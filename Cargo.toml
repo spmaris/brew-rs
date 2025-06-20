@@ -1,0 +1,70 @@
+[package]
+name = "brew-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A fast, modern package manager compatible with Homebrew formulae"
+license = "MIT"
+homepage = "https://github.com/yourusername/brew-rs"
+repository = "https://github.com/yourusername/brew-rs"
+keywords = ["package-manager", "homebrew", "macos", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# CLI framework
+clap = { version = "4.0", features = ["derive", "color"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Terminal UI
+colored = "2.0"
+indicatif = "0.17"
+dialoguer = "0.11"
+console = "0.15"
+
+# File operations
+tar = "0.4"
+flate2 = "1.0"
+walkdir = "2.0"
+
+# Fuzzy search
+fuzzy-matcher = "0.3"
+
+# System paths
+dirs = "5.0"
+
+# Cryptography
+sha2 = "0.10"
+hex = "0.4"
+
+# Parallel processing
+rayon = "1.7"
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[[bin]]
+name = "brew-rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
