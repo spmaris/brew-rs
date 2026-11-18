@@ -1,12 +1,13 @@
 [package]
 name = "brew-rs"
 version = "0.1.0"
-edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "A fast, modern package manager compatible with Homebrew formulae"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Spyros Maris <spyrosmaris@gmail.com>"]
+description = "A fast command line for Homebrew with cache-first search and readable package tables"
 license = "MIT"
-homepage = "https://github.com/yourusername/brew-rs"
-repository = "https://github.com/yourusername/brew-rs"
+homepage = "https://github.com/spmaris/brew-rs"
+repository = "https://github.com/spmaris/brew-rs"
 keywords = ["package-manager", "homebrew", "macos", "cli"]
 categories = ["command-line-utilities"]
 
@@ -18,7 +19,7 @@ clap = { version = "4.0", features = ["derive", "color"] }
 tokio = { version = "1.0", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", features = ["json", "stream", "gzip"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,13 +33,15 @@ thiserror = "1.0"
 # Terminal UI
 colored = "2.0"
 indicatif = "0.17"
-dialoguer = "0.11"
 console = "0.15"
 
 # File operations
 tar = "0.4"
 flate2 = "1.0"
 walkdir = "2.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
 
 # Fuzzy search
 fuzzy-matcher = "0.3"
@@ -50,14 +53,15 @@ dirs = "5.0"
 sha2 = "0.10"
 hex = "0.4"
 
-# Parallel processing
-rayon = "1.7"
+# Logging
+log = "0.4"
+env_logger = "0.10"
 
 [dev-dependencies]
 tempfile = "3.0"
 
 [[bin]]
-name = "brew-rs"
+name = "brewrs"
 path = "src/main.rs"
 
 [profile.release]
