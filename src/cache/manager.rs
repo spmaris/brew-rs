@@ -8,34 +8,48 @@ use super::cleanup::CleanupStats;
 /// Cache handle used by `brewrs clean`.
 ///
 /// Catalogue metadata is owned by the API layer and cleaned through
-/// [`crate::api::clean_catalogs`]. This type is deliberately limited to the
-/// legacy bottle directory that earlier brew-rs releases downloaded into, so
-/// no in-memory formula cache is kept here anymore.
+/// [`crate::api::clean_catalogs`]. This type handles current and legacy bottle caches.
 pub struct CacheManager {
     retention_days: u32,
     bottle_store: BottleStore,
+    native_bottle_store: BottleStore,
 }
 
 impl CacheManager {
     /// Bind to the configured cache without creating or deleting anything.
     ///
-    /// Fails when the legacy bottles directory is a symlink, before the
+    /// Fails when either bottles directory is a symlink, before the
     /// caller starts any cleanup.
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             retention_days: config.storage.cache_retention,
             bottle_store: BottleStore::new(&config.storage.cache_dir)?,
+            native_bottle_store: BottleStore::native(&config.storage.cache_dir)?,
         })
     }
 
-    /// Remove legacy bottle files older than the configured retention.
+    /// Remove bottle archives older than the configured retention.
     pub async fn clean_expired(&self) -> Result<CleanupStats> {
-        self.bottle_store.clean_expired(self.retention_days).await
+        let legacy = self.bottle_store.clean_expired(self.retention_days).await?;
+        let native = self
+            .native_bottle_store
+            .clean_expired(self.retention_days)
+            .await?;
+        Ok(combine(legacy, native))
     }
 
-    /// Remove every legacy bottle file.
+    /// Remove all recognized bottle archives.
     pub async fn clean_all(&self) -> Result<CleanupStats> {
-        self.bottle_store.clean_all().await
+        let legacy = self.bottle_store.clean_all().await?;
+        let native = self.native_bottle_store.clean_all().await?;
+        Ok(combine(legacy, native))
+    }
+}
+
+fn combine(legacy: CleanupStats, native: CleanupStats) -> CleanupStats {
+    CleanupStats {
+        bottles_removed: legacy.bottles_removed + native.bottles_removed,
+        bytes_freed: legacy.bytes_freed + native.bytes_freed,
     }
 }
 
@@ -67,6 +81,26 @@ mod tests {
         assert_eq!(stats.bottles_removed, 1);
         assert_eq!(stats.bytes_freed, 6);
         assert!(!bottles.join("bottle.tar.gz").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clean_all_removes_only_published_native_archives() -> Result<()> {
+        let temp = tempdir()?;
+        let dir = temp.path().join(crate::cache::NATIVE_BOTTLE_DIR);
+        fs::create_dir(&dir)?;
+        let archive = dir.join(format!("{}.tar.gz", "a".repeat(64)));
+        let partial = dir.join(format!("{}.tar.gz.part", "b".repeat(64)));
+        let unrelated = dir.join("notes.tar.gz");
+        fs::write(&archive, b"published")?;
+        fs::write(&partial, b"in progress")?;
+        fs::write(&unrelated, b"not a bottle")?;
+        let cache = CacheManager::new(&config_with_cache(temp.path(), 30))?;
+        let stats = cache.clean_all().await?;
+        assert_eq!(stats.bottles_removed, 1);
+        assert_eq!(stats.bytes_freed, 9);
+        assert!(!archive.exists());
+        assert!(partial.exists() && unrelated.exists());
         Ok(())
     }
 

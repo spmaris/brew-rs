@@ -8,25 +8,35 @@ use super::validator::ConfigValidator;
 pub struct ConfigLoader;
 
 impl ConfigLoader {
-    /// Load configuration from file, create default if it doesn't exist
+    /// Load configuration from file, creating defaults when the file is missing.
     pub fn load() -> Result<Config> {
-        let config_path = Self::config_path()?;
+        Self::load_inner(true)
+    }
 
-        if config_path.exists() {
-            let content = fs::read_to_string(&config_path)
-                .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+    /// Load configuration without writing defaults on first use.
+    pub fn load_read_only() -> Result<Config> {
+        Self::load_inner(false)
+    }
 
-            let config: Config =
-                toml::from_str(&content).with_context(|| "Failed to parse configuration file")?;
-
-            ConfigValidator::validate(&config)?;
-            Ok(config)
-        } else {
-            // Create default config
-            let config = Config::default();
-            Self::save(&config)?;
-            Ok(config)
-        }
+    fn load_inner(persist_defaults: bool) -> Result<Config> {
+        let path = Self::config_path()?;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let config = Config::default();
+                if persist_defaults {
+                    Self::save(&config)?;
+                }
+                return Ok(config);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read config file: {path:?}"));
+            }
+        };
+        let config: Config = toml::from_str(&text)
+            .with_context(|| format!("Failed to parse configuration file: {path:?}"))?;
+        ConfigValidator::validate(&config)?;
+        Ok(config)
     }
 
     /// Save configuration to file

@@ -1,12 +1,10 @@
 mod handlers;
-mod info;
-mod install;
-mod list;
 mod search;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, ConfigEditor};
@@ -15,7 +13,7 @@ use crate::config::{Config, ConfigEditor};
 #[command(
     name = "brewrs",
     version,
-    about = "A fast command line for Homebrew, inspired by uv"
+    about = "A native macOS package manager using Homebrew repositories"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -32,6 +30,10 @@ pub struct Cli {
     /// Override brew-rs's parallel downloads setting
     #[arg(long, global = true)]
     parallel: Option<u8>,
+
+    /// Absolute path to an isolated brewrs-owned package prefix
+    #[arg(long, global = true)]
+    prefix: Option<PathBuf>,
 }
 
 #[derive(Args, Clone, Copy, Default)]
@@ -56,32 +58,45 @@ struct PackageKind {
     cask: bool,
 }
 
-impl PackageKind {
-    fn flag(self) -> Option<&'static str> {
-        if self.formula {
-            Some("--formula")
-        } else if self.cask {
-            Some("--cask")
-        } else {
-            None
-        }
-    }
-}
-
 #[derive(Subcommand)]
 enum Commands {
-    /// Install formulae or casks
+    /// Alternate spelling for native package commands
+    #[command(hide = true)]
+    Native {
+        #[command(subcommand)]
+        action: NativeAction,
+    },
+
+    /// Resolve a formula plan from Homebrew's repository without invoking brew
+    Plan {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Download and verify formula bottles without installing them
+    Fetch {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Install formula bottles into the brewrs prefix
     #[command(alias = "in")]
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
-        /// Pass Homebrew's force-install option
+        /// Force replacement (unsupported for portable bottle installs)
         #[arg(short, long)]
         force: bool,
-        /// Skip formula dependencies (unsupported by Homebrew for general use)
+        /// Skip formula dependencies (unsupported)
         #[arg(long, conflicts_with = "cask")]
         no_deps: bool,
-        /// Install from HEAD instead of stable
+        /// Install from HEAD (unsupported; only stable bottles are supported)
         #[arg(long, conflicts_with = "cask")]
         head: bool,
         #[command(flatten)]
@@ -90,7 +105,7 @@ enum Commands {
         transaction: Transaction,
     },
 
-    /// Remove formulae or casks
+    /// Remove packages from the brewrs prefix
     #[command(alias = "rm")]
     Remove {
         #[arg(required = true)]
@@ -98,7 +113,7 @@ enum Commands {
         /// Also remove newly unneeded dependencies
         #[arg(long)]
         autoremove: bool,
-        /// Skip confirmation (alias for --assumeyes; does not force Homebrew)
+        /// Skip confirmation (alias for --assumeyes)
         #[arg(short, long)]
         force: bool,
         #[command(flatten)]
@@ -144,16 +159,16 @@ enum Commands {
         kind: PackageKind,
     },
 
-    /// List installed formulae and casks
+    /// List packages in the brewrs prefix
     #[command(alias = "ls")]
     List {
         /// Show available updates instead of the installed inventory
         #[arg(long, conflicts_with_all = ["sizes", "dates"])]
         outdated: bool,
-        /// Include Homebrew's disk usage report
+        /// Show disk usage (unsupported)
         #[arg(long)]
         sizes: bool,
-        /// Show recorded install dates (UTC)
+        /// Show recorded install dates (unsupported)
         #[arg(long)]
         dates: bool,
     },
@@ -161,7 +176,7 @@ enum Commands {
     /// List available updates (exit 100 when updates are found)
     #[command(visible_alias = "check-upgrade")]
     CheckUpdate {
-        /// Include auto-updating casks and casks with no fixed version
+        /// Include auto-updating casks (unsupported)
         #[arg(short, long)]
         greedy: bool,
     },
@@ -170,7 +185,7 @@ enum Commands {
     #[command(alias = "up")]
     Upgrade {
         packages: Vec<String>,
-        /// Include auto-updating casks and casks with no fixed version
+        /// Include auto-updating casks (unsupported)
         #[arg(short, long)]
         greedy: bool,
         #[command(flatten)]
@@ -179,7 +194,7 @@ enum Commands {
         transaction: Transaction,
     },
 
-    /// Refresh Homebrew metadata without upgrading packages
+    /// Refresh the brewrs formula and cask catalogs
     Update,
 
     /// Clean brew-rs cache and temporary files
@@ -204,7 +219,7 @@ enum Commands {
         /// Show a dependency tree (recursive dependents with --reverse)
         #[arg(long)]
         tree: bool,
-        /// Show installed formulae and casks that depend on this package
+        /// Show brewrs-managed formulae that depend on this package
         #[arg(long)]
         reverse: bool,
     },
@@ -219,6 +234,40 @@ enum Commands {
         #[arg(short, long, default_value_t = 20)]
         top: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum NativeAction {
+    /// Install supported portable formula bottles without running brew
+    Install {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+    /// Upgrade selected brewrs-managed formulae (all if omitted)
+    Upgrade {
+        packages: Vec<String>,
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+    /// Remove formulae installed by the native backend
+    Remove {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Also remove newly unneeded dependencies
+        #[arg(long)]
+        autoremove: bool,
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+    /// Remove unused dependencies from the brewrs prefix
+    Autoremove {
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+    /// List formulae installed by the native backend
+    List,
 }
 
 #[derive(Subcommand)]
@@ -244,7 +293,10 @@ impl Cli {
             Commands::Config {
                 action: ConfigAction::Edit,
             } if ConfigLoader::config_path()?.try_exists()? => Ok(Config::default()),
-            _ => ConfigLoader::load(),
+            Commands::Config {
+                action: ConfigAction::Edit,
+            } => ConfigLoader::load(),
+            _ => ConfigLoader::load_read_only(),
         }
     }
 
@@ -261,9 +313,62 @@ impl Cli {
         if let Some(parallel) = self.parallel {
             ConfigEditor::set_parallel_downloads(&mut config, parallel)?;
         }
-        let brew = crate::brew::Brew::new(&config, self.verbose);
+        let prefix = self.prefix.as_deref();
+        use crate::native::install as native;
 
         match self.command {
+            Commands::Native { action } => match action {
+                NativeAction::Install {
+                    packages,
+                    transaction,
+                } => {
+                    native::install(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )
+                    .await?;
+                }
+                NativeAction::Upgrade {
+                    packages,
+                    transaction,
+                } => {
+                    native::upgrade(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )
+                    .await?;
+                }
+                NativeAction::Remove {
+                    packages,
+                    autoremove,
+                    transaction,
+                } => {
+                    native::remove(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes,
+                        autoremove,
+                    )?;
+                }
+                NativeAction::Autoremove { transaction } => {
+                    native::autoremove(&config, prefix, transaction.dry_run, transaction.yes)?;
+                }
+                NativeAction::List => native::list(&config, prefix)?,
+            },
+            Commands::Plan { packages, target } => {
+                crate::native::run(&config, &packages, target.as_deref(), false).await?;
+            }
+            Commands::Fetch { packages, target } => {
+                crate::native::run(&config, &packages, target.as_deref(), true).await?;
+            }
             Commands::Install {
                 packages,
                 force,
@@ -272,27 +377,18 @@ impl Cli {
                 kind,
                 transaction,
             } => {
-                let mut options = Vec::new();
-                if force {
-                    options.push("--force");
-                }
-                if no_deps {
-                    options.push("--ignore-dependencies");
-                }
-                if head {
-                    options.push("--HEAD");
-                }
-                let selector = kind
-                    .flag()
-                    .or_else(|| (no_deps || head).then_some("--formula"));
-                options.extend(selector);
-                install::install_or_upgrade(
+                reject_unsupported(&[
+                    (kind.cask, "--cask"),
+                    (head, "--head"),
+                    (no_deps, "--no-deps"),
+                    (force, "--force"),
+                ])?;
+                native::install(
                     &config,
-                    brew,
-                    "install",
-                    options,
+                    prefix,
                     &packages,
-                    transaction,
+                    transaction.dry_run,
+                    transaction.yes,
                 )
                 .await?;
             }
@@ -301,13 +397,20 @@ impl Cli {
                 autoremove,
                 force,
                 kind,
-                mut transaction,
+                transaction,
             } => {
-                transaction.yes |= force;
-                install::remove(&config, brew, &packages, kind, transaction, autoremove).await?;
+                reject_unsupported(&[(kind.cask, "--cask")])?;
+                native::remove(
+                    &config,
+                    prefix,
+                    &packages,
+                    transaction.dry_run,
+                    transaction.yes || force,
+                    autoremove,
+                )?;
             }
             Commands::Autoremove { transaction } => {
-                install::autoremove(&config, brew, transaction).await?;
+                native::autoremove(&config, prefix, transaction.dry_run, transaction.yes)?;
             }
             Commands::Search {
                 query,
@@ -332,16 +435,32 @@ impl Cli {
                 deps,
                 kind,
             } => {
-                info::handle_info(&config, brew, &package, analytics, deps, kind).await?;
+                crate::native::info::info(
+                    &config,
+                    prefix,
+                    &package,
+                    kind.formula,
+                    kind.cask,
+                    deps,
+                    analytics,
+                )
+                .await?;
             }
-            Commands::List { outdated: true, .. } => {
-                list::show_outdated(&config, brew, false).await?;
-            }
-            Commands::List { sizes, dates, .. } => {
-                list::handle_list(&config, brew, sizes, dates).await?;
+            Commands::List {
+                outdated,
+                sizes,
+                dates,
+            } => {
+                reject_unsupported(&[(sizes, "--sizes"), (dates, "--dates")])?;
+                if outdated {
+                    native::check_updates(&config, prefix).await?;
+                } else {
+                    native::list(&config, prefix)?;
+                }
             }
             Commands::CheckUpdate { greedy } => {
-                if list::show_outdated(&config, brew, greedy).await? {
+                reject_unsupported(&[(greedy, "--greedy")])?;
+                if native::check_updates(&config, prefix).await? {
                     return Ok(ExitCode::from(100));
                 }
             }
@@ -351,23 +470,17 @@ impl Cli {
                 kind,
                 transaction,
             } => {
-                let mut options: Vec<_> = kind.flag().into_iter().collect();
-                if greedy {
-                    options.push("--greedy");
-                }
-                install::install_or_upgrade(
+                reject_unsupported(&[(kind.cask, "--cask"), (greedy, "--greedy")])?;
+                native::upgrade(
                     &config,
-                    brew,
-                    "upgrade",
-                    options,
+                    prefix,
                     &packages,
-                    transaction,
+                    transaction.dry_run,
+                    transaction.yes,
                 )
                 .await?;
             }
-            Commands::Update => {
-                brew.run("update", &[], false).await?;
-            }
+            Commands::Update => handlers::refresh_catalogs(&config).await?,
             Commands::Clean { all, dry_run } => {
                 handlers::handle_clean(config, all, dry_run).await?;
             }
@@ -376,17 +489,28 @@ impl Cli {
                 tree,
                 reverse,
             } => {
-                handlers::handle_deps(brew, &package, tree, reverse).await?;
+                crate::native::deps::deps(&config, prefix, &package, tree, reverse).await?;
             }
             Commands::Analytics {
                 package,
                 period,
                 top,
             } => {
-                handlers::handle_analytics(config, brew, package, period, top).await?;
+                if let Some(package) = package {
+                    crate::native::info::analytics(&config, &package, &period).await?;
+                } else {
+                    handlers::handle_analytics(config, period, top).await?;
+                }
             }
             Commands::Config { .. } => unreachable!(),
         }
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn reject_unsupported(flags: &[(bool, &str)]) -> Result<()> {
+    if let Some((_, flag)) = flags.iter().find(|(enabled, _)| *enabled) {
+        bail!("{flag} is not supported by the native backend; no changes were made.");
+    }
+    Ok(())
 }

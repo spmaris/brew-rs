@@ -1,8 +1,8 @@
-pub mod types;
-pub mod loader;
-pub mod validator;
 pub mod editor;
+pub mod loader;
+pub mod types;
+pub mod validator;
 
-pub use types::*;
-pub use loader::ConfigLoader;
 pub use editor::ConfigEditor;
+pub use loader::ConfigLoader;
+pub use types::*;

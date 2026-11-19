@@ -1,5 +1,5 @@
-use anyhow::Result;
 use super::types::Config;
+use anyhow::Result;
 
 pub struct ConfigValidator;
 
@@ -35,7 +35,10 @@ impl ConfigValidator {
     fn validate_ui(ui: &super::types::UiConfig) -> Result<()> {
         let valid_styles = ["dnf", "apt", "pacman", "minimal"];
         if !valid_styles.contains(&ui.style.as_str()) {
-            anyhow::bail!("Invalid UI style. Valid options: {}", valid_styles.join(", "));
+            anyhow::bail!(
+                "Invalid UI style. Valid options: {}",
+                valid_styles.join(", ")
+            );
         }
 
         Ok(())
@@ -43,11 +46,19 @@ impl ConfigValidator {
 
     fn validate_install(install: &super::types::InstallConfig) -> Result<()> {
         if install.prefix.exists() {
-            let metadata = std::fs::metadata(&install.prefix)
-                .map_err(|e| anyhow::anyhow!("Cannot access installation prefix {:?}: {}", install.prefix, e))?;
-            
+            let metadata = std::fs::metadata(&install.prefix).map_err(|e| {
+                anyhow::anyhow!(
+                    "Cannot access installation prefix {:?}: {}",
+                    install.prefix,
+                    e
+                )
+            })?;
+
             if !metadata.is_dir() {
-                anyhow::bail!("Installation prefix is not a directory: {:?}", install.prefix);
+                anyhow::bail!(
+                    "Installation prefix is not a directory: {:?}",
+                    install.prefix
+                );
             }
         }
 
@@ -55,18 +66,8 @@ impl ConfigValidator {
     }
 
     fn validate_storage(storage: &super::types::StorageConfig) -> Result<()> {
-        if let Some(parent) = storage.cache_dir.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| anyhow::anyhow!("Cannot create cache directory parent {:?}: {}", parent, e))?;
-            }
-        }
-
-        if let Some(parent) = storage.db_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| anyhow::anyhow!("Cannot create database directory parent {:?}: {}", parent, e))?;
-            }
+        if storage.cache_dir.as_os_str().is_empty() || storage.db_path.as_os_str().is_empty() {
+            anyhow::bail!("Cache and database paths must not be empty");
         }
 
         Ok(())
@@ -88,7 +89,7 @@ mod tests {
         let mut config = Config::default();
         config.downloads.parallel_downloads = 0;
         assert!(ConfigValidator::validate(&config).is_err());
-        
+
         config.downloads.parallel_downloads = 100;
         assert!(ConfigValidator::validate(&config).is_err());
     }

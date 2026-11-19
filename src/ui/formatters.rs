@@ -52,7 +52,7 @@ impl DnfStyleFormatter {
         result
     }
 
-    /// Frame interactive output; use plain columns when piping to another command.
+    /// Compact, width-aware terminal columns; plain text when redirected.
     pub fn table(&self, headers: &[&str], rows: &[Vec<String>]) -> String {
         let term = console::Term::stdout();
         let width = (term.is_term()
@@ -90,9 +90,10 @@ impl DnfStyleFormatter {
         let Some(width) = width else {
             return plain_table(headers, &rows, &widths);
         };
-        // Frame and two spaces of padding per column. Shrink prose/URLs before
-        // falling back to stacked fields; never abbreviate installable targets.
-        let mut over = (widths.iter().sum::<usize>() + 3 * widths.len() + 1).saturating_sub(width);
+        // Shrink prose/URLs before falling back to stacked fields. Never
+        // abbreviate installable targets.
+        let gutter = 2 * (widths.len() - 1);
+        let mut over = (widths.iter().sum::<usize>() + gutter).saturating_sub(width);
         for (label, column) in headers.iter().zip(&mut widths).rev() {
             if is_flexible(label) {
                 let reclaimed = over.min(column.saturating_sub(cells(label).max(16)));
@@ -118,23 +119,27 @@ impl DnfStyleFormatter {
                 .join("\n\n");
         }
 
-        let border = |left: char, middle: char, right: char| {
-            let fill: Vec<_> = widths.iter().map(|width| "─".repeat(width + 2)).collect();
-            self.frame(&format!("{left}{}{right}", fill.join(&middle.to_string())))
-        };
         let row_line = |values: &[&str], heading: bool| {
-            let mut line = self.frame("│");
+            let mut line = String::new();
             for (index, (value, width)) in values.iter().zip(&widths).enumerate() {
-                let padding = width.saturating_sub(cells(value));
-                let text = self.style_cell(headers[index], index, value, heading);
-                line.push_str(&format!(" {text}{:padding$} {}", "", self.frame("│")));
+                line.push_str(&self.style_cell(headers[index], index, value, heading));
+                if index + 1 < widths.len()
+                    && values[index + 1..].iter().any(|value| !value.is_empty())
+                {
+                    let padding = width.saturating_sub(cells(value)) + 2;
+                    line.push_str(&" ".repeat(padding));
+                }
             }
             line
         };
+        let rule = "─".repeat(widths.iter().sum::<usize>() + gutter);
         let mut output = vec![
-            border('╭', '┬', '╮'),
             row_line(headers, true),
-            border('├', '┼', '┤'),
+            if self.use_colors {
+                rule.dimmed().to_string()
+            } else {
+                rule
+            },
         ];
         for row in &rows {
             let wrapped: Vec<_> = row
@@ -150,16 +155,7 @@ impl DnfStyleFormatter {
                 output.push(row_line(&values, false));
             }
         }
-        output.push(border('╰', '┴', '╯'));
         output.join("\n")
-    }
-
-    fn frame(&self, text: &str) -> String {
-        if self.use_colors {
-            text.dimmed().to_string()
-        } else {
-            text.into()
-        }
     }
 
     fn style_cell(&self, label: &str, index: usize, value: &str, heading: bool) -> String {
@@ -179,14 +175,6 @@ impl DnfStyleFormatter {
             ("Status", "ready") => value.green().to_string(),
             ("Tap" | "Repository" | "Homepage", _) => value.dimmed().to_string(),
             _ => value.into(),
-        }
-    }
-
-    pub fn bullet_available(&self) -> ColoredString {
-        if self.use_colors {
-            "•".bright_blue()
-        } else {
-            "-".normal()
         }
     }
 
@@ -316,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_wraps_descriptions_inside_the_frame() {
+    fn terminal_wraps_descriptions_without_borders() {
         let rendered = FORMATTER.render_table(
             &["Package", "Version", "Description"],
             &[vec![
@@ -324,12 +312,13 @@ mod tests {
                 "128.0".into(),
                 "Mozilla Firefox Beta web browser".into(),
             ]],
-            Some(45),
+            Some(40),
         );
-        assert!(rendered.starts_with('╭'));
+        assert!(rendered.starts_with("Package"));
         assert!(rendered.contains("firefox@beta"));
         assert!(rendered.contains("web browser"));
-        assert!(rendered.lines().all(|line| cells(line) == 45));
+        assert!(!rendered.contains('│'));
+        assert!(rendered.lines().all(|line| cells(line) <= 40));
     }
 
     #[test]

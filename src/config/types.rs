@@ -122,7 +122,7 @@ impl Default for Config {
             storage: StorageConfig {
                 cache_dir,
                 max_cache_size: 1000, // 1GB
-                cache_retention: 30,   // 30 days
+                cache_retention: 30,  // 30 days
                 db_path: data_dir.join("installed.json"),
             },
         }

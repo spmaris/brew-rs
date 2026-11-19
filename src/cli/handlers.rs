@@ -1,17 +1,44 @@
 use anyhow::{Context, Result, bail};
 
-use crate::api::BrewApiClient;
-use crate::brew::Brew;
+use crate::api::{AnalyticsItem, BrewApiClient};
 use crate::cache::CacheManager;
 use crate::cli::ConfigAction;
 use crate::config::{Config, ConfigEditor, ConfigLoader};
 use crate::ui::DnfStyleFormatter;
 
+/// Refresh the local search catalogs from the native API.
+pub async fn refresh_catalogs(config: &Config) -> Result<()> {
+    use crate::api::{CachePolicy, catalog_cache};
+
+    let client = BrewApiClient::new(config)?;
+    let (formulae, casks) = tokio::try_join!(
+        catalog_cache::load_formulae(&client, config, CachePolicy::Refresh),
+        catalog_cache::load_casks(&client, config, CachePolicy::Refresh),
+    )?;
+    if !formulae.warnings.is_empty() || !casks.warnings.is_empty() {
+        bail!(
+            "Could not refresh the local catalogs: {}",
+            formulae
+                .warnings
+                .into_iter()
+                .chain(casks.warnings)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    println!(
+        "Refreshed {} formulae and {} casks. No packages changed.",
+        formulae.items.len(),
+        casks.items.len()
+    );
+    Ok(())
+}
+
 /// Handle clean command
 pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()> {
     let formatter = DnfStyleFormatter::new(&config);
 
-    // Validate the legacy bottle directory before deleting anything, so an
+    // Validate both bottle directories before deleting anything, so an
     // unsafe path cannot leave the cleanup half-done. Catalog cleanup performs
     // the same check for its own directory before it removes a file.
     let cache = CacheManager::new(&config)?;
@@ -19,7 +46,7 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
     if dry_run {
         let scope = if all { "all" } else { "expired" };
         println!(
-            "Would clean {scope} brew-rs cache entries in {} (Homebrew catalogs and legacy bottle files).",
+            "Would clean {scope} brew-rs cache entries in {} (Homebrew catalogs and bottle archives).",
             config.storage.cache_dir.display()
         );
         return Ok(());
@@ -48,7 +75,7 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
             formatter.format_size(catalog_bytes),
         ],
         vec![
-            "Legacy bottles".to_string(),
+            "Bottle archives".to_string(),
             bottles.bottles_removed.to_string(),
             formatter.format_size(bottles.bytes_freed),
         ],
@@ -112,72 +139,10 @@ pub async fn handle_config(mut config: Config, action: ConfigAction) -> Result<(
     Ok(())
 }
 
-/// Handle deps command
-pub async fn handle_deps(brew: Brew, package: &str, tree: bool, reverse: bool) -> Result<()> {
-    let heading = match (reverse, tree) {
-        (true, true) => format!("Installed packages that depend on {} (recursive):", package),
-        (true, false) => format!("Installed packages that depend on {}:", package),
-        (false, true) => format!("Dependency tree for {}:", package),
-        (false, false) => format!("Dependencies for {}:", package),
-    };
-    println!("{}", heading);
-
-    if reverse {
-        let mut args = vec!["--installed"];
-        if tree {
-            args.push("--recursive");
-        }
-        args.extend(["--", package]);
-        brew.run("uses", &args, true)
-            .await
-            .with_context(|| format!("Failed to list dependents of '{}'", package))?;
-    } else {
-        let mut args = Vec::new();
-        if tree {
-            args.push("--tree");
-        }
-        args.extend(["--", package]);
-        brew.run("deps", &args, true)
-            .await
-            .with_context(|| format!("Failed to list dependencies of '{}'", package))?;
-    }
-
-    Ok(())
-}
-
-/// Handle analytics command
-pub async fn handle_analytics(
-    config: Config,
-    brew: Brew,
-    package: Option<String>,
-    period: String,
-    top: usize,
-) -> Result<()> {
+/// Show native install analytics for the most popular packages.
+pub async fn handle_analytics(config: Config, period: String, top: usize) -> Result<()> {
     let formatter = DnfStyleFormatter::new(&config);
     let days = analytics_days(&period)?;
-
-    if let Some(package) = package {
-        println!(
-            "{}",
-            formatter.header(&format!("Analytics for {}", package))
-        );
-        println!("Period: last {} days\n", days);
-        let days_arg = days.to_string();
-        brew.run(
-            "info",
-            &[
-                "--analytics",
-                "--days",
-                days_arg.as_str(),
-                "--",
-                package.as_str(),
-            ],
-            true,
-        )
-        .await
-        .with_context(|| format!("Failed to load analytics for '{}'", package))?;
-        return Ok(());
-    }
 
     let client = BrewApiClient::new(&config)?;
     let analytics = client
@@ -200,29 +165,7 @@ pub async fn handle_analytics(
         return Ok(());
     }
 
-    let rows: Vec<Vec<String>> = items
-        .iter()
-        .take(top)
-        .enumerate()
-        .map(|(index, item)| {
-            let rank = if item.number == 0 {
-                index + 1
-            } else {
-                item.number as usize
-            };
-            let percent = if item.percent.ends_with('%') {
-                item.percent.clone()
-            } else {
-                format!("{}%", item.percent)
-            };
-            vec![
-                rank.to_string(),
-                item.formula.clone(),
-                item.count.clone(),
-                percent,
-            ]
-        })
-        .collect();
+    let rows = analytics_rows(&items, top);
 
     println!(
         "{}",
@@ -250,8 +193,35 @@ pub async fn handle_analytics(
     Ok(())
 }
 
-/// Convert a CLI period such as `30d` into the day count understood by
-/// `brew info --analytics`.
+/// Build the rank, package, install count and percentage table rows.
+fn analytics_rows(items: &[AnalyticsItem], top: usize) -> Vec<Vec<String>> {
+    items
+        .iter()
+        .take(top)
+        .enumerate()
+        .map(|(index, item)| {
+            let rank = if item.number == 0 {
+                index + 1
+            } else {
+                item.number as usize
+            };
+            let percent = if item.percent.ends_with('%') {
+                item.percent.clone()
+            } else {
+                format!("{}%", item.percent)
+            };
+            vec![
+                rank.to_string(),
+                item.formula.clone(),
+                item.count.clone(),
+                percent,
+            ]
+        })
+        .collect()
+}
+
+/// Convert a CLI period such as `30d` into the day count used for analytics
+/// windows.
 fn analytics_days(period: &str) -> Result<u32> {
     let raw = period.strip_suffix('d').unwrap_or(period);
     let days: u32 = raw
@@ -269,7 +239,8 @@ fn analytics_days(period: &str) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{analytics_days, handle_clean};
+    use super::{analytics_days, analytics_rows, handle_clean};
+    use crate::api::AnalyticsItem;
     use crate::config::Config;
     use anyhow::Result;
     use std::fs;
@@ -309,8 +280,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn analytics_rows_build_ranked_top_rows() {
+        let items = vec![
+            AnalyticsItem {
+                number: 0,
+                formula: "alpha".to_string(),
+                count: "10".to_string(),
+                percent: "40".to_string(),
+            },
+            AnalyticsItem {
+                number: 7,
+                formula: "beta".to_string(),
+                count: "5".to_string(),
+                percent: "20%".to_string(),
+            },
+            AnalyticsItem {
+                number: 8,
+                formula: "gamma".to_string(),
+                count: "2".to_string(),
+                percent: "8".to_string(),
+            },
+        ];
+
+        let rows = analytics_rows(&items, 2);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["1", "alpha", "10", "40%"]);
+        assert_eq!(rows[1], vec!["7", "beta", "5", "20%"]);
+        assert!(analytics_rows(&items, 0).is_empty());
+    }
+
     #[tokio::test]
-    async fn clean_removes_catalogs_and_legacy_bottles() -> Result<()> {
+    async fn clean_removes_catalogs_and_bottles() -> Result<()> {
         let temp = tempdir()?;
         let cache_dir = temp.path().join("cache");
         seed_cache(&cache_dir)?;

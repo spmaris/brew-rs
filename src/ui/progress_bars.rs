@@ -1,4 +1,4 @@
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Duration;
 
 pub struct ProgressManager {
@@ -28,10 +28,10 @@ impl ProgressManager {
         );
         pb.set_message(message.to_string());
         pb.enable_steady_tick(Duration::from_millis(100));
-        
+
         Some(pb)
     }
-    
+
     pub fn finish_with_message(&self, pb: Option<ProgressBar>, message: &str) {
         if let Some(pb) = pb {
             pb.finish_with_message(message.to_string());

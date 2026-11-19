@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Spyros Maris <spyrosmaris@gmail.com>"]
-description = "A fast command line for Homebrew with cache-first search and readable package tables"
+description = "A native macOS package manager using Homebrew repositories and verified bottles"
 license = "MIT"
 homepage = "https://github.com/spmaris/brew-rs"
 repository = "https://github.com/spmaris/brew-rs"
@@ -28,7 +28,6 @@ toml = "0.8"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Terminal UI
 colored = "2.0"
@@ -38,10 +37,7 @@ console = "0.15"
 # File operations
 tar = "0.4"
 flate2 = "1.0"
-walkdir = "2.0"
-
-# Time handling
-chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.0"
 
 # Fuzzy search
 fuzzy-matcher = "0.3"
@@ -56,9 +52,6 @@ hex = "0.4"
 # Logging
 log = "0.4"
 env_logger = "0.10"
-
-[dev-dependencies]
-tempfile = "3.0"
 
 [[bin]]
 name = "brewrs"

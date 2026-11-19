@@ -1,10 +1,10 @@
 //! Offline integration tests for the `brewrs` command line.
 //!
-//! Every test runs the real binary with a fake `brew` executable at the front
-//! of `PATH`. The fake records its argv and a small allowlist of Homebrew
-//! environment variables, and emits canned JSON for `brew info` and
-//! `brew outdated`. No Homebrew installation, network access, or real package
-//! state is involved.
+//! Every test runs the real binary with a sentinel `brew` executable at the
+//! front of `PATH`. The sentinel records its argv and exits with a distinctive
+//! failure, so a command that unexpectedly shells out to Homebrew is detected
+//! instead of touching a real installation. No Homebrew installation, network
+//! access, or real package state is involved.
 //!
 //! Configuration is redirected to a throwaway path through `BREW_RS_CONFIG`,
 //! and `HOME`/XDG directories are isolated as well, so the tests never touch
@@ -12,122 +12,36 @@
 
 #![cfg(unix)]
 
-use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
-/// Fake Homebrew. It records one block per invocation and answers `info` and
-/// `outdated` from fixture files, so assertions can inspect both argv and the
-/// environment brew-rs passes down.
-const FAKE_BREW: &str = r#"#!/bin/sh
+/// Sentinel Homebrew. It records one block per invocation and fails, so tests
+/// can prove that no command reaches Homebrew and a regression is loud instead
+/// of silently managing the host's packages.
+const SENTINEL_BREW: &str = r#"#!/bin/sh
 set -u
 
-log=${BREW_FAKE_LOG:?BREW_FAKE_LOG must be set}
-fixtures=${BREW_FAKE_DIR:?BREW_FAKE_DIR must be set}
+log=${BREW_SENTINEL_LOG:?BREW_SENTINEL_LOG must be set}
 
 {
     printf 'BEGIN\n'
     for arg in "$@"; do
         printf 'arg\037%s\n' "$arg"
     done
-    printf 'env\037HOMEBREW_NO_AUTOREMOVE=%s\n' "${HOMEBREW_NO_AUTOREMOVE-<unset>}"
-    printf 'env\037HOMEBREW_NO_AUTO_UPDATE=%s\n' "${HOMEBREW_NO_AUTO_UPDATE-<unset>}"
-    printf 'env\037HOMEBREW_NO_COLOR=%s\n' "${HOMEBREW_NO_COLOR-<unset>}"
-    printf 'env\037HOMEBREW_COLOR=%s\n' "${HOMEBREW_COLOR-<unset>}"
-    printf 'env\037HOMEBREW_VERBOSE=%s\n' "${HOMEBREW_VERBOSE-<unset>}"
     printf 'END\n'
 } >> "$log"
 
-case "${1-}" in
-    outdated)
-        if [ -f "$fixtures/outdated.json" ]; then
-            cat "$fixtures/outdated.json"
-        else
-            printf '{"formulae":[],"casks":[]}'
-        fi
-        exit "${BREW_FAKE_OUTDATED_EXIT:-0}"
-        ;;
-    info)
-        if [ -f "$fixtures/installed.json" ]; then
-            cat "$fixtures/installed.json"
-        else
-            printf '{"formulae":[],"casks":[]}'
-        fi
-        exit "${BREW_FAKE_INFO_EXIT:-0}"
-        ;;
-    *)
-        exit "${BREW_FAKE_EXIT:-0}"
-        ;;
-esac
+printf 'sentinel brew: brewrs must not invoke Homebrew in this test\n' >&2
+exit "${BREW_SENTINEL_EXIT:-97}"
 "#;
-
-const UPDATED_JSON: &str = r#"{
-  "formulae": [
-    {
-      "name": "ripgrep",
-      "installed_versions": ["13.0.0"],
-      "current_version": "14.1.1",
-      "pinned": false
-    }
-  ],
-  "casks": [
-    {
-      "name": "firefox",
-      "installed_versions": ["119.0"],
-      "current_version": "120.0"
-    }
-  ]
-}"#;
-
-const NO_UPDATES_JSON: &str = r#"{"formulae":[],"casks":[]}"#;
-
-/// Makes `handle_error` print the anyhow context chain to stderr.
-const VERBOSE_ERRORS: &[(&str, &str)] = &[("BREW_RS_VERBOSE", "1")];
-
-const INSTALLED_JSON: &str = r#"{
-  "formulae": [
-    {
-      "name": "ripgrep",
-      "full_name": "ripgrep",
-      "tap": null,
-      "installed": [
-        {"version": "14.1.0", "time": 1700000000}
-      ]
-    }
-  ],
-  "casks": [
-    {
-      "token": "firefox",
-      "full_token": "firefox",
-      "tap": null,
-      "installed": "120.0",
-      "installed_time": 1600000000
-    }
-  ]
-}"#;
-
-#[derive(Debug, Default)]
-struct Invocation {
-    args: Vec<String>,
-    /// Every tracked variable maps to its value, or `None` when the fake
-    /// observed it as unset.
-    env: HashMap<String, Option<String>>,
-}
-
-impl Invocation {
-    fn env(&self, key: &str) -> Option<&str> {
-        self.env.get(key).and_then(|value| value.as_deref())
-    }
-}
 
 struct Sandbox {
     _root: TempDir,
     bin: PathBuf,
-    fixtures: PathBuf,
     log: PathBuf,
     config: PathBuf,
     home: PathBuf,
@@ -137,20 +51,19 @@ impl Sandbox {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("create sandbox directory");
         let bin = root.path().join("bin");
-        let fixtures = root.path().join("fixtures");
         let home = root.path().join("home");
         let tmp = home.join("tmp");
-        for directory in [&bin, &fixtures, &home, &tmp] {
+        for directory in [&bin, &home, &tmp] {
             fs::create_dir_all(directory).expect("create sandbox directory");
         }
 
-        let fake_brew = bin.join("brew");
-        fs::write(&fake_brew, FAKE_BREW).expect("write fake brew");
-        let mut permissions = fs::metadata(&fake_brew)
-            .expect("stat fake brew")
+        let sentinel = bin.join("brew");
+        fs::write(&sentinel, SENTINEL_BREW).expect("write sentinel brew");
+        let mut permissions = fs::metadata(&sentinel)
+            .expect("stat sentinel brew")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&fake_brew, permissions).expect("chmod fake brew");
+        fs::set_permissions(&sentinel, permissions).expect("chmod sentinel brew");
 
         let log = root.path().join("brew.log");
         let config = root.path().join("config").join("config.toml");
@@ -158,7 +71,6 @@ impl Sandbox {
         Self {
             _root: root,
             bin,
-            fixtures,
             log,
             config,
             home,
@@ -181,8 +93,7 @@ impl Sandbox {
             .env("BREW_RS_CONFIG", &self.config)
             .env("BREW_RS_LOG", "off")
             .env("BREW_RS_LOG_STYLE", "never")
-            .env("BREW_FAKE_LOG", &self.log)
-            .env("BREW_FAKE_DIR", &self.fixtures)
+            .env("BREW_SENTINEL_LOG", &self.log)
             .env("LANG", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -203,34 +114,26 @@ impl Sandbox {
         command.output().expect("failed to run brewrs")
     }
 
-    fn write_fixture(&self, name: &str, contents: &str) {
-        fs::write(self.fixtures.join(name), contents).expect("write fixture");
-    }
-
-    fn invocations(&self) -> Vec<Invocation> {
+    /// Every sentinel `brew` invocation, in order, with the arguments it saw.
+    fn brew_invocations(&self) -> Vec<Vec<String>> {
         let log = fs::read_to_string(&self.log).unwrap_or_default();
         let mut invocations = Vec::new();
-        let mut current: Option<Invocation> = None;
+        let mut current: Option<Vec<String>> = None;
 
         for line in log.lines() {
             match line {
-                "BEGIN" => current = Some(Invocation::default()),
+                "BEGIN" => current = Some(Vec::new()),
                 "END" => {
-                    if let Some(invocation) = current.take() {
-                        invocations.push(invocation);
+                    if let Some(args) = current.take() {
+                        invocations.push(args);
                     }
                 }
                 _ => {
-                    let Some(invocation) = current.as_mut() else {
+                    let Some(args) = current.as_mut() else {
                         continue;
                     };
                     if let Some(arg) = line.strip_prefix("arg\u{1f}") {
-                        invocation.args.push(arg.to_string());
-                    } else if let Some(environment) = line.strip_prefix("env\u{1f}") {
-                        if let Some((key, value)) = environment.split_once('=') {
-                            let value = (value != "<unset>").then(|| value.to_string());
-                            invocation.env.insert(key.to_string(), value);
-                        }
+                        args.push(arg.to_string());
                     }
                 }
             }
@@ -239,14 +142,12 @@ impl Sandbox {
         invocations
     }
 
-    fn single_invocation(&self) -> Invocation {
-        let mut invocations = self.invocations();
-        assert_eq!(
-            invocations.len(),
-            1,
-            "expected exactly one brew invocation, observed {invocations:#?}"
+    fn assert_no_brew(&self) {
+        let invocations = self.brew_invocations();
+        assert!(
+            invocations.is_empty(),
+            "brewrs must not invoke brew, observed {invocations:#?}"
         );
-        invocations.remove(0)
     }
 }
 
@@ -284,328 +185,112 @@ fn assert_row_containing(output: &str, name: &str, expected: &[&str]) {
     }
 }
 
-fn assert_outdated_row(output: &str, name: &str, installed: &str, current: &str) {
-    assert_row_containing(output, name, &[installed, current]);
-}
-
+/// Guard the guard: the sentinel must really record argv and fail, so every
+/// `assert_no_brew` in this file reflects an executable check rather than an
+/// absent binary on `PATH`.
 #[test]
-fn install_preview_uses_brew_install_with_dry_run() {
+fn sentinel_brew_records_invocations_and_fails() {
     let sandbox = Sandbox::new();
-    let output = sandbox.run(&["--no-color", "install", "--dry-run", "ripgrep"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
+    let output = Command::new(sandbox.bin.join("brew"))
+        .args(["info", "--json=v2", "--installed"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("BREW_SENTINEL_LOG", &sandbox.log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the sentinel brew");
+    assert_eq!(output.status.code(), Some(97));
     assert_eq!(
-        invocation.args,
-        vec!["install", "--dry-run", "--", "ripgrep"]
+        sandbox.brew_invocations(),
+        vec![vec![
+            "info".to_string(),
+            "--json=v2".to_string(),
+            "--installed".to_string(),
+        ]]
     );
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_NO_COLOR"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_VERBOSE"), None);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTOREMOVE"), None);
-
-    let output = stdout(&output);
-    assert!(output.contains("Transaction summary"), "stdout: {output}");
-    assert!(output.contains("Preview"), "stdout: {output}");
 }
 
 #[test]
-fn upgrade_preview_uses_brew_upgrade_with_dry_run() {
+fn retired_legacy_flag_is_rejected_without_running_brew() {
     let sandbox = Sandbox::new();
-    let output = sandbox.run(&["--no-color", "-v", "upgrade", "-n", "ripgrep"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(
-        invocation.args,
-        vec!["upgrade", "--dry-run", "--", "ripgrep"]
-    );
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_NO_COLOR"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_VERBOSE"), Some("1"));
-
-    let output = stdout(&output);
-    assert!(output.contains("Upgrade"), "stdout: {output}");
-    assert!(output.contains("Preview"), "stdout: {output}");
-}
-
-#[test]
-fn remove_preview_sets_homebrew_no_autoremove_by_default() {
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&["--no-color", "remove", "--dry-run", "ripgrep"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(
-        invocation.args,
-        vec!["uninstall", "--dry-run", "--", "ripgrep"]
-    );
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTOREMOVE"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-
-    assert!(stdout(&output).contains("Preview"));
-}
-
-#[test]
-fn remove_preview_autoremove_opt_in_clears_homebrew_no_autoremove() {
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&[
-        "--no-color",
-        "remove",
-        "--dry-run",
-        "--autoremove",
-        "ripgrep",
-    ]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(
-        invocation.args,
-        vec!["uninstall", "--dry-run", "--", "ripgrep"]
-    );
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTOREMOVE"), None);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-}
-
-#[test]
-fn remove_with_assumeyes_sets_homebrew_no_autoremove_and_does_not_preview() {
-    let sandbox = Sandbox::new();
-    let output = sandbox.run(&["--no-color", "remove", "--assumeyes", "ripgrep"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, vec!["uninstall", "--", "ripgrep"]);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTOREMOVE"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), None);
-}
-
-#[test]
-fn non_tty_refuses_install_and_remove_without_confirmation() {
-    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
 
     for args in [
-        vec!["--no-color", "install", "ripgrep"],
-        vec!["--no-color", "remove", "ripgrep"],
+        vec!["--legacy", "list"],
+        vec!["list", "--legacy"],
+        vec!["--legacy", "install", "--dry-run", "hello"],
+        vec!["--legacy", "update"],
+        vec!["--prefix", path, "--legacy", "list"],
+        vec!["native", "--legacy", "list"],
     ] {
-        let output = sandbox.run_with_env(&args, VERBOSE_ERRORS);
-        assert_eq!(
+        let output = sandbox.run(&args);
+        assert_ne!(
             output.status.code(),
-            Some(1),
-            "expected refusal for {args:?}\nstdout:\n{}\nstderr:\n{}",
+            Some(0),
+            "retired --legacy must be rejected for {args:?}\nstdout:\n{}\nstderr:\n{}",
             stdout(&output),
             stderr(&output)
         );
         assert!(
-            stderr(&output).contains("Confirmation requires a terminal"),
-            "stderr for {args:?} did not explain the refusal:\n{}",
+            stderr(&output).to_ascii_lowercase().contains("legacy"),
+            "the rejection for {args:?} should name --legacy:\n{}",
+            stderr(&output)
+        );
+    }
+
+    sandbox.assert_no_brew();
+    assert!(
+        !prefix.exists(),
+        "a rejected --legacy command must not create the native prefix"
+    );
+    assert!(
+        !sandbox.config.exists(),
+        "a rejected command must not create configuration"
+    );
+}
+
+#[test]
+fn unsupported_upstream_flags_are_rejected_without_running_brew() {
+    let sandbox = Sandbox::new();
+
+    for (args, flag) in [
+        (vec!["install", "--dry-run", "--cask", "firefox"], "--cask"),
+        (vec!["install", "--dry-run", "--force", "hello"], "--force"),
+        (vec!["install", "--dry-run", "--head", "hello"], "--head"),
+        (
+            vec!["install", "--dry-run", "--no-deps", "hello"],
+            "--no-deps",
+        ),
+        (vec!["remove", "--dry-run", "--cask", "firefox"], "--cask"),
+        (
+            vec!["upgrade", "--dry-run", "--greedy", "hello"],
+            "--greedy",
+        ),
+        (vec!["check-update", "--greedy"], "--greedy"),
+        (vec!["list", "--sizes"], "--sizes"),
+        (vec!["list", "--dates"], "--dates"),
+    ] {
+        let output = sandbox.run(&args);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "unsupported {flag} must be rejected for {args:?}\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
             stderr(&output)
         );
         assert!(
-            !stdout(&output).contains("Transaction summary"),
-            "a refused transaction must not print a summary for {args:?}"
+            stderr(&output).contains(flag),
+            "the rejection for {args:?} should name {flag}:\n{}",
+            stderr(&output)
         );
     }
 
+    sandbox.assert_no_brew();
     assert!(
-        sandbox.invocations().is_empty(),
-        "brew must not be invoked when confirmation is refused"
+        !sandbox.config.exists(),
+        "a rejected upstream flag must not create configuration"
     );
-}
-
-#[test]
-fn check_update_reports_structured_outdated_rows_and_exits_100() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", UPDATED_JSON);
-
-    let output = sandbox.run(&["--no-color", "check-update"]);
-    assert_eq!(
-        output.status.code(),
-        Some(100),
-        "check-update must signal updates with exit code 100\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, vec!["outdated", "--json=v2"]);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-
-    let output = stdout(&output);
-    assert_outdated_row(&output, "ripgrep", "13.0.0", "14.1.1");
-    assert_outdated_row(&output, "firefox", "119.0", "120.0");
-}
-
-#[test]
-fn list_outdated_reports_updates_but_exits_zero() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", UPDATED_JSON);
-
-    let output = sandbox.run(&["--no-color", "list", "--outdated"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, vec!["outdated", "--json=v2"]);
-
-    let output = stdout(&output);
-    assert_outdated_row(&output, "ripgrep", "13.0.0", "14.1.1");
-    assert_outdated_row(&output, "firefox", "119.0", "120.0");
-}
-
-#[test]
-fn check_update_and_list_outdated_exit_zero_without_updates() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", NO_UPDATES_JSON);
-
-    for args in [
-        vec!["--no-color", "check-update"],
-        vec!["--no-color", "list", "--outdated"],
-    ] {
-        let output = sandbox.run(&args);
-        assert_success(&output);
-        assert!(
-            !stdout(&output).contains("ripgrep"),
-            "no outdated package should be reported for {args:?}:\n{}",
-            stdout(&output)
-        );
-    }
-
-    let invocations = sandbox.invocations();
-    assert_eq!(invocations.len(), 2);
-    for invocation in invocations {
-        assert_eq!(invocation.args, vec!["outdated", "--json=v2"]);
-    }
-}
-
-#[test]
-fn check_update_greedy_passes_greedy_to_brew() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", UPDATED_JSON);
-
-    let output = sandbox.run(&["--no-color", "check-update", "--greedy"]);
-    assert_eq!(
-        output.status.code(),
-        Some(100),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, vec!["outdated", "--json=v2", "--greedy"]);
-}
-
-#[test]
-fn malformed_outdated_json_is_a_failure() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", "{ this is not valid json");
-
-    let output = sandbox.run_with_env(&["--no-color", "check-update"], VERBOSE_ERRORS);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "malformed brew output must fail\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("Invalid JSON"),
-        "stderr did not identify the malformed JSON:\n{}",
-        stderr(&output)
-    );
-    assert_eq!(sandbox.invocations().len(), 1);
-}
-
-#[test]
-fn unexpected_outdated_shape_is_a_failure() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", r#"{"formulae":"ripgrep","casks":[]}"#);
-
-    let output = sandbox.run_with_env(&["--no-color", "check-update"], VERBOSE_ERRORS);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "unexpected brew output must fail\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("Invalid JSON"),
-        "stderr did not identify the unexpected JSON shape:\n{}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn list_dates_uses_installed_inventory_and_renders_formula_and_cask_dates() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("installed.json", INSTALLED_JSON);
-
-    let output = sandbox.run(&["--no-color", "list", "--dates"]);
-    assert_success(&output);
-
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, vec!["info", "--json=v2", "--installed"]);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
-    assert_eq!(invocation.env("HOMEBREW_NO_COLOR"), Some("1"));
-
-    let output = stdout(&output);
-    // Formula version and `installed[].time` (2023-11-14 UTC) on one row.
-    assert_row_containing(&output, "ripgrep", &["14.1.0", "2023-11-14"]);
-    // Cask version and `installed_time` (2020-09-13 UTC) on one row.
-    assert_row_containing(&output, "firefox", &["120.0", "2020-09-13"]);
-}
-
-#[test]
-fn check_update_fails_when_brew_outdated_fails() {
-    let sandbox = Sandbox::new();
-    sandbox.write_fixture("outdated.json", UPDATED_JSON);
-
-    let output = sandbox.run_with_env(
-        &["--no-color", "check-update"],
-        &[("BREW_RS_VERBOSE", "1"), ("BREW_FAKE_OUTDATED_EXIT", "1")],
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a failing brew outdated must fail the command\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("brew outdated failed"),
-        "stderr did not report the brew failure:\n{}",
-        stderr(&output)
-    );
-    assert_eq!(sandbox.invocations().len(), 1);
-}
-
-#[test]
-fn failed_apply_is_not_reported_as_complete() {
-    let sandbox = Sandbox::new();
-    let output = sandbox.run_with_env(&["install", "--yes", "ripgrep"], &[("BREW_FAKE_EXIT", "3")]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("brew install failed"));
-    assert!(!stdout(&output).contains("Complete!"));
-    assert_eq!(
-        sandbox.single_invocation().args,
-        ["install", "--yes", "--", "ripgrep"]
-    );
-}
-
-#[test]
-fn update_only_refreshes_metadata() {
-    let sandbox = Sandbox::new();
-    assert_success(&sandbox.run(&["update"]));
-    assert_eq!(sandbox.single_invocation().args, ["update"]);
-}
-
-#[test]
-fn autoremove_preview_does_not_apply() {
-    let sandbox = Sandbox::new();
-    assert_success(&sandbox.run(&["autoremove", "-n"]));
-    let invocation = sandbox.single_invocation();
-    assert_eq!(invocation.args, ["autoremove", "--dry-run"]);
-    assert_eq!(invocation.env("HOMEBREW_NO_AUTO_UPDATE"), Some("1"));
 }
 
 #[test]
@@ -615,7 +300,7 @@ fn help_names_brewrs_without_creating_config() {
     assert_success(&output);
     assert!(stdout(&output).contains("Usage: brewrs"));
     assert!(!sandbox.config.exists());
-    assert!(sandbox.invocations().is_empty());
+    sandbox.assert_no_brew();
 }
 
 #[test]
@@ -627,9 +312,10 @@ fn invalid_config_is_preserved_until_explicit_reset() {
     let failed = sandbox.run(&["list"]);
     assert_eq!(failed.status.code(), Some(1));
     assert_eq!(fs::read_to_string(&sandbox.config).unwrap(), invalid);
-    assert!(sandbox.invocations().is_empty());
+    sandbox.assert_no_brew();
     assert_success(&sandbox.run(&["config", "reset"]));
     assert_success(&sandbox.run(&["config", "show"]));
+    sandbox.assert_no_brew();
 }
 
 #[test]
@@ -657,5 +343,305 @@ fn offline_catalog_search_does_not_launch_brew() {
         "example-browser@beta",
         &["Example Browser Beta", "2.4"],
     );
-    assert!(sandbox.invocations().is_empty());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn native_list_does_not_create_a_missing_prefix_or_call_brew() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    for args in [
+        ["list", "--prefix", path].as_slice(),
+        &["ls", "--prefix", path],
+        &["native", "list", "--prefix", path],
+    ] {
+        let output = sandbox.run(args);
+        assert_success(&output);
+        assert!(stdout(&output).contains("No brewrs-managed packages"));
+    }
+    assert!(!prefix.exists());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn hidden_native_alias_stays_accepted_but_unlisted() {
+    let sandbox = Sandbox::new();
+    let help = sandbox.run(&["--help"]);
+    assert_success(&help);
+    assert!(
+        !stdout(&help)
+            .lines()
+            .any(|line| line.starts_with("  native ")),
+        "the hidden native alias must not be advertised:\n{}",
+        stdout(&help)
+    );
+
+    let prefix = sandbox.home.join("native-prefix");
+    let output = sandbox.run(&["native", "list", "--prefix", prefix.to_str().unwrap()]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("No brewrs-managed packages"));
+    assert!(!prefix.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_install_does_not_fall_back_to_brew_for_casks() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let output = sandbox.run(&[
+        "native",
+        "--prefix",
+        prefix.to_str().unwrap(),
+        "install",
+        "--dry-run",
+        "homebrew/cask/firefox",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("unsupported tap"));
+    assert!(!prefix.exists());
+    sandbox.assert_no_brew();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_upgrade_without_receipts_is_offline_and_read_only() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    let output = sandbox.run(&["upgrade", "--prefix", path, "--dry-run"]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("No brewrs-managed packages"));
+    let missing = sandbox.run(&["upgrade", "--prefix", path, "--yes", "hello"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("'hello' is not installed"));
+    assert!(!prefix.exists());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn default_update_queries_never_consult_homebrew_on_an_empty_prefix() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    for args in [
+        ["check-update", "--prefix", path].as_slice(),
+        &["list", "--outdated", "--prefix", path],
+    ] {
+        let output = sandbox.run(args);
+        assert_success(&output);
+        assert!(stdout(&output).contains("No brewrs-managed packages"));
+    }
+    assert!(!prefix.exists());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn native_refuses_a_prefix_inside_the_homebrew_prefix() {
+    let sandbox = Sandbox::new();
+
+    // A local stand-in for the Homebrew root: `HOMEBREW_PREFIX` is the
+    // environment variable the store consults, so this exercises the refusal
+    // without ever touching the host's real Homebrew prefix.
+    let homebrew = sandbox.home.join("fake-homebrew-prefix");
+    let protected = homebrew.join("brewrs-native");
+    seed_native_graph(&protected, &[("hello", true, &[])]);
+    let receipt = protected.join(".brewrs/state/receipts/hello.json");
+    let keg = protected.join("Cellar/hello/1.0");
+
+    let output = sandbox.run_with_env(
+        &[
+            "remove",
+            "--prefix",
+            protected.to_str().unwrap(),
+            "hello",
+            "--yes",
+        ],
+        &[("HOMEBREW_PREFIX", homebrew.to_str().unwrap())],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a prefix inside the Homebrew root must be refused\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let message = stderr(&output);
+    assert!(
+        message.contains("inside the Homebrew prefix"),
+        "stderr should explain the protected-prefix refusal:\n{message}"
+    );
+    assert!(
+        receipt.is_file() && keg.is_dir(),
+        "a refused protected prefix must stay untouched"
+    );
+
+    // The same fixture outside the protected root is still manageable, which
+    // proves the refusal is about the protected location rather than the
+    // fixture shape.
+    let safe = sandbox.home.join("safe-native");
+    seed_native_graph(&safe, &[("hello", true, &[])]);
+    assert_success(&sandbox.run(&[
+        "remove",
+        "--prefix",
+        safe.to_str().unwrap(),
+        "hello",
+        "--yes",
+    ]));
+    assert!(!safe.join(".brewrs/state/receipts/hello.json").exists());
+
+    sandbox.assert_no_brew();
+}
+
+fn seed_native_graph(prefix: &Path, packages: &[(&str, bool, &[&str])]) {
+    let receipts = prefix.join(".brewrs/state/receipts");
+    for directory in [
+        &receipts,
+        &prefix.join(".brewrs/stages"),
+        &prefix.join("bin"),
+        &prefix.join("Cellar"),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(prefix.join(".brewrs-root"), "brewrs native store v1\n").unwrap();
+    let identity =
+        |name: &str| serde_json::json!({"name": name, "version": "1.0", "sha256": "a".repeat(64)});
+    for &(name, requested, dependencies) in packages {
+        let mut receipt = identity(name);
+        receipt["requested"] = serde_json::json!(requested);
+        receipt["dependencies"] = serde_json::json!(
+            dependencies
+                .iter()
+                .copied()
+                .map(identity)
+                .collect::<Vec<_>>()
+        );
+        fs::create_dir_all(prefix.join("Cellar").join(name).join("1.0")).unwrap();
+        fs::write(receipts.join(format!("{name}.json")), receipt.to_string()).unwrap();
+    }
+}
+
+#[test]
+fn reverse_dependencies_use_only_native_receipts() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    seed_native_graph(
+        &prefix,
+        &[
+            ("leaf", false, &[]),
+            ("middle", false, &["leaf"]),
+            ("program", true, &["middle"]),
+        ],
+    );
+    let direct = sandbox.run(&["deps", "--prefix", path, "leaf", "--reverse"]);
+    assert_success(&direct);
+    assert!(stdout(&direct).contains("middle"));
+    assert!(!stdout(&direct).contains("program"));
+    let tree = sandbox.run(&["deps", "--prefix", path, "leaf", "--reverse", "--tree"]);
+    assert_success(&tree);
+    assert!(stdout(&tree).contains("middle"));
+    assert!(stdout(&tree).contains("program"));
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn native_autoremove_previews_and_preserves_live_dependencies() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    let receipts = prefix.join(".brewrs/state/receipts");
+    seed_native_graph(
+        &prefix,
+        &[
+            ("app", true, &["shared", "app-only"]),
+            ("keeper", true, &["shared"]),
+            ("app-only", false, &[]),
+            ("shared", false, &[]),
+            ("orphan-tool", false, &[]),
+        ],
+    );
+    let preview = sandbox.run(&["autoremove", "--prefix", path, "--dry-run"]);
+    assert_success(&preview);
+    assert_row_containing(&stdout(&preview), "orphan-tool", &["1.0", "Remove"]);
+    assert!(!stdout(&preview).contains("app-only"));
+    assert!(receipts.join("orphan-tool.json").is_file());
+
+    let remove = sandbox.run(&["remove", "--prefix", path, "app", "--autoremove", "--yes"]);
+    assert_success(&remove);
+    assert_row_containing(&stdout(&remove), "app-only", &["1.0", "Remove"]);
+    for name in ["app", "app-only"] {
+        assert!(!receipts.join(format!("{name}.json")).exists());
+        assert!(!prefix.join("Cellar").join(name).join("1.0").exists());
+    }
+    for name in ["keeper", "shared", "orphan-tool"] {
+        assert!(receipts.join(format!("{name}.json")).is_file());
+    }
+
+    assert_success(&sandbox.run(&["autoremove", "--prefix", path, "--yes"]));
+    assert!(!receipts.join("orphan-tool.json").exists());
+    assert!(receipts.join("shared.json").is_file());
+    assert!(receipts.join("keeper.json").is_file());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn native_remove_previews_and_removes_only_the_owned_package() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    let path = prefix.to_str().unwrap();
+    let receipts = prefix.join(".brewrs/state/receipts");
+    let executable = prefix.join("Cellar/hello/2.12.3/bin/hello");
+    let bin = prefix.join("bin");
+    for directory in [
+        &receipts,
+        &prefix.join(".brewrs/stages"),
+        &bin,
+        &executable.parent().unwrap().to_path_buf(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(prefix.join(".brewrs-root"), "brewrs native store v1\n").unwrap();
+    fs::write(&executable, "an inert executable fixture\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let receipt = receipts.join("hello.json");
+    fs::write(&receipt, serde_json::json!({"name":"hello", "version":"2.12.3", "sha256":"a".repeat(64), "requested":true}).to_string()).unwrap();
+    let link = bin.join("hello");
+    symlink("../Cellar/hello/2.12.3/bin/hello", &link).unwrap();
+    let foreign = bin.join("custom-command");
+    fs::write(&foreign, b"leave me alone").unwrap();
+
+    let preview = sandbox.run(&["remove", "--prefix", path, "hello", "--dry-run"]);
+    assert_success(&preview);
+    assert_row_containing(&stdout(&preview), "hello", &["2.12.3", "Remove"]);
+    assert!(receipt.exists() && executable.exists() && link.is_symlink());
+
+    let missing = sandbox.run(&[
+        "native", "remove", "--prefix", path, "hello", "missing", "--yes",
+    ]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("'missing' is not installed"));
+    assert!(receipt.exists() && executable.exists() && link.is_symlink());
+
+    let applied = sandbox.run(&[
+        "native",
+        "remove",
+        "--prefix",
+        path,
+        "homebrew/core/hello",
+        "--yes",
+    ]);
+    assert_success(&applied);
+    assert!(!receipt.exists() && !executable.exists() && fs::symlink_metadata(&link).is_err());
+    assert_eq!(fs::read(&foreign).unwrap(), b"leave me alone");
+    sandbox.assert_no_brew();
 }
