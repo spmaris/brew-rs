@@ -14,7 +14,7 @@ use super::cleanup::CleanupStats;
 /// are skipped so removals can never escape the cache.
 pub struct BottleStore {
     bottles_dir: PathBuf,
-    digest_names_only: bool,
+    digest_suffix: Option<&'static str>,
 }
 
 impl BottleStore {
@@ -25,18 +25,22 @@ impl BottleStore {
     /// cleaned anything else, because `read_dir` would otherwise follow the
     /// link and delete files outside the cache.
     pub fn new(cache_dir: &Path) -> Result<Self> {
-        Self::bind(cache_dir.join("bottles"), false)
+        Self::bind(cache_dir.join("bottles"), None)
     }
 
     pub fn native(cache_dir: &Path) -> Result<Self> {
-        Self::bind(cache_dir.join(super::NATIVE_BOTTLE_DIR), true)
+        Self::bind(cache_dir.join(super::NATIVE_BOTTLE_DIR), Some(".tar.gz"))
     }
 
-    fn bind(bottles_dir: PathBuf, digest_names_only: bool) -> Result<Self> {
+    pub fn native_casks(cache_dir: &Path) -> Result<Self> {
+        Self::bind(cache_dir.join(super::NATIVE_CASK_DIR), Some(".download"))
+    }
+
+    fn bind(bottles_dir: PathBuf, digest_suffix: Option<&'static str>) -> Result<Self> {
         ensure_not_symlink(&bottles_dir)?;
         Ok(Self {
             bottles_dir,
-            digest_names_only,
+            digest_suffix,
         })
     }
 
@@ -86,7 +90,9 @@ impl BottleStore {
                 format!("Failed to inspect cache entry: {}", entry.path().display())
             })?;
             if !file_type.is_file()
-                || (self.digest_names_only && !is_digest_archive(&entry.file_name()))
+                || self
+                    .digest_suffix
+                    .is_some_and(|suffix| !is_digest_archive(&entry.file_name(), suffix))
             {
                 continue;
             }
@@ -140,9 +146,9 @@ impl BottleStore {
     }
 }
 
-fn is_digest_archive(name: &std::ffi::OsStr) -> bool {
+fn is_digest_archive(name: &std::ffi::OsStr, suffix: &str) -> bool {
     name.to_str()
-        .and_then(|name| name.strip_suffix(".tar.gz"))
+        .and_then(|name| name.strip_suffix(suffix))
         .is_some_and(|digest| {
             digest.len() == 64
                 && digest

@@ -1,9 +1,21 @@
 mod archive;
+mod cask_download;
+mod cask_extract;
+pub(crate) mod cask_install;
+mod cask_plan;
+pub(crate) mod cask_store;
 pub(crate) mod deps;
 mod download;
 pub(crate) mod info;
 pub(crate) mod install;
+mod macho_relocate;
+pub(crate) mod migration;
+mod migration_inventory;
 mod plan;
+mod relocate;
+mod relocation_paths;
+mod relocation_text;
+pub(crate) mod services;
 mod store;
 mod version;
 
@@ -91,7 +103,7 @@ pub async fn run(
     Ok(())
 }
 
-fn default_target() -> Result<String> {
+pub(super) fn default_target() -> Result<String> {
     let arch = std::env::consts::ARCH;
     match std::env::consts::OS {
         "linux" if matches!(arch, "aarch64" | "x86_64") => Ok(if arch == "aarch64" {

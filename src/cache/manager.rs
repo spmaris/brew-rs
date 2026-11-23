@@ -13,6 +13,7 @@ pub struct CacheManager {
     retention_days: u32,
     bottle_store: BottleStore,
     native_bottle_store: BottleStore,
+    native_cask_store: BottleStore,
 }
 
 impl CacheManager {
@@ -25,24 +26,30 @@ impl CacheManager {
             retention_days: config.storage.cache_retention,
             bottle_store: BottleStore::new(&config.storage.cache_dir)?,
             native_bottle_store: BottleStore::native(&config.storage.cache_dir)?,
+            native_cask_store: BottleStore::native_casks(&config.storage.cache_dir)?,
         })
     }
 
-    /// Remove bottle archives older than the configured retention.
+    /// Remove bottle and cask archives older than the configured retention.
     pub async fn clean_expired(&self) -> Result<CleanupStats> {
         let legacy = self.bottle_store.clean_expired(self.retention_days).await?;
         let native = self
             .native_bottle_store
             .clean_expired(self.retention_days)
             .await?;
-        Ok(combine(legacy, native))
+        let casks = self
+            .native_cask_store
+            .clean_expired(self.retention_days)
+            .await?;
+        Ok(combine(combine(legacy, native), casks))
     }
 
-    /// Remove all recognized bottle archives.
+    /// Remove all recognized bottle and cask archives.
     pub async fn clean_all(&self) -> Result<CleanupStats> {
         let legacy = self.bottle_store.clean_all().await?;
         let native = self.native_bottle_store.clean_all().await?;
-        Ok(combine(legacy, native))
+        let casks = self.native_cask_store.clean_all().await?;
+        Ok(combine(combine(legacy, native), casks))
     }
 }
 
@@ -99,6 +106,26 @@ mod tests {
         let stats = cache.clean_all().await?;
         assert_eq!(stats.bottles_removed, 1);
         assert_eq!(stats.bytes_freed, 9);
+        assert!(!archive.exists());
+        assert!(partial.exists() && unrelated.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clean_all_removes_only_published_native_cask_downloads() -> Result<()> {
+        let temp = tempdir()?;
+        let dir = temp.path().join(crate::cache::NATIVE_CASK_DIR);
+        fs::create_dir(&dir)?;
+        let archive = dir.join(format!("{}.download", "c".repeat(64)));
+        let partial = dir.join(format!("{}.download.part", "d".repeat(64)));
+        let unrelated = dir.join("notes.download");
+        fs::write(&archive, b"published cask")?;
+        fs::write(&partial, b"in progress")?;
+        fs::write(&unrelated, b"not a cask")?;
+        let cache = CacheManager::new(&config_with_cache(temp.path(), 30))?;
+        let stats = cache.clean_all().await?;
+        assert_eq!(stats.bottles_removed, 1);
+        assert_eq!(stats.bytes_freed, 14);
         assert!(!archive.exists());
         assert!(partial.exists() && unrelated.exists());
         Ok(())

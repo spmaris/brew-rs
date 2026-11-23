@@ -67,6 +67,32 @@ enum Commands {
         action: NativeAction,
     },
 
+    /// Audit a Homebrew installation without changing it
+    Migrate {
+        /// Absolute Homebrew prefix to inspect (otherwise use HOMEBREW_PREFIX or the platform default)
+        #[arg(long)]
+        brew_prefix: Option<PathBuf>,
+        /// Query official metadata for formula and dependency compatibility
+        #[arg(long)]
+        check: bool,
+        /// Inspect these launchd directories instead of the standard locations
+        #[arg(long = "service-dir", value_name = "DIR")]
+        service_dirs: Vec<PathBuf>,
+    },
+
+    /// Preview or list services for brewrs-managed packages without starting them
+    Services {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
+    /// Print shell environment exports for this brewrs prefix
+    Shellenv {
+        /// Shell syntax to emit (defaults to $SHELL)
+        #[arg(long, value_parser = ["sh", "bash", "zsh", "fish"])]
+        shell: Option<String>,
+    },
+
     /// Resolve a formula plan from Homebrew's repository without invoking brew
     Plan {
         #[arg(required = true)]
@@ -85,11 +111,14 @@ enum Commands {
         target: Option<String>,
     },
 
-    /// Install formula bottles into the brewrs prefix
+    /// Install formula bottles or supported casks into the brewrs prefix
     #[command(alias = "in")]
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
+        /// Target directory for installed cask .app bundles (defaults to <prefix>/Applications)
+        #[arg(long, conflicts_with = "formula")]
+        appdir: Option<PathBuf>,
         /// Force replacement (unsupported for portable bottle installs)
         #[arg(short, long)]
         force: bool,
@@ -165,27 +194,34 @@ enum Commands {
         /// Show available updates instead of the installed inventory
         #[arg(long, conflicts_with_all = ["sizes", "dates"])]
         outdated: bool,
+        /// Include auto-updating casks when checking outdated packages
+        #[arg(short, long)]
+        greedy: bool,
         /// Show disk usage (unsupported)
         #[arg(long)]
         sizes: bool,
         /// Show recorded install dates (unsupported)
         #[arg(long)]
         dates: bool,
+        #[command(flatten)]
+        kind: PackageKind,
     },
 
     /// List available updates (exit 100 when updates are found)
     #[command(visible_alias = "check-upgrade")]
     CheckUpdate {
-        /// Include auto-updating casks (unsupported)
+        /// Include auto-updating casks
         #[arg(short, long)]
         greedy: bool,
+        #[command(flatten)]
+        kind: PackageKind,
     },
 
     /// Upgrade installed packages
     #[command(alias = "up")]
     Upgrade {
         packages: Vec<String>,
-        /// Include auto-updating casks (unsupported)
+        /// Include auto-updating casks
         #[arg(short, long)]
         greedy: bool,
         #[command(flatten)]
@@ -267,6 +303,14 @@ enum NativeAction {
         transaction: Transaction,
     },
     /// List formulae installed by the native backend
+    List,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Preview an installed formula's declarative service without starting it
+    Plan { package: String },
+    /// List brewrs-owned service state without inspecting launchd or processes
     List,
 }
 
@@ -363,6 +407,31 @@ impl Cli {
                 }
                 NativeAction::List => native::list(&config, prefix)?,
             },
+            Commands::Migrate {
+                brew_prefix,
+                check,
+                service_dirs,
+            } => {
+                crate::native::migration::audit(
+                    &config,
+                    prefix,
+                    brew_prefix.as_deref(),
+                    service_dirs,
+                    check,
+                )
+                .await?;
+            }
+            Commands::Services { action } => match action {
+                ServiceAction::Plan { package } => {
+                    crate::native::services::preview(&config, prefix, &package).await?;
+                }
+                ServiceAction::List => {
+                    crate::native::services::list(&config, prefix)?;
+                }
+            },
+            Commands::Shellenv { shell } => {
+                native::shellenv(prefix, shell.as_deref())?;
+            }
             Commands::Plan { packages, target } => {
                 crate::native::run(&config, &packages, target.as_deref(), false).await?;
             }
@@ -371,6 +440,7 @@ impl Cli {
             }
             Commands::Install {
                 packages,
+                appdir,
                 force,
                 no_deps,
                 head,
@@ -378,19 +448,33 @@ impl Cli {
                 transaction,
             } => {
                 reject_unsupported(&[
-                    (kind.cask, "--cask"),
                     (head, "--head"),
                     (no_deps, "--no-deps"),
                     (force, "--force"),
                 ])?;
-                native::install(
-                    &config,
-                    prefix,
-                    &packages,
-                    transaction.dry_run,
-                    transaction.yes,
-                )
-                .await?;
+                if kind.cask {
+                    crate::native::cask_install::install(
+                        &config,
+                        prefix,
+                        appdir.as_deref(),
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )
+                    .await?;
+                } else {
+                    if appdir.is_some() {
+                        bail!("--appdir requires --cask; no changes were made.");
+                    }
+                    native::install(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )
+                    .await?;
+                }
             }
             Commands::Remove {
                 packages,
@@ -399,15 +483,27 @@ impl Cli {
                 kind,
                 transaction,
             } => {
-                reject_unsupported(&[(kind.cask, "--cask")])?;
-                native::remove(
-                    &config,
-                    prefix,
-                    &packages,
-                    transaction.dry_run,
-                    transaction.yes || force,
-                    autoremove,
-                )?;
+                if kind.cask {
+                    if autoremove {
+                        bail!("--autoremove is not supported with --cask; no changes were made.");
+                    }
+                    crate::native::cask_install::remove(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes || force,
+                    )?;
+                } else {
+                    native::remove(
+                        &config,
+                        prefix,
+                        &packages,
+                        transaction.dry_run,
+                        transaction.yes || force,
+                        autoremove,
+                    )?;
+                }
             }
             Commands::Autoremove { transaction } => {
                 native::autoremove(&config, prefix, transaction.dry_run, transaction.yes)?;
@@ -448,19 +544,32 @@ impl Cli {
             }
             Commands::List {
                 outdated,
+                greedy,
                 sizes,
                 dates,
+                kind,
             } => {
                 reject_unsupported(&[(sizes, "--sizes"), (dates, "--dates")])?;
+                if greedy && !outdated {
+                    bail!("--greedy requires --outdated; no changes were made.");
+                }
+                if greedy && kind.formula {
+                    bail!("--greedy is not supported with --formula; no changes were made.");
+                }
                 if outdated {
-                    native::check_updates(&config, prefix).await?;
+                    native::check_all_updates(&config, prefix, kind.formula, kind.cask, greedy)
+                        .await?;
                 } else {
-                    native::list(&config, prefix)?;
+                    native::list_all(&config, prefix, kind.formula, kind.cask)?;
                 }
             }
-            Commands::CheckUpdate { greedy } => {
-                reject_unsupported(&[(greedy, "--greedy")])?;
-                if native::check_updates(&config, prefix).await? {
+            Commands::CheckUpdate { greedy, kind } => {
+                if greedy && kind.formula {
+                    bail!("--greedy is not supported with --formula; no changes were made.");
+                }
+                if native::check_all_updates(&config, prefix, kind.formula, kind.cask, greedy)
+                    .await?
+                {
                     return Ok(ExitCode::from(100));
                 }
             }
@@ -470,11 +579,16 @@ impl Cli {
                 kind,
                 transaction,
             } => {
-                reject_unsupported(&[(kind.cask, "--cask"), (greedy, "--greedy")])?;
-                native::upgrade(
+                if greedy && kind.formula {
+                    bail!("--greedy is not supported with --formula; no changes were made.");
+                }
+                native::upgrade_all(
                     &config,
                     prefix,
                     &packages,
+                    kind.formula,
+                    kind.cask,
+                    greedy,
                     transaction.dry_run,
                     transaction.yes,
                 )

@@ -19,6 +19,9 @@ impl HttpClient {
         let mut client_builder =
             ClientBuilder::new().timeout(Duration::from_secs(config.downloads.timeout));
 
+        if !config.downloads.use_proxy {
+            client_builder = client_builder.no_proxy();
+        }
         if let Some(user_agent) = &config.downloads.user_agent {
             client_builder = client_builder.user_agent(user_agent);
         }
@@ -66,6 +69,16 @@ impl HttpClient {
         }
         serde_json::from_slice(&bytes).context("Failed to parse JSON response")
     }
+}
+
+/// Whether an error chain contains a typed HTTP `404 Not Found` status.
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            == Some(reqwest::StatusCode::NOT_FOUND)
+    })
 }
 
 #[cfg(test)]

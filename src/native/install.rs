@@ -8,8 +8,10 @@ use anyhow::{Context, Result, bail};
 use crate::{config::Config, ui::DnfStyleFormatter};
 
 use super::plan::PlannedFormula;
-use super::store::{Dependency, Prepared, Receipt, Store, validate_dependencies};
-use super::{archive, default_target, download, plan};
+use super::store::{
+    Dependency, Prepared, Receipt, Store, validate_conflicts, validate_dependencies,
+};
+use super::{archive, default_target, download, plan, relocate};
 
 pub(crate) async fn install(
     config: &Config,
@@ -25,8 +27,14 @@ pub(crate) async fn install(
     let store = Store::open(&path, false)?;
     let tag = default_target()?;
     let existing = store.installed()?;
+    let existing_casks = super::cask_store::installed(&store)?;
     let plan = plan::resolve(config, packages, &tag).await?;
     let pending = pending_packages(&plan, &existing)?;
+    let mut projected = existing.clone();
+    for item in &pending {
+        projected.push(item.receipt.clone());
+    }
+    super::cask_store::validate_cask_conflicts(&existing_casks, &projected)?;
     let promotions = requested_promotions(&plan, &existing);
     let formatter = DnfStyleFormatter::new(config);
     let rows: Vec<_> = plan
@@ -36,7 +44,17 @@ pub(crate) async fn install(
                 .iter()
                 .any(|entry| entry.receipt.name == formula.name)
             {
-                "Install"
+                if formula.cellar == ":any" {
+                    if formula.keg_only {
+                        "Relocate & install (keg-only)"
+                    } else {
+                        "Relocate & install"
+                    }
+                } else if formula.keg_only {
+                    "Install (keg-only)"
+                } else {
+                    "Install"
+                }
             } else if promotions
                 .iter()
                 .any(|receipt| receipt.name == formula.name)
@@ -92,6 +110,14 @@ pub(crate) async fn install(
         return Ok(());
     }
 
+    if pending.iter().any(|item| item.formula.cellar == ":any") {
+        relocate::preflight()?;
+    }
+    let service_names: Vec<String> = pending
+        .iter()
+        .filter(|item| item.formula.has_service)
+        .map(|item| item.formula.name.clone())
+        .collect();
     let mut downloaded = Vec::new();
     for candidate in pending {
         let bottle = fetch_formula(config, candidate.formula).await?;
@@ -102,11 +128,23 @@ pub(crate) async fn install(
     } else {
         Store::open_existing(&path)?
     };
-    let mut prepared = Vec::new();
+    let mut staged = Vec::new();
     for (candidate, bottle) in downloaded {
-        prepared.push(stage_formula(&store, candidate, &bottle)?);
+        let needs_relocation = candidate.formula.cellar == ":any";
+        staged.push((needs_relocation, stage_formula(&store, candidate, &bottle)?));
     }
+    relocate::staged(
+        store.prefix(),
+        staged
+            .iter()
+            .map(|(needs_relocation, package)| relocate::Item {
+                package,
+                needs_relocation: *needs_relocation,
+            }),
+    )?;
+    let prepared: Vec<_> = staged.into_iter().map(|(_, package)| package).collect();
     let count = prepared.len();
+    let any_keg_only = prepared.iter().any(|package| package.receipt.keg_only);
     if promotions.is_empty() {
         store.commit(prepared)?;
     } else {
@@ -122,6 +160,23 @@ pub(crate) async fn install(
             "{}",
             formatter.field("Bin", &store.prefix().join("bin").display().to_string())
         );
+        if any_keg_only {
+            println!(
+                "{}",
+                formatter.field("Opt", &store.prefix().join("opt").display().to_string())
+            );
+        }
+        if !service_names.is_empty() {
+            println!(
+                "Note: {} {} an optional service (not started automatically).",
+                service_names.join(", "),
+                if service_names.len() == 1 {
+                    "declares"
+                } else {
+                    "declare"
+                }
+            );
+        }
     }
     if !promotions.is_empty() {
         let names = promotions
@@ -208,11 +263,20 @@ fn receipt_for(
         });
     }
     dependencies.sort_by(|left, right| left.name.cmp(&right.name));
+    let version_scheme = formula.version_scheme.with_context(|| {
+        format!(
+            "'{}' does not declare a Homebrew version scheme",
+            formula.name
+        )
+    })?;
     Ok(Receipt {
         name: formula.name.clone(),
         version: formula.version.clone(),
+        version_scheme,
         sha256: formula.sha256.clone(),
         requested,
+        keg_only: formula.keg_only,
+        conflicts_with: formula.conflicts_with.clone(),
         dependencies,
     })
 }
@@ -258,16 +322,37 @@ pub(crate) async fn upgrade(
         return Ok(());
     }
 
+    if changes.iter().any(|item| item.formula.cellar == ":any") {
+        relocate::preflight()?;
+    }
     let store = Store::open_existing(&path)?;
-    let mut replacements = Vec::new();
+    let mut staged = Vec::new();
     for change in changes {
         let bottle = fetch_formula(config, &change.formula).await?;
+        let needs_relocation = change.formula.cellar == ":any";
         let candidate = Candidate {
             formula: &change.formula,
             receipt: change.new,
         };
-        replacements.push((change.old, stage_formula(&store, candidate, &bottle)?));
+        staged.push((
+            needs_relocation,
+            change.old,
+            stage_formula(&store, candidate, &bottle)?,
+        ));
     }
+    relocate::staged(
+        store.prefix(),
+        staged
+            .iter()
+            .map(|(needs_relocation, _, package)| relocate::Item {
+                package,
+                needs_relocation: *needs_relocation,
+            }),
+    )?;
+    let replacements: Vec<_> = staged
+        .into_iter()
+        .map(|(_, old, package)| (old, package))
+        .collect();
     let count = replacements.len();
     store.upgrade(replacements)?;
     println!(
@@ -367,6 +452,7 @@ fn planned_changes(
     validate_dependencies(&projected).context(
         "Upgrade would leave unmet dependency pins; select compatible updates together or install missing requirements first",
     )?;
+    validate_conflicts(&projected)?;
     Ok(changes)
 }
 
@@ -428,24 +514,37 @@ fn upgrade_plan<'a>(
             })?;
         // An unchanged bottle keeps its original pins. The projected graph
         // still rejects upgrading any library that this bottle depends on.
-        if new.version == old.version && new.sha256 == old.sha256 {
+        if new.version_scheme == Some(old.version_scheme)
+            && new.version == old.version
+            && new.sha256 == old.sha256
+        {
             continue;
         }
-        if new.version_scheme != Some(0) || !new.install_blockers.is_empty() {
+        let Some(new_scheme) = new.version_scheme else {
             bail!(
                 "Cannot upgrade {} natively: {}",
                 old.name,
                 if new.install_blockers.is_empty() {
-                    "unsupported version scheme".into()
+                    "unknown version scheme".into()
                 } else {
                     new.install_blockers.join("; ")
                 }
             );
+        };
+        if !new.install_blockers.is_empty() {
+            bail!(
+                "Cannot upgrade {} natively: {}",
+                old.name,
+                new.install_blockers.join("; ")
+            );
         }
         let receipt = receipt_for(new, plan, old.requested)?;
-        match super::version::compare(&new.version, &old.version)
-            .with_context(|| format!("Cannot compare native versions for '{}'", old.name))?
-        {
+        let ordering = match new_scheme.cmp(&old.version_scheme) {
+            Ordering::Equal => super::version::compare(&new.version, &old.version)
+                .with_context(|| format!("Cannot compare native versions for '{}'", old.name))?,
+            other => other,
+        };
+        match ordering {
             Ordering::Greater => changes.push((
                 old.clone(),
                 Candidate {
@@ -663,7 +762,7 @@ fn removal_plan(packages: &[String], installed: &[Receipt]) -> Result<Vec<Receip
 
 pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let store = Store::open(&prefix_path(prefix)?, false)?;
-    let mut receipts = store.installed()?;
+    let receipts = store.installed()?;
     if receipts.is_empty() {
         println!(
             "No brewrs-managed packages in {}.",
@@ -671,8 +770,155 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
         );
         return Ok(());
     }
-    receipts.sort_by(|left, right| left.name.cmp(&right.name));
     let formatter = DnfStyleFormatter::new(config);
+    render_formula_list(&formatter, receipts);
+    Ok(())
+}
+
+pub(crate) fn list_all(
+    config: &Config,
+    prefix: Option<&Path>,
+    formula_only: bool,
+    cask_only: bool,
+) -> Result<()> {
+    if cask_only {
+        return super::cask_install::list(config, prefix);
+    }
+    if formula_only {
+        return list(config, prefix);
+    }
+    let store = Store::open(&prefix_path(prefix)?, false)?;
+    let formulae = store.installed()?;
+    let casks = super::cask_store::installed(&store)?;
+    if formulae.is_empty() && casks.is_empty() {
+        println!(
+            "No brewrs-managed packages in {}.",
+            store.prefix().display()
+        );
+        return Ok(());
+    }
+    let formatter = DnfStyleFormatter::new(config);
+    let has_formulae = !formulae.is_empty();
+    if has_formulae {
+        render_formula_list(&formatter, formulae);
+    }
+    if !casks.is_empty() {
+        if has_formulae {
+            println!();
+        }
+        super::cask_install::render_cask_list(&formatter, &casks);
+    }
+    Ok(())
+}
+
+pub(crate) async fn check_all_updates(
+    config: &Config,
+    prefix: Option<&Path>,
+    formula_only: bool,
+    cask_only: bool,
+    greedy: bool,
+) -> Result<bool> {
+    if cask_only {
+        return super::cask_install::check_updates(config, prefix, greedy, false).await;
+    }
+    if formula_only {
+        return check_updates(config, prefix).await;
+    }
+    let store = Store::open(&prefix_path(prefix)?, false)?;
+    let formulae = store.installed()?;
+    let casks = super::cask_store::installed(&store)?;
+    if formulae.is_empty() && casks.is_empty() {
+        println!("No brewrs-managed packages to upgrade.");
+        return Ok(false);
+    }
+    let mut has_updates = false;
+    if !formulae.is_empty() {
+        has_updates |= check_updates(config, prefix).await?;
+    }
+    if !casks.is_empty() {
+        has_updates |=
+            super::cask_install::check_updates(config, prefix, greedy, !formulae.is_empty())
+                .await?;
+    }
+    Ok(has_updates)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upgrade_all(
+    config: &Config,
+    prefix: Option<&Path>,
+    packages: &[String],
+    formula_only: bool,
+    cask_only: bool,
+    greedy: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    if cask_only {
+        return super::cask_install::upgrade(config, prefix, packages, greedy, dry_run, yes).await;
+    }
+    if formula_only {
+        return upgrade(config, prefix, packages, dry_run, yes).await;
+    }
+    let path = prefix_path(prefix)?;
+    let store = Store::open(&path, false)?;
+    let installed_formulae = store.installed()?;
+    let installed_casks = super::cask_store::installed(&store)?;
+    if packages.is_empty() {
+        if installed_formulae.is_empty() && installed_casks.is_empty() {
+            println!("No brewrs-managed packages to upgrade.");
+            return Ok(());
+        }
+        if !installed_formulae.is_empty() {
+            upgrade(config, prefix, &[], dry_run, yes).await?;
+        }
+        if !installed_casks.is_empty() {
+            super::cask_install::upgrade(config, prefix, &[], greedy, dry_run, yes).await?;
+        }
+        return Ok(());
+    }
+
+    let mut formula_targets = Vec::new();
+    let mut cask_targets = Vec::new();
+    for raw in packages {
+        if raw.starts_with("homebrew/core/") {
+            formula_targets.push(raw.clone());
+        } else if raw.starts_with("homebrew/cask/") {
+            cask_targets.push(raw.clone());
+        } else {
+            let formula_name = plan::parse_target(raw);
+            let cask_token = super::cask_plan::parse_cask_target(raw);
+            let is_formula = formula_name
+                .as_ref()
+                .is_ok_and(|name| installed_formulae.iter().any(|r| r.name == *name));
+            let is_cask = cask_token
+                .as_ref()
+                .is_ok_and(|token| installed_casks.iter().any(|r| r.token == *token));
+            match (is_formula, is_cask) {
+                (true, true) => bail!(
+                    "'{raw}' is installed as both a formula and a cask; pass --formula or --cask"
+                ),
+                (true, false) => formula_targets.push(raw.clone()),
+                (false, true) => cask_targets.push(raw.clone()),
+                (false, false) => {
+                    formula_name?;
+                    bail!("'{raw}' is not installed in this brewrs prefix");
+                }
+            }
+        }
+    }
+
+    if !formula_targets.is_empty() {
+        upgrade(config, prefix, &formula_targets, dry_run, yes).await?;
+    }
+    if !cask_targets.is_empty() {
+        super::cask_install::upgrade(config, prefix, &cask_targets, greedy, dry_run, yes).await?;
+    }
+    Ok(())
+}
+
+fn render_formula_list(formatter: &DnfStyleFormatter, mut receipts: Vec<Receipt>) {
+    receipts.sort_by(|left, right| left.name.cmp(&right.name));
     let rows: Vec<_> = receipts
         .into_iter()
         .map(|receipt| {
@@ -693,7 +939,6 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
         "{}",
         formatter.table(&["Package", "Version", "Reason"], &rows)
     );
-    Ok(())
 }
 
 fn pending_packages<'a>(
@@ -725,6 +970,7 @@ fn pending_packages<'a>(
         pending.push(Candidate { formula, receipt });
     }
     validate_dependencies(&projected)?;
+    validate_conflicts(&projected)?;
     Ok(pending)
 }
 
@@ -732,7 +978,29 @@ fn pending_packages<'a>(
 /// naming the installed and available versions and bottle digests instead of
 /// lumping them into one vague "different version, bottle, or dependencies".
 fn replacement_conflict(installed: &Receipt, planned: &Receipt) -> String {
-    if installed.version != planned.version {
+    if installed.version_scheme != planned.version_scheme {
+        if planned.version_scheme > installed.version_scheme {
+            format!(
+                "{} {} (scheme {}) is installed but {} {} (scheme {}) is available; run native upgrade to replace the installed version",
+                installed.name,
+                installed.version,
+                installed.version_scheme,
+                planned.name,
+                planned.version,
+                planned.version_scheme
+            )
+        } else {
+            format!(
+                "{} {} (scheme {}) is installed but the plan resolves older {} {} (scheme {}); refusing to replace it in place",
+                installed.name,
+                installed.version,
+                installed.version_scheme,
+                planned.name,
+                planned.version,
+                planned.version_scheme
+            )
+        }
+    } else if installed.version != planned.version {
         match super::version::compare(&planned.version, &installed.version) {
             Ok(Ordering::Greater) => format!(
                 "{} {} is installed but {} {} is available; run native upgrade to replace the installed version",
@@ -772,7 +1040,113 @@ pub(super) fn prefix_path(prefix: Option<&Path>) -> Result<PathBuf> {
         .context("Cannot determine the native prefix; pass --prefix with an absolute path")
 }
 
-fn confirm() -> Result<bool> {
+/// Print shell environment exports for the selected brewrs prefix without
+/// creating or modifying any files.
+pub(crate) fn shellenv(prefix: Option<&Path>, shell: Option<&str>) -> Result<()> {
+    let path = prefix_path(prefix)?;
+    let script = render_shellenv(&path, shell, std::env::var_os("SHELL").as_deref())?;
+    print!("{script}");
+    Ok(())
+}
+
+fn render_shellenv(
+    prefix: &Path,
+    shell: Option<&str>,
+    shell_env: Option<&std::ffi::OsStr>,
+) -> Result<String> {
+    let raw = prefix
+        .to_str()
+        .context("brewrs prefix must be valid UTF-8 for shellenv")?;
+    if raw.is_empty() {
+        bail!("refusing an empty brewrs prefix");
+    }
+    if !prefix.is_absolute() {
+        bail!(
+            "refusing relative brewrs prefix '{}'; use an absolute path",
+            prefix.display()
+        );
+    }
+    if raw.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        bail!("refusing brewrs prefix with control characters for shellenv");
+    }
+    let normalized = if raw.len() > 1 {
+        raw.trim_end_matches('/')
+    } else {
+        raw
+    };
+    let normalized = if normalized.is_empty() {
+        "/"
+    } else {
+        normalized
+    };
+    let bin = if normalized == "/" {
+        "/bin".to_string()
+    } else {
+        format!("{normalized}/bin")
+    };
+    let sbin = if normalized == "/" {
+        "/sbin".to_string()
+    } else {
+        format!("{normalized}/sbin")
+    };
+
+    let is_fish = match shell {
+        Some("fish") => true,
+        Some(_) => false,
+        None => {
+            shell_env
+                .and_then(|value| Path::new(value).file_name())
+                .and_then(|name| name.to_str())
+                == Some("fish")
+        }
+    };
+
+    if is_fish {
+        Ok(format!(
+            "set -gx BREWRS_PREFIX {};\nfish_add_path -gP {} {};\n",
+            fish_quote(normalized),
+            fish_quote(&bin),
+            fish_quote(&sbin),
+        ))
+    } else {
+        let path_entries = format!("{bin}:{sbin}");
+        Ok(format!(
+            "export BREWRS_PREFIX={};\nexport PATH={}:\"$PATH\";\n",
+            posix_quote(normalized),
+            posix_quote(&path_entries),
+        ))
+    }
+}
+
+fn posix_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn fish_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+pub(super) fn confirm() -> Result<bool> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
         bail!("Confirmation requires a visible terminal; pass --assumeyes or --dry-run");
     }
@@ -795,6 +1169,9 @@ mod tests {
             name: "hello".into(),
             version: "1.2".into(),
             version_scheme: Some(0),
+            keg_only: false,
+            has_service: false,
+            conflicts_with: Vec::new(),
             requested: true,
             url: String::new(),
             sha256: "a".repeat(64),
@@ -821,8 +1198,11 @@ mod tests {
         Receipt {
             name: "hello".into(),
             version: version.into(),
+            version_scheme: 0,
             sha256: "a".repeat(64),
             requested: true,
+            keg_only: false,
+            conflicts_with: Vec::new(),
             dependencies: Vec::new(),
         }
     }
@@ -889,7 +1269,7 @@ mod tests {
     #[test]
     fn upgrade_only_selects_strictly_newer_compatible_bottles() {
         let mut formula = formula();
-        let old = [installed_hello("1.2")];
+        let mut old = [installed_hello("1.2")];
         assert!(upgrade_plan(&[formula.clone()], &old).unwrap().is_empty());
         formula.version = "1.2_1".into();
         formula.sha256 = "b".repeat(64);
@@ -899,7 +1279,29 @@ mod tests {
         assert_eq!(changes[0].0.version, "1.2");
         assert_eq!(changes[0].1.receipt.version, "1.2_1");
 
+        // Higher version_scheme upgrades even when numeric version resets.
         formula.version_scheme = Some(1);
+        formula.version = "1.0".into();
+        let scheme_planned = [formula.clone()];
+        let scheme_upgrade = upgrade_plan(&scheme_planned, &old).unwrap();
+        assert_eq!(scheme_upgrade.len(), 1);
+        assert_eq!(scheme_upgrade[0].1.receipt.version_scheme, 1);
+
+        // Lower version_scheme is rejected as a downgrade.
+        old[0].version_scheme = 1;
+        old[0].version = "1.0".into();
+        formula.version_scheme = Some(0);
+        formula.version = "2025.0".into();
+        assert!(
+            upgrade_plan(&[formula.clone()], &old)
+                .unwrap_err()
+                .to_string()
+                .contains("downgrade")
+        );
+
+        // Unknown version_scheme is rejected.
+        old[0].version_scheme = 0;
+        formula.version_scheme = None;
         assert!(
             upgrade_plan(&[formula.clone()], &old)
                 .unwrap_err()
@@ -1009,8 +1411,11 @@ mod tests {
         let mut receipt = Receipt {
             name: "hello".into(),
             version: "1.2".into(),
+            version_scheme: 0,
             sha256: "a".repeat(64),
             requested: true,
+            keg_only: false,
+            conflicts_with: Vec::new(),
             dependencies: Vec::new(),
         };
         assert!(
@@ -1026,8 +1431,11 @@ mod tests {
         Receipt {
             name: name.into(),
             version: version.into(),
+            version_scheme: 0,
             sha256: digest.to_string().repeat(64),
             requested: true,
+            keg_only: false,
+            conflicts_with: Vec::new(),
             dependencies: Vec::new(),
         }
     }
@@ -1152,5 +1560,78 @@ mod tests {
             .unwrap();
         assert!(!updates);
         assert!(!prefix.exists());
+    }
+
+    #[test]
+    fn install_and_upgrade_reject_symmetric_conflicts() {
+        let mut app = formula();
+        app.name = "app".into();
+        app.conflicts_with = vec!["other".into()];
+        let mut other = formula();
+        other.name = "other".into();
+
+        // Conflict within one install batch.
+        assert!(
+            pending_packages(&[app.clone(), other.clone()], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts with")
+        );
+
+        // Installed package declares conflict with newly requested package.
+        let mut installed_app = receipt("app", "1.2", 'a');
+        installed_app.conflicts_with = vec!["other".into()];
+        assert!(
+            pending_packages(&[other.clone()], std::slice::from_ref(&installed_app))
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts with")
+        );
+
+        // Upgrade introduces a conflict with another installed package.
+        let installed_other = receipt("other", "1.2", 'a');
+        let mut app_v2 = app.clone();
+        app_v2.version = "1.3".into();
+        app_v2.sha256 = "b".repeat(64);
+        assert!(
+            planned_changes(
+                &[app_v2],
+                &[receipt("app", "1.2", 'a'), installed_other],
+                &[receipt("app", "1.2", 'a')],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with")
+        );
+    }
+
+    #[test]
+    fn render_shellenv_quotes_paths_for_posix_and_fish() {
+        let prefix = Path::new("/tmp/brew's space/native/");
+        let posix = render_shellenv(prefix, Some("zsh"), None).unwrap();
+        assert_eq!(
+            posix,
+            "export BREWRS_PREFIX='/tmp/brew'\\''s space/native';\nexport PATH='/tmp/brew'\\''s space/native/bin:/tmp/brew'\\''s space/native/sbin':\"$PATH\";\n"
+        );
+
+        let fish_auto = render_shellenv(
+            Path::new("/tmp/space/native"),
+            None,
+            Some(std::ffi::OsStr::new("/opt/homebrew/bin/fish")),
+        )
+        .unwrap();
+        assert_eq!(
+            fish_auto,
+            "set -gx BREWRS_PREFIX '/tmp/space/native';\nfish_add_path -gP '/tmp/space/native/bin' '/tmp/space/native/sbin';\n"
+        );
+
+        let fish_quoted = render_shellenv(prefix, Some("fish"), None).unwrap();
+        assert_eq!(
+            fish_quoted,
+            "set -gx BREWRS_PREFIX '/tmp/brew\\'s space/native';\nfish_add_path -gP '/tmp/brew\\'s space/native/bin' '/tmp/brew\\'s space/native/sbin';\n"
+        );
+
+        assert!(render_shellenv(Path::new("relative/path"), Some("sh"), None).is_err());
+        assert!(render_shellenv(Path::new("/tmp/bad\npath"), Some("sh"), None).is_err());
     }
 }

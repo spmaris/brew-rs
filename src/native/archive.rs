@@ -10,11 +10,12 @@
 //! prefix is required and stripped.
 //!
 //! `.brew` metadata is skipped rather than extracted. Relative symlinks are
-//! accepted only when their target resolves lexically inside the keg and names
-//! a regular file or directory that was already staged. Link creation is
-//! deferred until every regular file and directory is written and the gzip
-//! stream has been fully verified, so extraction never traverses an archive
-//! link. Absolute, escaping, chained, cyclic, and broken links are rejected,
+//! accepted only when their target (and any symlink hops along it, up to a
+//! bounded depth) resolves lexically inside the keg and names a regular file or
+//! directory staged in the archive. Link creation is deferred until every
+//! regular file and directory is written and the gzip stream has been fully
+//! verified, so extraction never traverses an archive link. Absolute, escaping,
+//! cyclic, over-deep, and broken links are rejected,
 //! as are hardlinks, special files, duplicate paths, unsafe path components,
 //! and archives that exceed the count, depth, path, or size budgets.
 //! Ownership, set-id bits, timestamps, group/world write permission, and
@@ -63,6 +64,8 @@ const MAX_LINK_TARGET_BYTES: usize = 1024;
 const MAX_LINK_COMPONENTS: usize = 2 * MAX_DEPTH;
 /// Most symlinks accepted in one bottle.
 const MAX_SYMLINKS: usize = 20_000;
+/// Maximum number of symlink hops allowed when resolving a staged symlink target.
+const MAX_SYMLINK_HOPS: usize = 8;
 /// Buffer used for hashing.
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -235,6 +238,13 @@ fn verified_snapshot(archive: &Path, out: &Path, sha256: &str) -> Result<File> {
     Ok(snapshot)
 }
 
+/// A symlink entry buffered during tar streaming and validated once every
+/// entry in the archive is known.
+struct RawSymlink {
+    path: PathBuf,
+    target_bytes: Vec<u8>,
+}
+
 /// A syntactically and semantically validated symlink whose creation is
 /// deferred until the archive is completely verified.
 struct PendingSymlink {
@@ -248,6 +258,8 @@ struct PendingSymlink {
 ///
 /// Valid symlinks are collected and returned rather than created, so the
 /// caller never traverses them while the archive is still being read.
+/// Validation runs after every tar entry is seen so forward-referenced
+/// keg-internal symlinks (such as `bin/go -> ../libexec/bin/go`) succeed.
 fn extract<R: Read>(
     tar: &mut tar::Archive<R>,
     out: &Path,
@@ -256,7 +268,7 @@ fn extract<R: Read>(
 ) -> Result<Vec<PendingSymlink>> {
     let mut seen: HashMap<PathBuf, Seen> = HashMap::new();
     let mut directories: HashSet<PathBuf> = HashSet::new();
-    let mut symlinks: Vec<PendingSymlink> = Vec::new();
+    let mut raw_symlinks: Vec<RawSymlink> = Vec::new();
     let mut count = 0_usize;
     let mut declared_total = 0_u64;
 
@@ -326,13 +338,18 @@ fn extract<R: Read>(
                     relative.display()
                 );
             };
-            let target = resolve_symlink_target(&relative, &target_bytes, &seen, &directories)?;
-            if symlinks.len() >= MAX_SYMLINKS {
+            if target_bytes.len() > MAX_LINK_TARGET_BYTES {
+                bail!(
+                    "bottle archive symlink '{}' has a target longer than {MAX_LINK_TARGET_BYTES} bytes",
+                    relative.display()
+                );
+            }
+            if raw_symlinks.len() >= MAX_SYMLINKS {
                 bail!("bottle archive has more than {MAX_SYMLINKS} symlinks");
             }
-            symlinks.push(PendingSymlink {
+            raw_symlinks.push(RawSymlink {
                 path: relative,
-                target,
+                target_bytes: target_bytes.into_owned(),
             });
             continue;
         }
@@ -391,6 +408,29 @@ fn extract<R: Read>(
         set_mode(&destination, 0o644 | (mode & 0o111))?;
     }
 
+    let mut parsed = Vec::with_capacity(raw_symlinks.len());
+    let mut raw_targets = HashMap::with_capacity(raw_symlinks.len());
+    for raw in raw_symlinks {
+        if directories.contains(&raw.path) {
+            bail!(
+                "bottle archive symlink '{}' is used as an ancestor directory",
+                raw.path.display()
+            );
+        }
+        let immediate = parse_symlink_target(&raw.path, &raw.target_bytes)?;
+        raw_targets.insert(raw.path.clone(), immediate.clone());
+        parsed.push((raw.path, immediate));
+    }
+
+    let mut symlinks = Vec::with_capacity(parsed.len());
+    for (path, immediate) in parsed {
+        validate_symlink_chain(&path, &immediate, &seen, &directories, &raw_targets)?;
+        symlinks.push(PendingSymlink {
+            path,
+            target: immediate,
+        });
+    }
+
     Ok(symlinks)
 }
 
@@ -418,19 +458,13 @@ fn note_directories(relative: &Path, directories: &mut HashSet<PathBuf>) {
     }
 }
 
-/// Validate a symlink target and resolve it lexically to a keg-relative path.
+/// Validate a symlink target lexically and return its immediate keg-relative target.
 ///
 /// Only relative targets that stay inside the keg are accepted. `..` may only
 /// appear before any normal component, so a target can never rely on a
-/// directory that a later `..` cancels. The resolved path must name a regular
-/// file or directory that was already staged; chained links, links to links,
-/// and broken links fail closed.
-fn resolve_symlink_target(
-    link: &Path,
-    bytes: &[u8],
-    seen: &HashMap<PathBuf, Seen>,
-    directories: &HashSet<PathBuf>,
-) -> Result<PathBuf> {
+/// directory that a later `..` cancels. Chain, cycle, and existence checks run
+/// separately in [`validate_symlink_chain`] once all archive symlinks are known.
+fn parse_symlink_target(link: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if bytes.is_empty() {
         bail!(
             "bottle archive symlink '{}' has an empty target",
@@ -545,42 +579,114 @@ fn resolve_symlink_target(
         );
     }
 
-    let mut prefix = PathBuf::new();
-    for (index, component) in resolved.iter().enumerate() {
-        prefix.push(component);
-        let is_leaf = index + 1 == resolved.len();
-        match seen.get(&prefix) {
-            Some(Seen::File) if is_leaf => {}
-            Some(Seen::Dir) => {}
-            Some(Seen::File) => bail!(
-                "bottle archive symlink '{}' targets a path through a regular file",
-                link.display()
-            ),
-            Some(Seen::Symlink) if is_leaf => bail!(
-                "bottle archive symlink '{}' targets another symlink",
-                link.display()
-            ),
-            Some(Seen::Symlink) => bail!(
-                "bottle archive symlink '{}' targets a path through another symlink",
-                link.display()
-            ),
-            None if directories.contains(&prefix) => {}
-            None => bail!(
-                "bottle archive symlink '{}' targets '{}', which was not staged before it",
-                link.display(),
-                prefix.display()
-            ),
-        }
+    let mut immediate = PathBuf::new();
+    for component in resolved {
+        immediate.push(component);
     }
-    // A directory link to one of its own ancestors can be followed forever
-    // (for example `lib/sub/link -> ..`), so it is not a simple link.
-    if link_components.starts_with(&resolved) {
+    Ok(immediate)
+}
+
+/// Resolve an immediate keg-relative symlink target purely in-memory across
+/// bounded symlink hops, ensuring it is acyclic and ends at a staged regular
+/// file or non-ancestor directory.
+fn validate_symlink_chain(
+    link: &Path,
+    immediate: &Path,
+    seen: &HashMap<PathBuf, Seen>,
+    directories: &HashSet<PathBuf>,
+    raw_targets: &HashMap<PathBuf, PathBuf>,
+) -> Result<()> {
+    let mut current = immediate.to_path_buf();
+    let mut hops = 0usize;
+    let mut visited = HashSet::new();
+    visited.insert(link.to_path_buf());
+
+    'walk: loop {
+        let components: Vec<PathBuf> = current
+            .components()
+            .map(|component| PathBuf::from(component.as_os_str()))
+            .collect();
+        let mut prefix = PathBuf::new();
+        for (index, component) in components.iter().enumerate() {
+            prefix.push(component);
+            let is_leaf = index + 1 == components.len();
+            match seen.get(&prefix) {
+                Some(Seen::File) if is_leaf => return Ok(()),
+                Some(Seen::File) => bail!(
+                    "bottle archive symlink '{}' targets a path through a regular file",
+                    link.display()
+                ),
+                Some(Seen::Dir) => {
+                    if is_leaf {
+                        // A directory link to one of its own ancestors can be
+                        // followed forever (for example `lib/sub/link -> ..`),
+                        // so it is not a simple link.
+                        if link.starts_with(&prefix) {
+                            bail!(
+                                "bottle archive symlink '{}' targets an ancestor directory, which would form a cycle",
+                                link.display()
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+                Some(Seen::Symlink) => {
+                    if !visited.insert(prefix.clone()) {
+                        bail!(
+                            "bottle archive symlink '{}' forms a symlink cycle",
+                            link.display()
+                        );
+                    }
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        bail!(
+                            "bottle archive symlink '{}' exceeds the symlink resolution depth limit of {MAX_SYMLINK_HOPS}",
+                            link.display()
+                        );
+                    }
+                    let expanded_base = raw_targets.get(&prefix).with_context(|| {
+                        format!(
+                            "bottle archive symlink '{}' references unresolved symlink '{}'",
+                            link.display(),
+                            prefix.display()
+                        )
+                    })?;
+                    let mut expanded = expanded_base.clone();
+                    for tail in &components[index + 1..] {
+                        expanded.push(tail);
+                    }
+                    if expanded.components().count() > MAX_DEPTH {
+                        bail!(
+                            "bottle archive symlink '{}' has a target that exceeds the depth limit of {MAX_DEPTH}",
+                            link.display()
+                        );
+                    }
+                    current = expanded;
+                    continue 'walk;
+                }
+                None if directories.contains(&prefix) => {
+                    if is_leaf {
+                        if link.starts_with(&prefix) {
+                            bail!(
+                                "bottle archive symlink '{}' targets an ancestor directory, which would form a cycle",
+                                link.display()
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+                None => bail!(
+                    "bottle archive symlink '{}' targets '{}', which is not staged in the archive",
+                    link.display(),
+                    prefix.display()
+                ),
+            }
+        }
         bail!(
-            "bottle archive symlink '{}' targets an ancestor directory, which would form a cycle",
+            "bottle archive symlink '{}' resolves to an empty path",
             link.display()
         );
     }
-    Ok(prefix)
 }
 
 /// Create the deferred symlinks after all regular entries are in place.
@@ -1475,7 +1581,7 @@ mod tests {
             ("..", "resolves to the keg root"),
             ("..\\lib\\real", "backslash"),
             ("real/../lib", "'..' after a normal component"),
-            ("missing", "was not staged before it"),
+            ("missing", "not staged in the archive"),
         ] {
             let staged = staged_link(target);
             let error = unpack_fixture(&staged).expect_err(target);
@@ -1568,38 +1674,32 @@ mod tests {
     fn rejects_chained_cyclic_and_duplicate_symlinks() {
         let cases = [
             (
-                "chained",
-                vec![
-                    Fixture {
-                        path: "hello/2.12.1/lib/real",
-                        kind: FixtureKind::File,
-                        data: b"x",
-                        mode: 0o644,
-                    },
-                    Fixture {
-                        path: "hello/2.12.1/lib/first",
-                        kind: FixtureKind::Symlink("real"),
-                        data: b"",
-                        mode: 0o777,
-                    },
-                    Fixture {
-                        path: "hello/2.12.1/lib/second",
-                        kind: FixtureKind::Symlink("first"),
-                        data: b"",
-                        mode: 0o777,
-                    },
-                ],
-                "another symlink",
-            ),
-            (
-                "cyclic",
+                "self_cycle",
                 vec![Fixture {
                     path: "hello/2.12.1/lib/self",
                     kind: FixtureKind::Symlink("self"),
                     data: b"",
                     mode: 0o777,
                 }],
-                "another symlink",
+                "cycle",
+            ),
+            (
+                "two_cycle",
+                vec![
+                    Fixture {
+                        path: "hello/2.12.1/lib/a",
+                        kind: FixtureKind::Symlink("b"),
+                        data: b"",
+                        mode: 0o777,
+                    },
+                    Fixture {
+                        path: "hello/2.12.1/lib/b",
+                        kind: FixtureKind::Symlink("a"),
+                        data: b"",
+                        mode: 0o777,
+                    },
+                ],
+                "cycle",
             ),
             (
                 "duplicate",
@@ -1799,5 +1899,264 @@ mod tests {
             .expect_err("over-budget input must fail");
         assert!(error.to_string().contains("decompressed byte limit"));
         assert_eq!(output.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracts_forward_referenced_contained_relative_symlinks() {
+        let entries = vec![
+            Fixture {
+                path: "hello/2.12.1/bin/go",
+                kind: FixtureKind::Symlink("../libexec/bin/go"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/bin/gofmt",
+                kind: FixtureKind::Symlink("../libexec/bin/gofmt"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/libexec/bin/go",
+                kind: FixtureKind::File,
+                data: b"go-binary",
+                mode: 0o755,
+            },
+            Fixture {
+                path: "hello/2.12.1/libexec/bin/gofmt",
+                kind: FixtureKind::File,
+                data: b"gofmt-binary",
+                mode: 0o755,
+            },
+        ];
+        let staged = stage(&gzipped(&entries));
+        unpack_fixture(&staged).expect("forward-referenced relative links");
+
+        assert_eq!(
+            fs::read_link(staged.out.join("bin/go")).expect("go link"),
+            Path::new("../libexec/bin/go")
+        );
+        assert_eq!(
+            fs::read(staged.out.join("bin/go")).expect("read go via link"),
+            b"go-binary"
+        );
+        assert_eq!(
+            fs::read(staged.out.join("bin/gofmt")).expect("read gofmt via link"),
+            b"gofmt-binary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracts_bounded_chained_and_directory_symlinks() {
+        let forward_chain = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.dylib",
+                kind: FixtureKind::Symlink("libfoo.1.dylib"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.1.dylib",
+                kind: FixtureKind::Symlink("libfoo.1.2.dylib"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.1.2.dylib",
+                kind: FixtureKind::Symlink("libfoo.1.2.3.dylib"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.1.2.3.dylib",
+                kind: FixtureKind::File,
+                data: b"dylib-bytes",
+                mode: 0o755,
+            },
+        ];
+        let staged = stage(&gzipped(&forward_chain));
+        unpack_fixture(&staged).expect("forward 3-hop chain");
+        assert_eq!(
+            fs::read_link(staged.out.join("lib/libfoo.dylib")).unwrap(),
+            Path::new("libfoo.1.dylib")
+        );
+        assert_eq!(
+            fs::read(staged.out.join("lib/libfoo.dylib")).unwrap(),
+            b"dylib-bytes"
+        );
+
+        let reverse_chain = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.1.2.3.dylib",
+                kind: FixtureKind::File,
+                data: b"reverse-bytes",
+                mode: 0o755,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.1.dylib",
+                kind: FixtureKind::Symlink("libfoo.1.2.3.dylib"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/libfoo.dylib",
+                kind: FixtureKind::Symlink("libfoo.1.dylib"),
+                data: b"",
+                mode: 0o777,
+            },
+        ];
+        let staged = stage(&gzipped(&reverse_chain));
+        unpack_fixture(&staged).expect("reverse 2-hop chain");
+        assert_eq!(
+            fs::read(staged.out.join("lib/libfoo.dylib")).unwrap(),
+            b"reverse-bytes"
+        );
+
+        let dir_symlink_chain = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/icu/Makefile.inc",
+                kind: FixtureKind::Symlink("current/Makefile.inc"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/icu/current",
+                kind: FixtureKind::Symlink("79.1"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/icu/79.1/Makefile.inc",
+                kind: FixtureKind::File,
+                data: b"icu-makefile",
+                mode: 0o644,
+            },
+        ];
+        let staged = stage(&gzipped(&dir_symlink_chain));
+        unpack_fixture(&staged).expect("directory symlink traversal");
+        assert_eq!(
+            fs::read_link(staged.out.join("lib/icu/Makefile.inc")).unwrap(),
+            Path::new("current/Makefile.inc")
+        );
+        assert_eq!(
+            fs::read(staged.out.join("lib/icu/Makefile.inc")).unwrap(),
+            b"icu-makefile"
+        );
+
+        let indirect_ancestor_cycle = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/sub/dir",
+                kind: FixtureKind::Symlink("up"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/sub/up",
+                kind: FixtureKind::Symlink(".."),
+                data: b"",
+                mode: 0o777,
+            },
+        ];
+        let error = unpack_fixture(&stage(&gzipped(&indirect_ancestor_cycle)))
+            .expect_err("indirect ancestor cycle must fail");
+        assert!(
+            format!("{error:#}").contains("ancestor directory"),
+            "{error:#}"
+        );
+
+        let broken_chain = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/a",
+                kind: FixtureKind::Symlink("b"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/b",
+                kind: FixtureKind::Symlink("missing"),
+                data: b"",
+                mode: 0o777,
+            },
+        ];
+        let error =
+            unpack_fixture(&stage(&gzipped(&broken_chain))).expect_err("broken chain must fail");
+        assert!(
+            format!("{error:#}").contains("not staged in the archive"),
+            "{error:#}"
+        );
+
+        let deep_chain = vec![
+            Fixture {
+                path: "hello/2.12.1/lib/l0",
+                kind: FixtureKind::Symlink("l1"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l1",
+                kind: FixtureKind::Symlink("l2"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l2",
+                kind: FixtureKind::Symlink("l3"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l3",
+                kind: FixtureKind::Symlink("l4"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l4",
+                kind: FixtureKind::Symlink("l5"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l5",
+                kind: FixtureKind::Symlink("l6"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l6",
+                kind: FixtureKind::Symlink("l7"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l7",
+                kind: FixtureKind::Symlink("l8"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l8",
+                kind: FixtureKind::Symlink("l9"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/l9",
+                kind: FixtureKind::Symlink("real"),
+                data: b"",
+                mode: 0o777,
+            },
+            Fixture {
+                path: "hello/2.12.1/lib/real",
+                kind: FixtureKind::File,
+                data: b"x",
+                mode: 0o644,
+            },
+        ];
+        let error =
+            unpack_fixture(&stage(&gzipped(&deep_chain))).expect_err("over-deep chain must fail");
+        assert!(format!("{error:#}").contains("depth limit"), "{error:#}");
     }
 }

@@ -46,7 +46,7 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
     if dry_run {
         let scope = if all { "all" } else { "expired" };
         println!(
-            "Would clean {scope} brew-rs cache entries in {} (Homebrew catalogs and bottle archives).",
+            "Would clean {scope} brew-rs cache entries in {} (Homebrew catalogs, bottles, and casks).",
             config.storage.cache_dir.display()
         );
         return Ok(());
@@ -75,7 +75,7 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
             formatter.format_size(catalog_bytes),
         ],
         vec![
-            "Bottle archives".to_string(),
+            "Bottle and cask archives".to_string(),
             bottles.bottles_removed.to_string(),
             formatter.format_size(bottles.bytes_freed),
         ],

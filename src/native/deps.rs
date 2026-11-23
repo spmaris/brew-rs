@@ -34,7 +34,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::api::http_client::HttpClient;
+use crate::api::catalog_cache;
+use crate::api::http_client::{HttpClient, is_not_found};
 use crate::config::Config;
 use crate::ui::DnfStyleFormatter;
 
@@ -103,6 +104,7 @@ async fn forward_deps(config: &Config, package: &str, tree: bool) -> Result<()> 
     let tag = super::default_target()?;
     let source = HttpFormulaSource {
         http: HttpClient::new(config)?,
+        config: config.clone(),
     };
     let graph = build_forward_graph(&source, &target, &tag, tree).await?;
     let root = graph
@@ -263,16 +265,31 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
 /// [`plan`]'s online formula source, using the shared HTTP client.
 struct HttpFormulaSource {
     http: HttpClient,
+    config: Config,
 }
 
 impl FormulaSource for HttpFormulaSource {
     async fn fetch(&self, name: &str) -> Result<FormulaPayload> {
         // `name` comes from `plan::parse_target`, so it cannot alter the path.
         let url = format!("{API_BASE}/formula/{name}.json");
-        self.http
-            .fetch_json(&url)
-            .await
-            .with_context(|| format!("failed to fetch formula metadata from {url}"))
+        match self.http.fetch_json(&url).await {
+            Ok(payload) => Ok(payload),
+            Err(error) => {
+                if is_not_found(&error) {
+                    if let Ok(Some(canonical)) =
+                        catalog_cache::resolve_formula_alias(&self.config, name).await
+                    {
+                        if !canonical.contains('/') && plan::parse_target(&canonical).is_ok() {
+                            let alias_url = format!("{API_BASE}/formula/{canonical}.json");
+                            return self.http.fetch_json(&alias_url).await.with_context(|| {
+                                format!("failed to fetch formula metadata from {alias_url}")
+                            });
+                        }
+                    }
+                }
+                Err(error).with_context(|| format!("failed to fetch formula metadata from {url}"))
+            }
+        }
     }
 }
 
@@ -1248,8 +1265,11 @@ mod tests {
         Receipt {
             name: name.to_string(),
             version: version.to_string(),
+            version_scheme: 0,
             sha256: DIGEST_A.to_string(),
             requested,
+            keg_only: false,
+            conflicts_with: Vec::new(),
             dependencies: pins
                 .iter()
                 .map(|(name, version, sha256)| Dependency {

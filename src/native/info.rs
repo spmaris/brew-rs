@@ -18,9 +18,9 @@
 //! [`HttpClient`] preserves the typed `reqwest::StatusCode` on its error chain,
 //! so the HTTP source classifies a failure as "not found" only when a
 //! `reqwest::Error` in that chain carries `404 Not Found`. Error text is never
-//! inspected, and every other failure is propagated with its context. The
-//! per-name endpoints do not resolve aliases or old names; those still require
-//! `brew` and are intentionally out of scope.
+//! inspected, and every other failure is propagated with its context. When a
+//! formula endpoint returns `404`, [`HttpMetadataSource`] checks the formula
+//! catalog for an exact alias or old name before falling back to casks.
 //!
 //! # Data shown
 //!
@@ -32,9 +32,8 @@
 //! * Cask: human name, description, tap, version (and auto-updating state),
 //!   homepage, old tokens, `depends_on`, conflicts, deprecation or disable
 //!   state, caveats, and the inline install counts.
-//! * Installed state: for formulae only, overlaid from the native brewrs
-//!   receipts in the selected prefix. Casks are not tracked by the native
-//!   store, so their installed state is reported as unknown.
+//! * Installed state: overlaid from native formula and cask receipts in the
+//!   selected prefix.
 //!
 //! `info --analytics` renders the package payload's inline install map. The
 //! standalone [`analytics`] function reads the tap-scoped analytics endpoint
@@ -49,10 +48,12 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::api::http_client::HttpClient;
+use crate::api::catalog_cache;
+use crate::api::http_client::{HttpClient, is_not_found};
 use crate::config::Config;
 use crate::ui::DnfStyleFormatter;
 
+use super::cask_plan::{CaskVersionOrder, compare_cask_versions};
 use super::install::prefix_path;
 use super::store::Store;
 
@@ -272,12 +273,14 @@ trait MetadataSource {
 /// [`MetadataSource`] backed by the official API over [`HttpClient`].
 struct HttpMetadataSource {
     http: HttpClient,
+    config: Config,
 }
 
 impl HttpMetadataSource {
     fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             http: HttpClient::new(config)?,
+            config: config.clone(),
         })
     }
 }
@@ -287,7 +290,27 @@ impl MetadataSource for HttpMetadataSource {
         let url = format!("{API_BASE}/{}/{name}.json", Kind::Formula.endpoint());
         match self.http.fetch_json(&url).await {
             Ok(payload) => Ok(payload),
-            Err(error) => Err(classify_http_error(&url, error)),
+            Err(error) => {
+                if is_not_found(&error) {
+                    if let Ok(Some(canonical)) =
+                        catalog_cache::resolve_formula_alias(&self.config, name).await
+                    {
+                        if !canonical.contains('/')
+                            && validate_identifier(&canonical, "formula alias").is_ok()
+                        {
+                            let alias_url =
+                                format!("{API_BASE}/{}/{canonical}.json", Kind::Formula.endpoint());
+                            return match self.http.fetch_json(&alias_url).await {
+                                Ok(payload) => Ok(payload),
+                                Err(alias_error) => {
+                                    Err(classify_http_error(&alias_url, alias_error))
+                                }
+                            };
+                        }
+                    }
+                }
+                Err(classify_http_error(&url, error))
+            }
         }
     }
 
@@ -319,16 +342,6 @@ fn classify_http_error(url: &str, error: anyhow::Error) -> LookupError {
     } else {
         LookupError::Failed(error.context(format!("GET {url} failed")))
     }
-}
-
-/// A 404 is recognised only from the typed reqwest status, never from text.
-fn is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .and_then(reqwest::Error::status)
-            == Some(reqwest::StatusCode::NOT_FOUND)
-    })
 }
 
 /// Build the tap-scoped analytics endpoint for a period.
@@ -462,7 +475,7 @@ fn print_info(
         }
         Kind::Cask => {
             if let Some(cask) = metadata.cask.as_ref() {
-                print_cask(&formatter, metadata, cask, deps, show_analytics);
+                print_cask(&formatter, prefix, metadata, cask, deps, show_analytics);
             }
         }
     }
@@ -575,6 +588,7 @@ fn print_formula(
 
 fn print_cask(
     formatter: &DnfStyleFormatter,
+    prefix: Option<&Path>,
     metadata: &Metadata,
     cask: &CaskResponse,
     deps: bool,
@@ -611,9 +625,20 @@ fn print_cask(
     if let Some(conflicts) = cask_conflicts_value(&cask.conflicts_with) {
         println!("{}", formatter.field("Conflicts", &conflicts));
     }
+    let installed = read_installed_cask(prefix, &metadata.name);
+    if let InstalledCask::Unknown(reason) = &installed {
+        eprintln!(
+            "{} could not read brewrs cask receipts: {}",
+            formatter.warning("warning:"),
+            one_line(reason)
+        );
+    }
     println!(
         "{}",
-        formatter.field("Installed", "unknown (brewrs manages formulae only)")
+        formatter.field(
+            "Installed",
+            &describe_installed_cask(&installed, &cask.version)
+        )
     );
 
     for message in cask_status_messages(cask, &metadata.name) {
@@ -1171,6 +1196,53 @@ fn describe_installed(installed: &Installed, available: Option<&str>, revision: 
         }
         Installed::Absent => "not installed by brewrs".to_string(),
         Installed::Unknown(_) => "unknown".to_string(),
+    }
+}
+
+#[derive(Debug)]
+enum InstalledCask {
+    Present { version: String },
+    Absent,
+    Unknown(String),
+}
+
+fn read_installed_cask(prefix: Option<&Path>, token: &str) -> InstalledCask {
+    let path = match prefix_path(prefix) {
+        Ok(path) => path,
+        Err(error) => return InstalledCask::Unknown(format!("{error:#}")),
+    };
+    let store = match Store::open(&path, false) {
+        Ok(store) => store,
+        Err(error) => return InstalledCask::Unknown(format!("{error:#}")),
+    };
+    let receipts = match super::cask_store::installed(&store) {
+        Ok(receipts) => receipts,
+        Err(error) => return InstalledCask::Unknown(format!("{error:#}")),
+    };
+    match receipts.into_iter().find(|receipt| receipt.token == token) {
+        Some(receipt) => InstalledCask::Present {
+            version: receipt.version,
+        },
+        None => InstalledCask::Absent,
+    }
+}
+
+fn describe_installed_cask(installed: &InstalledCask, available: &str) -> String {
+    match installed {
+        InstalledCask::Present { version } => {
+            let available = available.trim();
+            if available.is_empty() {
+                return version.clone();
+            }
+            let status = match compare_cask_versions(available, version) {
+                CaskVersionOrder::Same => "up to date",
+                CaskVersionOrder::Upgrade => "update available",
+                CaskVersionOrder::Downgrade => "newer than the API version",
+            };
+            format!("{version} ({status})")
+        }
+        InstalledCask::Absent => "not installed by brewrs".to_string(),
+        InstalledCask::Unknown(_) => "unknown".to_string(),
     }
 }
 
@@ -1897,6 +1969,36 @@ mod tests {
             Installed::Absent => {}
             other => panic!("unowned prefix must be absent, got {other:?}"),
         }
+        match read_installed_cask(Some(prefix.path()), "firefox") {
+            InstalledCask::Absent => {}
+            other => panic!("unowned prefix must be absent for casks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cask_installed_overlay_reports_version_and_update_state() {
+        assert_eq!(
+            describe_installed_cask(
+                &InstalledCask::Present {
+                    version: "141.0".into(),
+                },
+                "142.0",
+            ),
+            "141.0 (update available)"
+        );
+        assert_eq!(
+            describe_installed_cask(
+                &InstalledCask::Present {
+                    version: "142.0".into(),
+                },
+                "142.0",
+            ),
+            "142.0 (up to date)"
+        );
+        assert_eq!(
+            describe_installed_cask(&InstalledCask::Absent, "142.0"),
+            "not installed by brewrs"
+        );
     }
 
     #[test]

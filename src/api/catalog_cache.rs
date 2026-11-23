@@ -49,6 +49,102 @@ pub struct Catalog<T> {
     pub warnings: Vec<String>,
 }
 
+/// Resolve an alias or old formula name to its unique canonical `homebrew/core`
+/// formula name from a loaded catalog slice.
+pub fn find_formula_alias(formulae: &[Formula], query: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(name) = unique_match(
+        formulae,
+        |formula| formula.name.as_str(),
+        |formula| formula.aliases.iter().any(|alias| alias == query),
+    ) {
+        if name != query {
+            return Some(name);
+        }
+    }
+    if let Some(name) = unique_match(
+        formulae,
+        |formula| formula.name.as_str(),
+        |formula| formula.oldnames.iter().any(|old| old == query),
+    ) {
+        if name != query {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Resolve an old cask token to its unique canonical `homebrew/cask` token
+/// from a loaded catalog slice.
+pub fn find_cask_old_token(casks: &[Cask], query: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let token = unique_match(
+        casks,
+        |cask| cask.token.as_str(),
+        |cask| cask.old_tokens.iter().any(|old| old == query),
+    )?;
+    if token == query { None } else { Some(token) }
+}
+
+fn unique_match<T, K, P>(items: &[T], key: K, predicate: P) -> Option<String>
+where
+    K: Fn(&T) -> &str,
+    P: Fn(&T) -> bool,
+{
+    let mut matched: Option<&str> = None;
+    for item in items {
+        let id = key(item);
+        if id.is_empty() || !predicate(item) {
+            continue;
+        }
+        match matched {
+            None => matched = Some(id),
+            Some(previous) if previous == id => {}
+            Some(_) => return None,
+        }
+    }
+    matched.map(str::to_owned)
+}
+
+/// Resolve an alias or old name using the cached formula catalog, refreshing
+/// once if the cached catalog appears to predate `aliases`/`oldnames` fields.
+pub async fn resolve_formula_alias(config: &Config, query: &str) -> Result<Option<String>> {
+    let client = BrewApiClient::new(config)?;
+    let catalog = load_formulae(&client, config, CachePolicy::PreferFresh).await?;
+    if let Some(canonical) = find_formula_alias(&catalog.items, query) {
+        return Ok(Some(canonical));
+    }
+    if !catalog.items.is_empty()
+        && catalog
+            .items
+            .iter()
+            .all(|formula| formula.aliases.is_empty() && formula.oldnames.is_empty())
+    {
+        let refreshed = load_formulae(&client, config, CachePolicy::Refresh).await?;
+        return Ok(find_formula_alias(&refreshed.items, query));
+    }
+    Ok(None)
+}
+
+/// Resolve an old cask token using the cached cask catalog, refreshing once if
+/// the cached catalog appears to predate `old_tokens` fields.
+pub async fn resolve_cask_old_token(config: &Config, query: &str) -> Result<Option<String>> {
+    let client = BrewApiClient::new(config)?;
+    let catalog = load_casks(&client, config, CachePolicy::PreferFresh).await?;
+    if let Some(canonical) = find_cask_old_token(&catalog.items, query) {
+        return Ok(Some(canonical));
+    }
+    if !catalog.items.is_empty() && catalog.items.iter().all(|cask| cask.old_tokens.is_empty()) {
+        let refreshed = load_casks(&client, config, CachePolicy::Refresh).await?;
+        return Ok(find_cask_old_token(&refreshed.items, query));
+    }
+    Ok(None)
+}
+
 /// Load the formula catalog according to `policy`.
 pub async fn load_formulae(
     client: &BrewApiClient,
@@ -607,5 +703,76 @@ mod tests {
         let error = clean_catalogs(&config, true).await.unwrap_err();
         assert!(error.to_string().contains("symlinked"));
         Ok(())
+    }
+
+    #[test]
+    fn resolves_unique_aliases_and_oldnames_safely() {
+        let mut kubectl = formula("kubernetes-cli");
+        kubectl.aliases = vec!["kubectl".into(), "kubernetes-cli@1.37".into()];
+        let mut neovim = formula("neovim");
+        neovim.aliases = vec!["nvim".into()];
+        let mut renamed = formula("new-name");
+        renamed.oldnames = vec!["legacy-name".into(), "shared-name".into()];
+        let mut alias_winner = formula("alias-owner");
+        alias_winner.aliases = vec!["shared-name".into()];
+        let mut self_ref = formula("self-tool");
+        self_ref.aliases = vec!["self-tool".into()];
+        let mut dup_a = formula("first-owner");
+        dup_a.aliases = vec!["ambiguous".into()];
+        let mut dup_b = formula("second-owner");
+        dup_b.aliases = vec!["ambiguous".into()];
+
+        let formulae = vec![
+            kubectl,
+            neovim,
+            renamed,
+            alias_winner,
+            self_ref,
+            dup_a,
+            dup_b,
+        ];
+
+        assert_eq!(
+            find_formula_alias(&formulae, "kubectl").as_deref(),
+            Some("kubernetes-cli")
+        );
+        assert_eq!(
+            find_formula_alias(&formulae, "nvim").as_deref(),
+            Some("neovim")
+        );
+        assert_eq!(
+            find_formula_alias(&formulae, "legacy-name").as_deref(),
+            Some("new-name")
+        );
+        assert_eq!(
+            find_formula_alias(&formulae, "shared-name").as_deref(),
+            Some("alias-owner")
+        );
+        assert_eq!(find_formula_alias(&formulae, "self-tool"), None);
+        assert_eq!(find_formula_alias(&formulae, "ambiguous"), None);
+        assert_eq!(find_formula_alias(&formulae, "missing"), None);
+        assert_eq!(find_formula_alias(&formulae, ""), None);
+    }
+
+    #[test]
+    fn resolves_unique_cask_old_tokens_safely() {
+        let mut new_cask = cask("new-app");
+        new_cask.old_tokens = vec!["legacy-app".into()];
+        let mut self_cask = cask("self-app");
+        self_cask.old_tokens = vec!["self-app".into()];
+        let mut dup_a = cask("cask-a");
+        dup_a.old_tokens = vec!["shared-old".into()];
+        let mut dup_b = cask("cask-b");
+        dup_b.old_tokens = vec!["shared-old".into()];
+
+        let casks = vec![new_cask, self_cask, dup_a, dup_b];
+        assert_eq!(
+            find_cask_old_token(&casks, "legacy-app").as_deref(),
+            Some("new-app")
+        );
+        assert_eq!(find_cask_old_token(&casks, "self-app"), None);
+        assert_eq!(find_cask_old_token(&casks, "shared-old"), None);
+        assert_eq!(find_cask_old_token(&casks, "missing"), None);
+        assert_eq!(find_cask_old_token(&casks, ""), None);
     }
 }

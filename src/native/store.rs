@@ -8,8 +8,25 @@
 //! <prefix>/.brewrs/state/install.lock   writer lock
 //! <prefix>/.brewrs/stages/              private staging directories
 //! <prefix>/Cellar/<name>/<version>/     keg contents (a staged root, renamed)
-//! <prefix>/bin/<member>                 relative links into the keg
+//! <prefix>/opt/<name>                   relative link into the active keg
+//! <prefix>/bin/<member>                 relative links into the keg (omitted for keg-only)
+//! <prefix>/sbin/<member>                administrative CLI links
+//! <prefix>/share/man/man1..8/<page>     manual page links
+//! <prefix>/etc/bash_completion.d/<file> bash completion links
+//! <prefix>/share/zsh/site-functions/<f> zsh completion links
+//! <prefix>/share/fish/vendor_completions.d/<f> fish completion links
+//! <prefix>/lib/docker/cli-plugins/docker-<plugin> Docker CLI plugin links
 //! ```
+//!
+//! A non-keg-only package also links direct regular files (or keg-contained
+//! relative symlinks) from `share/man/man1` through `share/man/man8`,
+//! `etc/bash_completion.d`, `share/zsh/site-functions`, and
+//! `share/fish/vendor_completions.d`, plus executable `docker-*` members of
+//! `lib/docker/cli-plugins`. Every linked directory uses the same transaction,
+//! exact-target ownership, collision, and rollback rules as `bin`/`sbin`; a
+//! member is linked only when it is a direct entry, never through a symlinked
+//! parent directory, and removal recognizes a link only by its exact
+//! version-specific target.
 //!
 //! Nothing here writes into a Homebrew prefix. A root is only usable when it
 //! carries the marker, so an existing unrelated directory is never adopted by
@@ -19,10 +36,10 @@
 //! # Commit atomicity
 //!
 //! Each package is applied as: create `Cellar/<name>`, rename the staged root
-//! to `Cellar/<name>/<version>`, create the `bin` links, then write the receipt
-//! last. On failure everything created by this commit is rolled back in reverse
-//! order. The lock serializes brewrs writers, so preflight collisions are not
-//! expected to race with another commit.
+//! to `Cellar/<name>/<version>`, create the managed links, then write the
+//! receipt last. On failure everything created by this commit is rolled back in
+//! reverse order. The lock serializes brewrs writers, so preflight collisions
+//! are not expected to race with another commit.
 //!
 //! Commits are not crash-atomic. A process death after the rename but before
 //! the final receipt leaves an unreceipted keg (and possibly links) behind.
@@ -108,6 +125,98 @@ const MARKER_CONTENT: &str = "brewrs native store v1\n";
 const CELLAR: &str = "Cellar";
 /// Root for CLI links.
 const BIN: &str = "bin";
+/// Root for admin CLI links.
+const SBIN: &str = "sbin";
+/// Root for active keg aliases (`opt/<name> -> ../Cellar/<name>/<version>`).
+const OPT: &str = "opt";
+/// Prefix-relative directory whose direct members are linked into the store,
+/// together with the member rules for that directory.
+///
+/// `subdir` is both the keg-relative and prefix-relative path, so a link always
+/// uses one `..` per path component. Every directory is optional: an older
+/// brewrs prefix has only `bin`, `sbin`, and `opt`, and missing directories are
+/// created on demand by the first package that provides a member.
+#[derive(Clone, Copy)]
+struct LinkDirectory {
+    subdir: &'static str,
+    /// Whether a member must be executable (CLI, admin CLI, Docker plugin).
+    executable: bool,
+    /// Optional required member-name prefix, as Docker uses for plugins.
+    member_prefix: Option<&'static str>,
+}
+
+const LINK_DIRECTORIES: [LinkDirectory; 14] = [
+    LinkDirectory {
+        subdir: BIN,
+        executable: true,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: SBIN,
+        executable: true,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man1",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man2",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man3",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man4",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man5",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man6",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man7",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/man/man8",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "etc/bash_completion.d",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/zsh/site-functions",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "share/fish/vendor_completions.d",
+        executable: false,
+        member_prefix: None,
+    },
+    LinkDirectory {
+        subdir: "lib/docker/cli-plugins",
+        executable: true,
+        member_prefix: Some("docker-"),
+    },
+];
 /// Directory for brewrs-managed state.
 const META: &str = ".brewrs";
 const STATE: &str = "state";
@@ -121,7 +230,7 @@ const MAX_VERSION_LEN: usize = 128;
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
 
 /// Writer lock token/TempDir names stay unique within a process.
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(super) static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Where a bound prefix stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +267,14 @@ pub(super) struct Dependency {
 pub(super) struct Receipt {
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub version_scheme: u32,
     pub sha256: String,
     pub requested: bool,
+    #[serde(default)]
+    pub keg_only: bool,
+    #[serde(default)]
+    pub conflicts_with: Vec<String>,
     /// Direct dependencies, each pinned to an exact installed name, version,
     /// and digest. Receipts written before dependencies existed omit this
     /// field and decode as empty.
@@ -219,6 +334,11 @@ impl Store {
     /// The prefix this store is bound to.
     pub(super) fn prefix(&self) -> &Path {
         &self.prefix
+    }
+
+    /// Whether this store is bound to an existing owned prefix.
+    pub(super) fn is_owned(&self) -> bool {
+        self.state == RootState::Owned
     }
 
     /// Read every receipt, sorted by package name.
@@ -391,6 +511,7 @@ impl Store {
         }
         projected.extend(pending.iter().map(|package| package.receipt.clone()));
         validate_dependencies(&projected)?;
+        validate_conflicts(&projected)?;
 
         // New packages are applied first: if they fail, nothing was promoted.
         let mut applied = Vec::new();
@@ -489,7 +610,9 @@ impl Store {
     fn plan_removal(&self, expected: &[Receipt]) -> Result<Vec<Removal>> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
-        let bin = bin_dir(&self.prefix);
+        let opt = opt_dir(&self.prefix);
+        let link_dirs = existing_link_directories(&self.prefix)?;
+        let has_opt = check_optional_directory(&opt)?;
         let mut names = HashSet::new();
         let mut links_seen = HashSet::new();
         let mut removals = Vec::with_capacity(expected.len());
@@ -574,45 +697,61 @@ impl Store {
                 }
             }
 
-            // Scan the prefix's own bin entries. Deriving names from the keg
-            // would miss an owned link whose keg member was deleted or made
-            // non-executable, and a reinstall would then collide with it. Only
-            // an exact stored target identifies a brewrs link; everything else
-            // is foreign and is preserved.
+            // Scan the prefix's own managed link directories. Deriving names
+            // from the keg would miss an owned link whose keg member was
+            // deleted or made non-executable, and a reinstall would then
+            // collide with it. Only an exact stored target identifies a brewrs
+            // link; everything else is foreign and is preserved.
             let mut links = Vec::new();
-            for entry in
-                fs::read_dir(&bin).with_context(|| format!("failed to read '{}'", bin.display()))?
-            {
-                let entry = entry
-                    .with_context(|| format!("failed to read an entry in '{}'", bin.display()))?;
-                if !entry
-                    .file_type()
-                    .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
-                    .is_symlink()
-                {
-                    continue;
+            for root in LINK_DIRECTORIES {
+                if let Some(directory) = link_dirs.get(root.subdir) {
+                    links.extend(collect_owned_links(
+                        directory,
+                        &root,
+                        &receipt.name,
+                        &receipt.version,
+                    )?);
                 }
-                let Some(member) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if !is_safe_bin_name(&member) {
-                    continue;
-                }
-                let path = entry.path();
-                let target = keg_link_target(&receipt.name, &receipt.version, &member);
-                let actual = fs::read_link(&path)
-                    .with_context(|| format!("failed to read link '{}'", path.display()))?;
-                if actual.as_os_str() != target.as_os_str() {
-                    continue;
-                }
-                if !links_seen.insert(path.clone()) {
+            }
+            for link in &links {
+                if !links_seen.insert(link.path.clone()) {
                     bail!(
                         "refusing to remove '{}': more than one selected package claims the link '{}'",
                         receipt.name,
-                        path.display()
+                        link.path.display()
                     );
                 }
-                links.push(OwnedLink { path, target });
+            }
+            if has_opt {
+                let opt_path = opt.join(&receipt.name);
+                let opt_target = opt_link_target(&receipt.name, &receipt.version);
+                match fs::symlink_metadata(&opt_path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let actual = fs::read_link(&opt_path).with_context(|| {
+                            format!("failed to read link '{}'", opt_path.display())
+                        })?;
+                        if actual.as_os_str() == opt_target.as_os_str() {
+                            if !links_seen.insert(opt_path.clone()) {
+                                bail!(
+                                    "refusing to remove '{}': more than one selected package claims the link '{}'",
+                                    receipt.name,
+                                    opt_path.display()
+                                );
+                            }
+                            links.push(OwnedLink {
+                                path: opt_path,
+                                target: opt_target,
+                            });
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to inspect '{}'", opt_path.display())
+                        });
+                    }
+                }
             }
             links.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -740,7 +879,9 @@ impl Store {
     fn plan_upgrade(&self, packages: Vec<(Receipt, Prepared)>) -> Result<Vec<Upgrade>> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
-        let bin = bin_dir(&self.prefix);
+        let opt = opt_dir(&self.prefix);
+        let link_dirs = existing_link_directories(&self.prefix)?;
+        let has_opt = check_optional_directory(&opt)?;
         let mut names = HashSet::new();
         let mut link_names = HashSet::new();
         let mut upgrades = Vec::with_capacity(packages.len());
@@ -769,7 +910,7 @@ impl Store {
                     old.version
                 );
             }
-            if old.version == receipt.version {
+            if old.version == receipt.version && old.version_scheme == receipt.version_scheme {
                 bail!(
                     "refusing to upgrade '{}': version {} is already installed; the caller must skip it",
                     old.name,
@@ -777,7 +918,11 @@ impl Store {
                 );
             }
             self.validate_stage(stage.path())?;
-            let links = executable_bin_members(stage.path())?;
+            let links = if receipt.keg_only {
+                Vec::new()
+            } else {
+                staged_links(stage.path())?
+            };
 
             let receipt_path = receipts.join(format!("{}.json", old.name));
             let current = existing_receipt(&receipt_path)?.with_context(|| {
@@ -871,49 +1016,39 @@ impl Store {
             }
 
             let mut owned_links = Vec::new();
-            for entry in
-                fs::read_dir(&bin).with_context(|| format!("failed to read '{}'", bin.display()))?
-            {
-                let entry = entry
-                    .with_context(|| format!("failed to read an entry in '{}'", bin.display()))?;
-                if !entry
-                    .file_type()
-                    .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
-                    .is_symlink()
-                {
-                    continue;
-                }
-                let Some(member) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if !is_safe_bin_name(&member) {
-                    continue;
-                }
-                let path = entry.path();
-                let target = keg_link_target(&old.name, &old.version, &member);
-                let actual = fs::read_link(&path)
-                    .with_context(|| format!("failed to read link '{}'", path.display()))?;
-                if actual.as_os_str() == target.as_os_str() {
-                    owned_links.push(OwnedLink { path, target });
+            for root in LINK_DIRECTORIES {
+                if let Some(directory) = link_dirs.get(root.subdir) {
+                    owned_links.extend(collect_owned_links(
+                        directory,
+                        &root,
+                        &old.name,
+                        &old.version,
+                    )?);
                 }
             }
-            owned_links.sort_by(|left, right| left.path.cmp(&right.path));
-
-            // A replacement may claim a bin name only when this package's own
-            // exact link currently occupies it; anything else is foreign and
-            // is never overwritten. Cross-package claims fail in `link_names`.
-            for link in &links {
-                if !link_names.insert(link.clone()) {
-                    bail!("more than one package in this upgrade provides 'bin/{link}'");
-                }
-                let existing = bin.join(link);
-                match fs::symlink_metadata(&existing) {
-                    Ok(_) => {
-                        if !owned_links.iter().any(|owned| owned.path == existing) {
+            if has_opt {
+                let opt_path = opt.join(&old.name);
+                let opt_target = opt_link_target(&old.name, &old.version);
+                match fs::symlink_metadata(&opt_path) {
+                    Ok(metadata) => {
+                        let owned = if metadata.file_type().is_symlink() {
+                            let actual = fs::read_link(&opt_path).with_context(|| {
+                                format!("failed to read link '{}'", opt_path.display())
+                            })?;
+                            actual.as_os_str() == opt_target.as_os_str()
+                        } else {
+                            false
+                        };
+                        if owned {
+                            owned_links.push(OwnedLink {
+                                path: opt_path,
+                                target: opt_target,
+                            });
+                        } else {
                             bail!(
                                 "refusing to upgrade '{}': '{}' already exists and is not a link owned by {} {}; refusing to overwrite it",
                                 old.name,
-                                existing.display(),
+                                opt_path.display(),
                                 old.name,
                                 old.version
                             );
@@ -922,8 +1057,45 @@ impl Store {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(error).with_context(|| {
-                            format!("failed to inspect '{}'", existing.display())
+                            format!("failed to inspect '{}'", opt_path.display())
                         });
+                    }
+                }
+            }
+            owned_links.sort_by(|left, right| left.path.cmp(&right.path));
+
+            // A replacement may claim a managed link name only when this
+            // package's own exact link currently occupies it; anything else is
+            // foreign and is never overwritten. Cross-package claims fail in
+            // `link_names`.
+            for link in &links {
+                if !link_names.insert(link.clone()) {
+                    bail!(
+                        "more than one package in this upgrade provides '{}/{}'",
+                        link.subdir,
+                        link.name
+                    );
+                }
+                if let Some(directory) = link_dirs.get(link.subdir) {
+                    let existing = directory.join(&link.name);
+                    match fs::symlink_metadata(&existing) {
+                        Ok(_) => {
+                            if !owned_links.iter().any(|owned| owned.path == existing) {
+                                bail!(
+                                    "refusing to upgrade '{}': '{}' already exists and is not a link owned by {} {}; refusing to overwrite it",
+                                    old.name,
+                                    existing.display(),
+                                    old.name,
+                                    old.version
+                                );
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to inspect '{}'", existing.display())
+                            });
+                        }
                     }
                 }
             }
@@ -958,6 +1130,7 @@ impl Store {
                 .map(|upgrade| upgrade.pending.receipt.clone()),
         );
         validate_dependencies(&final_receipts)?;
+        validate_conflicts(&final_receipts)?;
         Ok(upgrades)
     }
 
@@ -1125,6 +1298,8 @@ impl Store {
         for directory in [
             cellar_dir(prefix),
             bin_dir(prefix),
+            sbin_dir(prefix),
+            opt_dir(prefix),
             meta_dir(prefix),
             state_dir(prefix),
             receipts_dir(prefix),
@@ -1141,7 +1316,7 @@ impl Store {
     }
 
     /// Re-validate ownership and every managed directory before writing.
-    fn ensure_owned(&self) -> Result<()> {
+    pub(super) fn ensure_owned(&self) -> Result<()> {
         if !self.writable {
             bail!(
                 "refusing to modify '{}': the store was opened read-only",
@@ -1155,7 +1330,7 @@ impl Store {
     ///
     /// Removal runs on [`Store::open`]'s read-only binding, so it uses this to
     /// refuse an absent, unowned, or foreign prefix before writing anything.
-    fn verify_owned(&self) -> Result<()> {
+    pub(super) fn verify_owned(&self) -> Result<()> {
         if self.state != RootState::Owned {
             bail!(
                 "refusing to modify '{}': it is not an initialized brewrs store",
@@ -1191,6 +1366,11 @@ impl Store {
         ] {
             ensure_directory(&directory, false)?;
         }
+        check_optional_directory(&sbin_dir(&self.prefix))?;
+        check_optional_directory(&opt_dir(&self.prefix))?;
+        check_optional_directory(&self.prefix.join("Caskroom"))?;
+        check_optional_directory(&self.prefix.join("Applications"))?;
+        check_optional_directory(&state_dir(&self.prefix).join("casks"))?;
         Ok(())
     }
 
@@ -1198,7 +1378,9 @@ impl Store {
     fn prepare(&self, packages: Vec<Prepared>) -> Result<Vec<Pending>> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
-        let bin = bin_dir(&self.prefix);
+        let opt = opt_dir(&self.prefix);
+        let link_dirs = existing_link_directories(&self.prefix)?;
+        let has_opt = check_optional_directory(&opt)?;
         let mut names = HashSet::new();
         let mut link_names = HashSet::new();
         let mut pending = Vec::with_capacity(packages.len());
@@ -1212,7 +1394,11 @@ impl Store {
                 );
             }
             self.validate_stage(stage.path())?;
-            let links = executable_bin_members(stage.path())?;
+            let links = if receipt.keg_only {
+                Vec::new()
+            } else {
+                staged_links(stage.path())?
+            };
 
             let receipt_path = receipts.join(format!("{}.json", receipt.name));
             if let Some(existing) = existing_receipt(&receipt_path)? {
@@ -1247,22 +1433,45 @@ impl Store {
                 }
             }
 
-            for link in &links {
-                if !link_names.insert(link.clone()) {
-                    bail!("more than one package in this commit provides 'bin/{link}'");
-                }
-                let existing = bin.join(link);
-                match fs::symlink_metadata(&existing) {
+            if has_opt {
+                let existing_opt = opt.join(&receipt.name);
+                match fs::symlink_metadata(&existing_opt) {
                     Ok(_) => bail!(
                         "refusing to install '{}': '{}' already exists; links are never overwritten",
                         receipt.name,
-                        existing.display()
+                        existing_opt.display()
                     ),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(error).with_context(|| {
-                            format!("failed to inspect '{}'", existing.display())
+                            format!("failed to inspect '{}'", existing_opt.display())
                         });
+                    }
+                }
+            }
+
+            for link in &links {
+                if !link_names.insert(link.clone()) {
+                    bail!(
+                        "more than one package in this commit provides '{}/{}'",
+                        link.subdir,
+                        link.name
+                    );
+                }
+                if let Some(directory) = link_dirs.get(link.subdir) {
+                    let existing = directory.join(&link.name);
+                    match fs::symlink_metadata(&existing) {
+                        Ok(_) => bail!(
+                            "refusing to install '{}': '{}' already exists; links are never overwritten",
+                            receipt.name,
+                            existing.display()
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to inspect '{}'", existing.display())
+                            });
+                        }
                     }
                 }
             }
@@ -1281,6 +1490,7 @@ impl Store {
         let mut final_receipts = self.installed()?;
         final_receipts.extend(pending.iter().map(|package| package.receipt.clone()));
         validate_dependencies(&final_receipts)?;
+        validate_conflicts(&final_receipts)?;
         Ok(pending)
     }
 
@@ -1402,8 +1612,11 @@ impl Store {
         reuse_cellar: bool,
     ) -> Result<()> {
         let cellar = cellar_dir(&self.prefix);
-        let bin = bin_dir(&self.prefix);
+        let sbin = sbin_dir(&self.prefix);
+        let opt = opt_dir(&self.prefix);
         let receipts = receipts_dir(&self.prefix);
+        ensure_directory(&sbin, true)?;
+        ensure_directory(&opt, true)?;
 
         for (index, package) in pending.into_iter().enumerate() {
             if fail_after == Some(index) {
@@ -1435,6 +1648,7 @@ impl Store {
                 keg: keg.clone(),
                 keg_created: false,
                 links: Vec::new(),
+                link_dirs_created: Vec::new(),
                 receipt: receipts.join(format!("{name}.json")),
             });
 
@@ -1449,11 +1663,34 @@ impl Store {
 
             let record = applied.last_mut().expect("record was just pushed");
             record.keg_created = true;
+            let opt_link_path = opt.join(&name);
+            let opt_target = opt_link_target(&name, &version);
+            create_symlink(&opt_target, &opt_link_path).with_context(|| {
+                format!(
+                    "failed to create the opt link '{}'",
+                    opt_link_path.display()
+                )
+            })?;
+            record.links.push(opt_link_path);
             for link in links {
-                let link_path = bin.join(&link);
-                let target = keg_link_target(&name, &version, &link);
+                let Some(link_dir) = link_directory(
+                    &self.prefix,
+                    link.subdir,
+                    Some(&mut record.link_dirs_created),
+                )?
+                else {
+                    bail!(
+                        "failed to create the link directory '{}'",
+                        self.prefix.join(link.subdir).display()
+                    );
+                };
+                let link_path = link_dir.join(&link.name);
+                let target = keg_link_target(&name, &version, link.subdir, &link.name);
                 create_symlink(&target, &link_path).with_context(|| {
-                    format!("failed to create the CLI link '{}'", link_path.display())
+                    format!(
+                        "failed to create the managed link '{}'",
+                        link_path.display()
+                    )
                 })?;
                 record.links.push(link_path);
             }
@@ -1464,11 +1701,18 @@ impl Store {
     }
 }
 
+/// A symlink owned under one managed prefix link directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ManagedLink {
+    subdir: &'static str,
+    name: String,
+}
+
 /// A validated package awaiting application.
 struct Pending {
     receipt: Receipt,
     stage: tempfile::TempDir,
-    links: Vec<String>,
+    links: Vec<ManagedLink>,
 }
 
 /// A preflighted requested-flag update for one installed package.
@@ -1498,6 +1742,7 @@ struct Applied {
     /// Whether the staged keg was successfully renamed into place.
     keg_created: bool,
     links: Vec<PathBuf>,
+    link_dirs_created: Vec<PathBuf>,
     receipt: PathBuf,
 }
 
@@ -1600,6 +1845,17 @@ fn rollback(applied: &[Applied]) -> Vec<String> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     issues.push(format!("failed to inspect '{}': {error}", link.display()));
+                }
+            }
+        }
+
+        for directory in record.link_dirs_created.iter().rev() {
+            if let Err(error) = fs::remove_dir(directory) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    issues.push(format!(
+                        "failed to remove new link directory '{}': {error}",
+                        directory.display()
+                    ));
                 }
             }
         }
@@ -1933,20 +2189,73 @@ fn validate_promotion_keg(name: &str, version: &str, cellar: &Path) -> Result<()
     }
 }
 
-/// The exact relative target [`Store::commit`] stores for a keg member.
-fn keg_link_target(name: &str, version: &str, member: &str) -> PathBuf {
-    Path::new("..")
+/// The exact relative target [`Store::commit`] stores for a managed member.
+///
+/// `subdir` is both keg- and prefix-relative, so it contributes one `..` per
+/// path component: `bin/tool -> ../Cellar/.../bin/tool` and
+/// `share/man/man1/tool.1 -> ../../../Cellar/.../share/man/man1/tool.1`.
+fn keg_link_target(name: &str, version: &str, subdir: &str, member: &str) -> PathBuf {
+    let mut target = PathBuf::new();
+    for _ in subdir.split('/') {
+        target.push("..");
+    }
+    target
         .join(CELLAR)
         .join(name)
         .join(version)
-        .join(BIN)
+        .join(subdir)
         .join(member)
 }
 
-/// Atomically publish a receipt; never replace an existing one.
-fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
-    let target = directory.join(format!("{}.json", receipt.name));
-    match fs::symlink_metadata(&target) {
+/// Scan one prefix link directory for symlinks whose exact relative target
+/// matches `../.../Cellar/<name>/<version>/<subdir>/<member>`.
+fn collect_owned_links(
+    dir: &Path,
+    root: &LinkDirectory,
+    name: &str,
+    version: &str,
+) -> Result<Vec<OwnedLink>> {
+    let mut links = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read '{}'", dir.display()))? {
+        let entry =
+            entry.with_context(|| format!("failed to read an entry in '{}'", dir.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
+            .is_symlink()
+        {
+            continue;
+        }
+        let Some(member) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_safe_bin_name(&member) {
+            continue;
+        }
+        if let Some(prefix) = root.member_prefix {
+            if !member.starts_with(prefix) {
+                continue;
+            }
+        }
+        let path = entry.path();
+        let target = keg_link_target(name, version, root.subdir, &member);
+        let actual = fs::read_link(&path)
+            .with_context(|| format!("failed to read link '{}'", path.display()))?;
+        if actual.as_os_str() == target.as_os_str() {
+            links.push(OwnedLink { path, target });
+        }
+    }
+    Ok(links)
+}
+
+/// The exact relative target [`Store::commit`] stores for `opt/<name>`.
+fn opt_link_target(name: &str, version: &str) -> PathBuf {
+    Path::new("..").join(CELLAR).join(name).join(version)
+}
+
+/// Atomically publish a new file inside `directory` without overwriting `target`.
+pub(super) fn write_new_file_atomic(directory: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
+    match fs::symlink_metadata(target) {
         Ok(_) => bail!(
             "refusing to overwrite the existing receipt '{}'",
             target.display()
@@ -1957,7 +2266,6 @@ fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
         }
     }
 
-    let bytes = encode_receipt(receipt)?;
     let temporary = directory.join(format!(
         ".tmp-{}-{}-{}",
         std::process::id(),
@@ -1971,7 +2279,7 @@ fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
             .create_new(true)
             .open(&temporary)
             .with_context(|| format!("failed to create '{}'", temporary.display()))?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .with_context(|| format!("failed to write '{}'", temporary.display()))?;
         Ok(())
@@ -1980,12 +2288,19 @@ fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&temporary, &target) {
+    if let Err(error) = fs::rename(&temporary, target) {
         let _ = fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("failed to publish '{}'", target.display()));
     }
     sync_directory(directory);
     Ok(())
+}
+
+/// Atomically publish a receipt; never replace an existing one.
+fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
+    let target = directory.join(format!("{}.json", receipt.name));
+    let bytes = encode_receipt(receipt)?;
+    write_new_file_atomic(directory, &target, &bytes)
 }
 
 /// Encode a receipt exactly as it is stored on disk.
@@ -2082,58 +2397,176 @@ fn existing_receipt(path: &Path) -> Result<Option<Receipt>> {
     }
 }
 
-/// Executable, regular, safely named members directly below `<stage>/bin`.
-fn executable_bin_members(stage: &Path) -> Result<Vec<String>> {
-    let bin = stage.join(BIN);
-    let metadata = match fs::symlink_metadata(&bin) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect '{}'", bin.display()));
+/// Collect every linkable member below the staged keg's managed directories.
+fn staged_links(stage: &Path) -> Result<Vec<ManagedLink>> {
+    let mut links = Vec::new();
+    for root in LINK_DIRECTORIES {
+        for name in staged_members(stage, &root)? {
+            links.push(ManagedLink {
+                subdir: root.subdir,
+                name,
+            });
         }
-    };
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing stage '{}': its bin directory is a symlink",
-            stage.display()
-        );
     }
-    if !metadata.is_dir() {
-        return Ok(Vec::new());
-    }
+    Ok(links)
+}
 
+/// Resolve a managed directory below the stage without following symlinked
+/// ancestors. `None` means the stage simply does not ship that directory.
+fn staged_directory(stage: &Path, subdir: &str) -> Result<Option<PathBuf>> {
+    let mut directory = stage.to_path_buf();
+    for component in subdir.split('/') {
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "refusing stage '{}': '{subdir}' has a symlinked parent directory",
+                stage.display()
+            ),
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+            }
+        }
+    }
+    Ok(Some(directory))
+}
+
+/// Direct regular files or keg-contained relative symlinks below one staged
+/// managed directory.
+fn staged_members(stage: &Path, root: &LinkDirectory) -> Result<Vec<String>> {
+    let Some(dir) = staged_directory(stage, root.subdir)? else {
+        return Ok(Vec::new());
+    };
+
+    let stage_root = stage
+        .canonicalize()
+        .with_context(|| format!("failed to resolve stage '{}'", stage.display()))?;
     let mut members = Vec::new();
     for entry in
-        fs::read_dir(&bin).with_context(|| format!("failed to read '{}'", bin.display()))?
+        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
     {
         let entry =
-            entry.with_context(|| format!("failed to read an entry in '{}'", bin.display()))?;
-        if !entry
-            .file_type()
-            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
-            .is_file()
-        {
-            continue;
-        }
+            entry.with_context(|| format!("failed to read an entry in '{}'", dir.display()))?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         if !is_safe_bin_name(&name) {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
-        if is_executable(&metadata) {
-            members.push(name);
+        if let Some(prefix) = root.member_prefix {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+        }
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect '{}'", entry_path.display()))?;
+        if file_type.is_file() {
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to inspect '{}'", entry_path.display()))?;
+            if !root.executable || is_executable(&metadata) {
+                members.push(name);
+            }
+        } else if file_type.is_symlink() {
+            let raw_target = fs::read_link(&entry_path)
+                .with_context(|| format!("failed to read link '{}'", entry_path.display()))?;
+            if raw_target.is_absolute() {
+                bail!(
+                    "refusing stage '{}': '{}/{}' is an absolute symlink",
+                    stage.display(),
+                    root.subdir,
+                    name
+                );
+            }
+            let resolved = fs::canonicalize(&entry_path).with_context(|| {
+                format!(
+                    "refusing stage '{}': '{}/{}' is a broken symlink",
+                    stage.display(),
+                    root.subdir,
+                    name
+                )
+            })?;
+            if !resolved.starts_with(&stage_root) {
+                bail!(
+                    "refusing stage '{}': '{}/{}' escapes the staged keg",
+                    stage.display(),
+                    root.subdir,
+                    name
+                );
+            }
+            let target_meta = fs::symlink_metadata(&resolved)
+                .with_context(|| format!("failed to inspect '{}'", resolved.display()))?;
+            if target_meta.is_file() && (!root.executable || is_executable(&target_meta)) {
+                members.push(name);
+            }
         }
     }
     members.sort();
     Ok(members)
 }
 
+/// Resolve `<prefix>/<subdir>` while refusing any symlinked or non-directory
+/// ancestor, and optionally create missing components.
+///
+/// `None` means an ancestor is missing and `create` is false. Existing
+/// components are never followed when they are symlinks, so a foreign link
+/// cannot redirect a managed link outside the prefix.
+fn link_directory(
+    prefix: &Path,
+    subdir: &str,
+    mut created: Option<&mut Vec<PathBuf>>,
+) -> Result<Option<PathBuf>> {
+    let mut directory = prefix.to_path_buf();
+    for component in subdir.split('/') {
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "refusing '{}': a brewrs-managed path may not be a symlink",
+                directory.display()
+            ),
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => bail!(
+                "refusing '{}': a brewrs-managed path must be a directory",
+                directory.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(created) = created.as_mut() else {
+                    return Ok(None);
+                };
+                fs::create_dir(&directory)
+                    .with_context(|| format!("failed to create '{}'", directory.display()))?;
+                created.push(directory.clone());
+                ensure_directory(&directory, false)?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+            }
+        }
+    }
+    Ok(Some(directory))
+}
+
+/// Every managed link directory that already exists, keyed by prefix-relative
+/// path. Missing directories are absent from the map and are created on demand
+/// by a package that actually provides a member.
+fn existing_link_directories(prefix: &Path) -> Result<HashMap<&'static str, PathBuf>> {
+    let mut directories = HashMap::with_capacity(LINK_DIRECTORIES.len());
+    for root in LINK_DIRECTORIES {
+        if let Some(directory) = link_directory(prefix, root.subdir, None)? {
+            directories.insert(root.subdir, directory);
+        }
+    }
+    Ok(directories)
+}
+
 /// Create the relative CLI link, never replacing an existing path.
-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+pub(super) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(target, link)
@@ -2162,7 +2595,7 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 }
 
 /// Validate a package name exactly as the archive layer does.
-fn is_safe_package_name(name: &str) -> bool {
+pub(super) fn is_safe_package_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_NAME_LEN || name.contains("..") {
         return false;
     }
@@ -2196,7 +2629,7 @@ fn is_safe_bin_name(name: &str) -> bool {
         })
 }
 
-fn is_lower_hex_digest(value: &str) -> bool {
+pub(super) fn is_lower_hex_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -2234,6 +2667,26 @@ fn validate_receipt(receipt: &Receipt) -> Result<()> {
                 "refusing '{}': dependency '{}' is listed more than once",
                 receipt.name,
                 dependency.name
+            );
+        }
+    }
+    let mut conflicts = HashSet::new();
+    for conflict in &receipt.conflicts_with {
+        if !is_safe_package_name(conflict) {
+            bail!(
+                "refusing invalid conflict name '{}' recorded by '{}'",
+                conflict,
+                receipt.name
+            );
+        }
+        if conflict == &receipt.name {
+            bail!("refusing '{}': it lists itself as a conflict", receipt.name);
+        }
+        if !conflicts.insert(conflict.as_str()) {
+            bail!(
+                "refusing '{}': conflict '{}' is listed more than once",
+                receipt.name,
+                conflict
             );
         }
     }
@@ -2314,14 +2767,39 @@ pub(super) fn validate_dependencies(receipts: &[Receipt]) -> Result<()> {
     Ok(())
 }
 
+/// Reject any projected receipt set where one package conflicts with another
+/// present package. Checks both directions symmetrically so neither installing
+/// a conflicting formula nor keeping an older one with a declared conflict can
+/// succeed.
+pub(super) fn validate_conflicts(receipts: &[Receipt]) -> Result<()> {
+    let installed: HashSet<&str> = receipts
+        .iter()
+        .map(|receipt| receipt.name.as_str())
+        .collect();
+    for receipt in receipts {
+        for conflict in &receipt.conflicts_with {
+            if installed.contains(conflict.as_str()) {
+                bail!(
+                    "'{}' conflicts with '{}'; remove '{}' before installing '{}'",
+                    receipt.name,
+                    conflict,
+                    conflict,
+                    receipt.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Serialize writers for one prefix with an exclusive lock file.
-struct InstallLock {
+pub(super) struct InstallLock {
     path: PathBuf,
     token: String,
 }
 
 impl InstallLock {
-    fn acquire(prefix: &Path) -> Result<Self> {
+    pub(super) fn acquire(prefix: &Path) -> Result<Self> {
         let path = state_dir(prefix).join(LOCK_FILE);
         let token = format!("pid={} nonce={}\n", std::process::id(), monotonic_nonce());
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -2461,7 +2939,7 @@ fn create_marker(prefix: &Path) -> Result<()> {
 }
 
 /// Require an owned directory, optionally creating it (and never a symlink).
-fn ensure_directory(path: &Path, create: bool) -> Result<()> {
+pub(super) fn ensure_directory(path: &Path, create: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => bail!(
             "refusing '{}': a brewrs-managed path may not be a symlink",
@@ -2490,7 +2968,7 @@ fn ensure_directory(path: &Path, create: bool) -> Result<()> {
 /// Inspect a managed directory that is allowed to be absent.
 ///
 /// Returns false only for a missing path; a symlink or file is an error.
-fn check_optional_directory(path: &Path) -> Result<bool> {
+pub(super) fn check_optional_directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => bail!(
             "refusing '{}': a brewrs-managed path may not be a symlink",
@@ -2508,7 +2986,7 @@ fn check_optional_directory(path: &Path) -> Result<bool> {
 
 /// Reject the filesystem root and any known Homebrew prefix, resolving
 /// existing ancestors so a symlink cannot point a store into Homebrew.
-fn reject_protected_prefix(prefix: &Path) -> Result<()> {
+pub(super) fn reject_protected_prefix(prefix: &Path) -> Result<()> {
     let candidate = canonical_candidate(prefix)?;
     if candidate == Path::new("/") || candidate.parent().is_none() {
         bail!("refusing to use the filesystem root as a brewrs prefix");
@@ -2547,7 +3025,7 @@ fn protected_prefixes() -> Vec<PathBuf> {
 
 /// Resolve the path a prefix would occupy, following existing symlinks and
 /// dangling ones, without requiring the missing tail to exist.
-fn canonical_candidate(path: &Path) -> Result<PathBuf> {
+pub(super) fn canonical_candidate(path: &Path) -> Result<PathBuf> {
     canonical_candidate_inner(path, 0)
 }
 
@@ -2610,7 +3088,7 @@ fn append_tail(base: &mut PathBuf, tail: &[&OsStr]) {
     }
 }
 
-fn sync_directory(directory: &Path) {
+pub(super) fn sync_directory(directory: &Path) {
     #[cfg(unix)]
     if let Ok(handle) = File::open(directory) {
         if let Err(error) = handle.sync_all() {
@@ -2621,7 +3099,7 @@ fn sync_directory(directory: &Path) {
     let _ = directory;
 }
 
-fn monotonic_nonce() -> u128 {
+pub(super) fn monotonic_nonce() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2632,11 +3110,11 @@ fn marker_path(prefix: &Path) -> PathBuf {
     prefix.join(MARKER_FILE)
 }
 
-fn meta_dir(prefix: &Path) -> PathBuf {
+pub(super) fn meta_dir(prefix: &Path) -> PathBuf {
     prefix.join(META)
 }
 
-fn state_dir(prefix: &Path) -> PathBuf {
+pub(super) fn state_dir(prefix: &Path) -> PathBuf {
     meta_dir(prefix).join(STATE)
 }
 
@@ -2644,7 +3122,7 @@ fn receipts_dir(prefix: &Path) -> PathBuf {
     state_dir(prefix).join(RECEIPTS)
 }
 
-fn stages_dir(prefix: &Path) -> PathBuf {
+pub(super) fn stages_dir(prefix: &Path) -> PathBuf {
     meta_dir(prefix).join(STAGES)
 }
 
@@ -2652,8 +3130,16 @@ fn cellar_dir(prefix: &Path) -> PathBuf {
     prefix.join(CELLAR)
 }
 
-fn bin_dir(prefix: &Path) -> PathBuf {
+pub(super) fn bin_dir(prefix: &Path) -> PathBuf {
     prefix.join(BIN)
+}
+
+fn sbin_dir(prefix: &Path) -> PathBuf {
+    prefix.join(SBIN)
+}
+
+fn opt_dir(prefix: &Path) -> PathBuf {
+    prefix.join(OPT)
 }
 
 #[cfg(test)]
@@ -2670,8 +3156,11 @@ mod tests {
         Receipt {
             name: name.into(),
             version: version.into(),
+            version_scheme: 0,
             sha256: digest(),
             requested,
+            keg_only: false,
+            conflicts_with: Vec::new(),
             dependencies: Vec::new(),
         }
     }
@@ -2718,6 +3207,31 @@ mod tests {
         let receipt = prepared.receipt.clone();
         store.commit(vec![prepared]).expect("install package");
         receipt
+    }
+
+    /// Write one staged file at a keg-relative path and set its mode.
+    fn stage_file(prepared: &Prepared, relative: &str, bytes: &[u8], mode: u32) {
+        let path = prepared.stage.path().join(relative);
+        fs::create_dir_all(path.parent().expect("staged parent")).expect("create staged directory");
+        fs::write(&path, bytes).expect("write staged file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set staged mode");
+    }
+
+    /// Create one keg-contained relative symlink in a stage.
+    #[cfg(unix)]
+    fn stage_link(prepared: &Prepared, relative: &str, target: &str) {
+        let path = prepared.stage.path().join(relative);
+        fs::create_dir_all(path.parent().expect("staged parent")).expect("create staged directory");
+        std::os::unix::fs::symlink(target, &path).expect("create staged symlink");
+    }
+
+    /// The exact target a commit stores for a managed `relative` path.
+    fn keg_target(name: &str, version: &str, relative: &str) -> PathBuf {
+        let mut target = PathBuf::new();
+        for _ in 1..Path::new(relative).components().count() {
+            target.push("..");
+        }
+        target.join(CELLAR).join(name).join(version).join(relative)
     }
 
     /// Install a package as an unrequested dependency, as a commit of a
@@ -2827,6 +3341,8 @@ mod tests {
         for directory in [
             cellar_dir(&prefix),
             bin_dir(&prefix),
+            sbin_dir(&prefix),
+            opt_dir(&prefix),
             meta_dir(&prefix),
             state_dir(&prefix),
             receipts_dir(&prefix),
@@ -3262,6 +3778,7 @@ mod tests {
             path.as_path() != Path::new(".brewrs/state/receipts/alpha.json")
                 && !path.starts_with("Cellar/alpha")
                 && path.as_path() != Path::new("bin/alpha")
+                && path.as_path() != Path::new("opt/alpha")
         });
         assert_eq!(tree(&prefix), expected);
         assert_eq!(
@@ -3428,10 +3945,10 @@ mod tests {
         let prefix = store.prefix().to_path_buf();
         let before = tree(&prefix);
 
-        // Steps are receipt, each link, then the keg; failing before the keg
-        // makes the rollback restore several paths.
+        // Steps are receipt, each link (bin + opt), then the keg; failing before
+        // the keg makes the rollback restore several paths.
         let error = store
-            .remove_inner(std::slice::from_ref(&hello), Some(3))
+            .remove_inner(std::slice::from_ref(&hello), Some(4))
             .expect_err("injected removal failure");
         assert!(format!("{error:#}").contains("injected"), "{error:#}");
         assert_eq!(tree(&prefix), before);
@@ -3449,11 +3966,11 @@ mod tests {
         let prefix = store.prefix().to_path_buf();
         let before = tree(&prefix);
 
-        // Alpha's steps are receipt, link, keg, prune; beta then moves its
-        // receipt. Failing at beta's link forces alpha's pruned directory to
-        // be recreated before alpha's keg can return.
+        // Alpha's steps are receipt, bin link, opt link, keg, prune; beta then
+        // moves its receipt. Failing at beta's link forces alpha's pruned
+        // directory to be recreated before alpha's keg can return.
         let error = store
-            .remove_inner(&[alpha, beta], Some(5))
+            .remove_inner(&[alpha, beta], Some(6))
             .expect_err("injected removal failure");
         assert!(format!("{error:#}").contains("injected"), "{error:#}");
         assert_eq!(tree(&prefix), before);
@@ -4434,5 +4951,654 @@ mod tests {
         assert!(!is_safe_version("1.0/2"));
         assert!(is_lower_hex_digest(&digest()));
         assert!(!is_lower_hex_digest(&digest().to_uppercase()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_keg_contained_executable_bin_symlinks_and_rejects_escaping_ones() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, store) = new_store();
+        let stage = store.stage().expect("create stage");
+        let libexec_bin = stage.path().join("libexec/bin");
+        let stage_bin = stage.path().join("bin");
+        fs::create_dir_all(&libexec_bin).expect("libexec/bin");
+        fs::create_dir_all(&stage_bin).expect("bin");
+
+        let tool = libexec_bin.join("tool");
+        fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+        symlink("../libexec/bin/tool", stage_bin.join("tool")).expect("link tool");
+
+        let doc = libexec_bin.join("doc");
+        fs::write(&doc, b"readme").expect("write doc");
+        fs::set_permissions(&doc, fs::Permissions::from_mode(0o644)).expect("chmod doc");
+        symlink("../libexec/bin/doc", stage_bin.join("doc")).expect("link doc");
+
+        let prepared = Prepared {
+            receipt: receipt("go", "1.27.4", true),
+            stage,
+        };
+        let installed_receipt = prepared.receipt.clone();
+        store.commit(vec![prepared]).expect("commit keg symlink");
+
+        let tool_link = store.prefix().join(BIN).join("tool");
+        assert_eq!(
+            fs::read_link(&tool_link).expect("read tool link"),
+            Path::new("../Cellar/go/1.27.4/bin/tool")
+        );
+        assert!(fs::symlink_metadata(store.prefix().join(BIN).join("doc")).is_err());
+
+        read_only(&store)
+            .remove(std::slice::from_ref(&installed_receipt))
+            .expect("remove go");
+        assert!(fs::symlink_metadata(&tool_link).is_err());
+
+        // Absolute and escaping symlinks inside bin/ must be rejected without touching the prefix.
+        let outside = _temp.path().join("outside");
+        fs::write(&outside, b"#!/bin/sh\n").expect("write outside");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).expect("chmod outside");
+
+        for (label, target) in [
+            ("absolute", "/usr/bin/true"),
+            ("escaping", "../../../../../outside"),
+        ] {
+            let bad_stage = store.stage().expect("bad stage");
+            fs::create_dir_all(bad_stage.path().join("bin")).expect("bad bin");
+            symlink(target, bad_stage.path().join("bin/bad")).expect("bad symlink");
+            let bad = Prepared {
+                receipt: receipt("bad", "1.0", true),
+                stage: bad_stage,
+            };
+            let error = store.commit(vec![bad]).expect_err(label);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("absolute symlink")
+                    || message.contains("escapes the staged keg")
+                    || message.contains("broken symlink"),
+                "{label}: {message}"
+            );
+            assert!(store.installed().expect("installed").is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keg_only_package_creates_opt_link_without_bin_links_and_cleans_up() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+
+        let mut first = prepare(&store, "m4", "1.4.20", &[("m4", true)]);
+        first.receipt.keg_only = true;
+        let first_receipt = first.receipt.clone();
+        store.commit(vec![first]).expect("install keg-only m4");
+
+        let opt_link = prefix.join(OPT).join("m4");
+        assert_eq!(
+            fs::read_link(&opt_link).expect("opt link"),
+            Path::new("../Cellar/m4/1.4.20")
+        );
+        assert!(fs::symlink_metadata(prefix.join(BIN).join("m4")).is_err());
+
+        // Foreign opt/<name> blocks upgrade without altering installed state.
+        let mut second = prepare(&store, "m4", "1.4.21", &[("m4", true)]);
+        second.receipt.keg_only = true;
+        fs::remove_file(&opt_link).unwrap();
+        symlink("/tmp/foreign", &opt_link).unwrap();
+        let foreign_err = store
+            .upgrade(vec![(first_receipt.clone(), second)])
+            .expect_err("foreign opt link must refuse upgrade");
+        assert!(
+            format!("{foreign_err:#}").contains("not a link owned by"),
+            "{foreign_err:#}"
+        );
+        fs::remove_file(&opt_link).unwrap();
+        symlink("../Cellar/m4/1.4.20", &opt_link).unwrap();
+
+        // Upgrade flips keg_only true -> false and updates opt/m4 + links bin/m4.
+        let upgraded = prepare(&store, "m4", "1.4.21", &[("m4", true)]);
+        let upgraded_receipt = upgraded.receipt.clone();
+        store
+            .upgrade(vec![(first_receipt, upgraded)])
+            .expect("upgrade m4");
+        assert_eq!(
+            fs::read_link(&opt_link).expect("updated opt link"),
+            Path::new("../Cellar/m4/1.4.21")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join(BIN).join("m4")).expect("new bin link"),
+            Path::new("../Cellar/m4/1.4.21/bin/m4")
+        );
+
+        read_only(&store)
+            .remove(std::slice::from_ref(&upgraded_receipt))
+            .expect("remove m4");
+        assert!(fs::symlink_metadata(&opt_link).is_err());
+        assert!(fs::symlink_metadata(prefix.join(BIN).join("m4")).is_err());
+        assert!(store.installed().expect("installed").is_empty());
+    }
+
+    #[test]
+    fn validate_conflicts_rejects_symmetric_and_same_batch_conflicts() {
+        let (_temp, store) = new_store();
+
+        let mut alpha = receipt("alpha", "1.0", true);
+        alpha.conflicts_with = vec!["beta".into()];
+        let beta = receipt("beta", "1.0", true);
+        let err = validate_conflicts(&[alpha.clone(), beta.clone()]).expect_err("conflict");
+        assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+        // Symmetric: conflict declared on second item still rejects.
+        let err = validate_conflicts(&[beta, alpha]).expect_err("reverse conflict");
+        assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+
+        let mut first = prepare(&store, "first", "1.0", &[("first", true)]);
+        first.receipt.conflicts_with = vec!["second".into()];
+        let second = prepare(&store, "second", "1.0", &[("second", true)]);
+        let err = store
+            .commit(vec![first, second])
+            .expect_err("same-batch conflict must fail commit");
+        assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+        assert!(store.installed().expect("installed").is_empty());
+
+        let base = install(&store, "base", "1.0", &[("base", true)]);
+        let mut challenger = prepare(&store, "challenger", "1.0", &[("challenger", true)]);
+        challenger.receipt.conflicts_with = vec!["base".into()];
+        let err = store
+            .commit(vec![challenger])
+            .expect_err("conflict with installed package must fail commit");
+        assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+
+        // Upgrading an existing package to a version that conflicts with another installed package fails.
+        let other = install(&store, "other", "1.0", &[("other", true)]);
+        let mut base_v2 = prepare(&store, "base", "2.0", &[("base", true)]);
+        base_v2.receipt.conflicts_with = vec!["other".into()];
+        let err = store
+            .upgrade(vec![(base, base_v2)])
+            .expect_err("upgrade introducing conflict must fail");
+        assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+        assert_eq!(store.installed().expect("installed").len(), 2);
+        let _ = other;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_upgrades_and_removes_sbin_executables_safely() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+
+        let add_sbin = |prepared: &Prepared, members: &[(&str, bool)]| {
+            let sbin = prepared.stage.path().join(SBIN);
+            fs::create_dir_all(&sbin).unwrap();
+            for (name, exec) in members {
+                let path = sbin.join(name);
+                fs::write(&path, b"#!/bin/sh\n").unwrap();
+                fs::set_permissions(
+                    &path,
+                    fs::Permissions::from_mode(if *exec { 0o755 } else { 0o644 }),
+                )
+                .unwrap();
+            }
+        };
+
+        // Pre-existing store lacking `sbin/` opens cleanly and creates `sbin/` on install.
+        fs::remove_dir(sbin_dir(&prefix)).unwrap();
+
+        let v1 = prepare(&store, "daemon", "1.0", &[("cli", true)]);
+        add_sbin(&v1, &[("daemond", true), ("notes", false)]);
+        let v1_receipt = v1.receipt.clone();
+        store.commit(vec![v1]).expect("commit bin+sbin");
+
+        assert!(sbin_dir(&prefix).is_dir());
+        assert_eq!(
+            fs::read_link(prefix.join(BIN).join("cli")).unwrap(),
+            Path::new("../Cellar/daemon/1.0/bin/cli")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join(SBIN).join("daemond")).unwrap(),
+            Path::new("../Cellar/daemon/1.0/sbin/daemond")
+        );
+        assert!(fs::symlink_metadata(prefix.join(SBIN).join("notes")).is_err());
+
+        // Preserve foreign file in sbin/, refuse collision with foreign sbin/ member.
+        fs::write(prefix.join(SBIN).join("foreign"), b"keep").unwrap();
+        let colliding = prepare(&store, "other", "1.0", &[]);
+        add_sbin(&colliding, &[("foreign", true)]);
+        assert!(store.commit(vec![colliding]).is_err());
+
+        let v2_collision = prepare(&store, "daemon", "2.0", &[("cli", true)]);
+        add_sbin(&v2_collision, &[("foreign", true)]);
+        assert!(
+            store
+                .upgrade(vec![(v1_receipt.clone(), v2_collision)])
+                .is_err()
+        );
+
+        let v2 = prepare(&store, "daemon", "2.0", &[("cli", true)]);
+        add_sbin(&v2, &[("daemond", true), ("daemonctl", true)]);
+        let v2_receipt = v2.receipt.clone();
+        store
+            .upgrade(vec![(v1_receipt, v2)])
+            .expect("upgrade bin+sbin");
+
+        assert_eq!(
+            fs::read_link(prefix.join(SBIN).join("daemond")).unwrap(),
+            Path::new("../Cellar/daemon/2.0/sbin/daemond")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join(SBIN).join("daemonctl")).unwrap(),
+            Path::new("../Cellar/daemon/2.0/sbin/daemonctl")
+        );
+        assert_eq!(
+            fs::read(prefix.join(SBIN).join("foreign")).unwrap(),
+            b"keep"
+        );
+
+        read_only(&store)
+            .remove(std::slice::from_ref(&v2_receipt))
+            .expect("remove bin+sbin");
+        assert!(fs::symlink_metadata(prefix.join(SBIN).join("daemond")).is_err());
+        assert!(fs::symlink_metadata(prefix.join(SBIN).join("daemonctl")).is_err());
+        assert_eq!(
+            fs::read(prefix.join(SBIN).join("foreign")).unwrap(),
+            b"keep"
+        );
+
+        // Keg-only formula skips both bin/ and sbin/, linking only opt/<name>.
+        let mut ko = prepare(&store, "kodaemon", "1.0", &[("ko-bin", true)]);
+        ko.receipt.keg_only = true;
+        add_sbin(&ko, &[("ko-sbin", true)]);
+        let ko_receipt = ko.receipt.clone();
+        store.commit(vec![ko]).expect("commit keg-only sbin");
+        assert_eq!(
+            fs::read_link(prefix.join(OPT).join("kodaemon")).unwrap(),
+            Path::new("../Cellar/kodaemon/1.0")
+        );
+        assert!(fs::symlink_metadata(prefix.join(BIN).join("ko-bin")).is_err());
+        assert!(fs::symlink_metadata(prefix.join(SBIN).join("ko-sbin")).is_err());
+        read_only(&store)
+            .remove(std::slice::from_ref(&ko_receipt))
+            .expect("remove keg-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_manpages_and_completions_through_install_upgrade_and_remove() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+        let docs = [
+            ("share/man/man1/tool.1", b"man1".as_slice()),
+            ("share/man/man8/tool.8", b"man8".as_slice()),
+            ("etc/bash_completion.d/tool", b"bash".as_slice()),
+            ("share/zsh/site-functions/_tool", b"zsh".as_slice()),
+            (
+                "share/fish/vendor_completions.d/tool.fish",
+                b"fish".as_slice(),
+            ),
+        ];
+
+        let v1 = prepare(&store, "tool", "1.0", &[("tool", true)]);
+        for (relative, bytes) in docs {
+            stage_file(&v1, relative, bytes, 0o644);
+        }
+        // A directory and a hidden member are neither direct nor safe members.
+        fs::create_dir_all(v1.stage.path().join("share/man/man1/tool.d")).unwrap();
+        stage_file(&v1, "share/man/man1/.hidden", b"hidden", 0o644);
+        let v1_receipt = v1.receipt.clone();
+        store.commit(vec![v1]).expect("install documentation links");
+
+        assert_eq!(
+            fs::read_link(prefix.join("share/man/man1/tool.1")).unwrap(),
+            Path::new("../../../Cellar/tool/1.0/share/man/man1/tool.1")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("etc/bash_completion.d/tool")).unwrap(),
+            Path::new("../../Cellar/tool/1.0/etc/bash_completion.d/tool")
+        );
+        for (relative, _) in docs {
+            assert_eq!(
+                fs::read_link(prefix.join(relative)).unwrap(),
+                keg_target("tool", "1.0", relative),
+                "{relative}"
+            );
+        }
+        assert!(fs::symlink_metadata(prefix.join("share/man/man1/tool.d")).is_err());
+        assert!(fs::symlink_metadata(prefix.join("share/man/man1/.hidden")).is_err());
+
+        // Upgrade replaces the man page and bash completion, switches the zsh
+        // function to a keg-contained symlink, and drops the fish completion.
+        let v2 = prepare(&store, "tool", "2.0", &[("tool", true)]);
+        stage_file(&v2, "share/man/man1/tool.1", b"man1-v2", 0o644);
+        stage_file(&v2, "share/zsh/site-functions/_tool.real", b"zsh-v2", 0o644);
+        stage_link(&v2, "share/zsh/site-functions/_tool", "_tool.real");
+        stage_file(&v2, "etc/bash_completion.d/tool", b"bash-v2", 0o644);
+        let v2_receipt = v2.receipt.clone();
+        store
+            .upgrade(vec![(v1_receipt, v2)])
+            .expect("upgrade documentation links");
+
+        assert_eq!(
+            fs::read(prefix.join("share/man/man1/tool.1")).unwrap(),
+            b"man1-v2"
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("share/zsh/site-functions/_tool")).unwrap(),
+            Path::new("../../../Cellar/tool/2.0/share/zsh/site-functions/_tool")
+        );
+        assert_eq!(
+            fs::read(prefix.join("share/zsh/site-functions/_tool")).unwrap(),
+            b"zsh-v2"
+        );
+        assert_eq!(
+            fs::read(prefix.join("etc/bash_completion.d/tool")).unwrap(),
+            b"bash-v2"
+        );
+        assert!(
+            fs::symlink_metadata(prefix.join("share/fish/vendor_completions.d/tool.fish")).is_err()
+        );
+
+        // Removal recognizes an owned link by its exact target even after the
+        // keg member it points at has disappeared.
+        fs::remove_file(
+            prefix
+                .join(CELLAR)
+                .join("tool")
+                .join("2.0")
+                .join("share/man/man1/tool.1"),
+        )
+        .unwrap();
+        read_only(&store)
+            .remove(std::slice::from_ref(&v2_receipt))
+            .expect("remove documentation links");
+        for (relative, _) in docs {
+            assert!(
+                fs::symlink_metadata(prefix.join(relative)).is_err(),
+                "{relative}"
+            );
+        }
+        assert!(store.installed().expect("installed").is_empty());
+
+        // Keg-only packages never create these links, only opt/<name>.
+        let mut keg_only = prepare(&store, "kegtool", "1.0", &[("kegtool", true)]);
+        keg_only.receipt.keg_only = true;
+        stage_file(&keg_only, "share/man/man1/kegtool.1", b"man", 0o644);
+        stage_file(&keg_only, "etc/bash_completion.d/kegtool", b"bash", 0o644);
+        let keg_only_receipt = keg_only.receipt.clone();
+        store
+            .commit(vec![keg_only])
+            .expect("install keg-only package");
+        assert!(fs::symlink_metadata(prefix.join("share/man/man1/kegtool.1")).is_err());
+        assert!(fs::symlink_metadata(prefix.join("etc/bash_completion.d/kegtool")).is_err());
+        assert_eq!(
+            fs::read_link(prefix.join(OPT).join("kegtool")).unwrap(),
+            Path::new("../Cellar/kegtool/1.0")
+        );
+        read_only(&store)
+            .remove(std::slice::from_ref(&keg_only_receipt))
+            .expect("remove keg-only package");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_executable_docker_cli_plugins_and_ignores_other_members() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+
+        let v1 = prepare(&store, "docker", "27.0", &[("docker", true)]);
+        stage_file(&v1, "bin/docker-buildx", b"#!/bin/sh\n", 0o755);
+        stage_file(&v1, "bin/docker-compose", b"#!/bin/sh\n", 0o755);
+        stage_link(
+            &v1,
+            "lib/docker/cli-plugins/docker-buildx",
+            "../../../bin/docker-buildx",
+        );
+        stage_link(
+            &v1,
+            "lib/docker/cli-plugins/docker-compose",
+            "../../../bin/docker-compose",
+        );
+        // Non-executable, unprefixed, and directory members are not plugins.
+        stage_file(
+            &v1,
+            "lib/docker/cli-plugins/docker-helper",
+            b"#!/bin/sh\n",
+            0o644,
+        );
+        stage_file(&v1, "lib/docker/cli-plugins/other", b"#!/bin/sh\n", 0o755);
+        fs::create_dir_all(v1.stage.path().join("lib/docker/cli-plugins/docker-dir")).unwrap();
+        let v1_receipt = v1.receipt.clone();
+        store.commit(vec![v1]).expect("install docker plugins");
+
+        let plugins = prefix.join("lib/docker/cli-plugins");
+        assert_eq!(
+            fs::read_link(plugins.join("docker-buildx")).unwrap(),
+            Path::new("../../../Cellar/docker/27.0/lib/docker/cli-plugins/docker-buildx")
+        );
+        assert_eq!(
+            fs::read(plugins.join("docker-compose")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert!(fs::symlink_metadata(plugins.join("docker-helper")).is_err());
+        assert!(fs::symlink_metadata(plugins.join("other")).is_err());
+        assert!(fs::symlink_metadata(plugins.join("docker-dir")).is_err());
+
+        // An upgrade replaces the plugin set: compose disappears, buildx now
+        // resolves through a different keg-contained symlink, and helper
+        // becomes executable and is linked.
+        let v2 = prepare(&store, "docker", "28.0", &[("docker", true)]);
+        stage_file(&v2, "bin/buildx", b"#!/bin/sh\n", 0o755);
+        stage_link(
+            &v2,
+            "lib/docker/cli-plugins/docker-buildx",
+            "../../../bin/buildx",
+        );
+        stage_file(
+            &v2,
+            "lib/docker/cli-plugins/docker-helper",
+            b"#!/bin/sh\n",
+            0o755,
+        );
+        let v2_receipt = v2.receipt.clone();
+        store
+            .upgrade(vec![(v1_receipt, v2)])
+            .expect("upgrade docker plugins");
+
+        assert_eq!(
+            fs::read(prefix.join("lib/docker/cli-plugins/docker-buildx")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert!(
+            fs::symlink_metadata(prefix.join("lib/docker/cli-plugins/docker-compose")).is_err()
+        );
+        assert_eq!(
+            fs::read(prefix.join("lib/docker/cli-plugins/docker-helper")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+
+        read_only(&store)
+            .remove(std::slice::from_ref(&v2_receipt))
+            .expect("remove docker plugins");
+        assert!(fs::symlink_metadata(prefix.join("lib/docker/cli-plugins/docker-buildx")).is_err());
+        assert!(fs::symlink_metadata(prefix.join("lib/docker/cli-plugins/docker-helper")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrades_a_pre_documentation_layout_package_into_managed_links() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+
+        // An older brewrs prefix only has bin/sbin/opt; its receipt and layout
+        // must remain readable and upgradable.
+        let v1 = prepare(&store, "legacy", "1.0", &[("legacy", true)]);
+        let v1_receipt = v1.receipt.clone();
+        store.commit(vec![v1]).expect("install legacy layout");
+        for directory in ["share", "etc", "lib"] {
+            assert!(fs::symlink_metadata(prefix.join(directory)).is_err());
+        }
+
+        let v2 = prepare(&store, "legacy", "2.0", &[("legacy", true)]);
+        stage_file(&v2, "share/man/man1/legacy.1", b"man", 0o644);
+        stage_file(
+            &v2,
+            "share/fish/vendor_completions.d/legacy.fish",
+            b"fish",
+            0o644,
+        );
+        let v2_receipt = v2.receipt.clone();
+        store
+            .upgrade(vec![(v1_receipt, v2)])
+            .expect("upgrade into managed links");
+        assert_eq!(
+            fs::read(prefix.join("share/man/man1/legacy.1")).unwrap(),
+            b"man"
+        );
+        assert_eq!(
+            fs::read(prefix.join("share/fish/vendor_completions.d/legacy.fish")).unwrap(),
+            b"fish"
+        );
+
+        read_only(&store)
+            .remove(std::slice::from_ref(&v2_receipt))
+            .expect("remove upgraded package");
+        assert!(fs::symlink_metadata(prefix.join("share/man/man1/legacy.1")).is_err());
+        assert!(
+            fs::symlink_metadata(prefix.join("share/fish/vendor_completions.d/legacy.fish"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_managed_link_collisions_before_writing() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+
+        // A foreign bash completion blocks the whole commit.
+        fs::create_dir_all(prefix.join("etc/bash_completion.d")).unwrap();
+        fs::write(prefix.join("etc/bash_completion.d/tool"), b"foreign").unwrap();
+        let before = tree(&prefix);
+        let v = prepare(&store, "tool", "1.0", &[("tool", true)]);
+        stage_file(&v, "etc/bash_completion.d/tool", b"own", 0o644);
+        let error = store.commit(vec![v]).expect_err("foreign completion");
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+        assert_eq!(tree(&prefix), before);
+        assert!(store.installed().expect("installed").is_empty());
+
+        // A foreign Docker plugin blocks the whole commit as well.
+        fs::create_dir_all(prefix.join("lib/docker/cli-plugins")).unwrap();
+        fs::write(
+            prefix.join("lib/docker/cli-plugins/docker-buildx"),
+            b"foreign",
+        )
+        .unwrap();
+        let before = tree(&prefix);
+        let docker = prepare(&store, "docker", "1.0", &[("docker", true)]);
+        stage_file(
+            &docker,
+            "lib/docker/cli-plugins/docker-buildx",
+            b"own",
+            0o755,
+        );
+        let error = store.commit(vec![docker]).expect_err("foreign plugin");
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+        assert_eq!(tree(&prefix), before);
+
+        // A foreign zsh function blocks an upgrade and leaves the old version
+        // installed and linked.
+        let docs = prepare(&store, "docs", "1.0", &[("docs", true)]);
+        stage_file(&docs, "share/man/man1/docs.1", b"v1", 0o644);
+        let docs_receipt = docs.receipt.clone();
+        store.commit(vec![docs]).expect("install docs");
+        fs::create_dir_all(prefix.join("share/zsh/site-functions")).unwrap();
+        fs::write(prefix.join("share/zsh/site-functions/_docs"), b"foreign").unwrap();
+        let v2 = prepare(&store, "docs", "2.0", &[("docs", true)]);
+        stage_file(&v2, "share/zsh/site-functions/_docs", b"v2", 0o644);
+        let error = store
+            .upgrade(vec![(docs_receipt, v2)])
+            .expect_err("foreign zsh function");
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+        let installed = store.installed().expect("installed");
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version, "1.0");
+        assert_eq!(
+            fs::read(prefix.join("share/man/man1/docs.1")).unwrap(),
+            b"v1"
+        );
+        assert_eq!(
+            fs::read(prefix.join("share/zsh/site-functions/_docs")).unwrap(),
+            b"foreign"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_commit_rolls_back_new_link_directories_only() {
+        let (_temp, store) = new_store();
+        let prefix = store.prefix();
+        fs::create_dir(prefix.join("share")).unwrap();
+        let first = prepare(&store, "first", "1.0", &[]);
+        stage_file(&first, "share/man/man1/first.1", b"man", 0o644);
+        let second = prepare(&store, "second", "1.0", &[]);
+        stage_file(&second, "share/man/man8/second.8", b"man", 0o644);
+        let third = prepare(&store, "third", "1.0", &[]);
+        let error = store
+            .commit_inner(vec![first, second, third], Some(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected commit failure"));
+        assert!(store.installed().unwrap().is_empty());
+        assert!(prefix.join("share").is_dir());
+        assert!(!prefix.join("share/man").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_managed_link_ancestors() {
+        let (temp, store) = new_store();
+        let prefix = store.prefix().to_path_buf();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        // Install refuses to traverse a symlinked share/ ancestor.
+        std::os::unix::fs::symlink(&outside, prefix.join("share")).unwrap();
+        let docs = prepare(&store, "tool", "1.0", &[("tool", true)]);
+        stage_file(&docs, "share/man/man1/tool.1", b"man", 0o644);
+        let error = store.commit(vec![docs]).expect_err("symlinked share");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert!(store.installed().expect("installed").is_empty());
+        assert!(!outside.join("man").exists());
+        fs::remove_file(prefix.join("share")).unwrap();
+
+        // The same applies to lib/, the Docker plugin ancestor.
+        std::os::unix::fs::symlink(&outside, prefix.join("lib")).unwrap();
+        let docker = prepare(&store, "docker", "1.0", &[("docker", true)]);
+        stage_file(
+            &docker,
+            "lib/docker/cli-plugins/docker-buildx",
+            b"#!/bin/sh\n",
+            0o755,
+        );
+        let error = store.commit(vec![docker]).expect_err("symlinked lib");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert!(!outside.join("docker").exists());
+        fs::remove_file(prefix.join("lib")).unwrap();
+
+        // Removal fails closed instead of scanning through the link.
+        let installed = install(&store, "tool", "1.0", &[("tool", true)]);
+        std::os::unix::fs::symlink(&outside, prefix.join("share")).unwrap();
+        let error = read_only(&store)
+            .remove(std::slice::from_ref(&installed))
+            .expect_err("removal through symlink");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(store.installed().expect("installed").len(), 1);
+        assert_eq!(
+            fs::read_link(prefix.join(BIN).join("tool")).unwrap(),
+            Path::new("../Cellar/tool/1.0/bin/tool")
+        );
+        fs::remove_file(prefix.join("share")).unwrap();
+        read_only(&store)
+            .remove(std::slice::from_ref(&installed))
+            .expect("remove after unlink");
     }
 }

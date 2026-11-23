@@ -19,6 +19,10 @@ pub struct Formula {
     #[serde(default)]
     pub versions: Versions,
     #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub oldnames: Vec<String>,
+    #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub build_dependencies: Vec<String>,
@@ -44,6 +48,8 @@ pub struct Formula {
 pub struct Cask {
     #[serde(default)]
     pub token: String,
+    #[serde(default)]
+    pub old_tokens: Vec<String>,
     #[serde(default)]
     pub name: Vec<String>,
     #[serde(default)]

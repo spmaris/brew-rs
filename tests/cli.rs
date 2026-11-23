@@ -255,19 +255,26 @@ fn unsupported_upstream_flags_are_rejected_without_running_brew() {
     let sandbox = Sandbox::new();
 
     for (args, flag) in [
-        (vec!["install", "--dry-run", "--cask", "firefox"], "--cask"),
         (vec!["install", "--dry-run", "--force", "hello"], "--force"),
         (vec!["install", "--dry-run", "--head", "hello"], "--head"),
         (
             vec!["install", "--dry-run", "--no-deps", "hello"],
             "--no-deps",
         ),
-        (vec!["remove", "--dry-run", "--cask", "firefox"], "--cask"),
         (
-            vec!["upgrade", "--dry-run", "--greedy", "hello"],
+            vec!["install", "--dry-run", "--appdir", "/tmp", "hello"],
+            "--appdir",
+        ),
+        (
+            vec!["remove", "--dry-run", "--cask", "--autoremove", "firefox"],
+            "--autoremove",
+        ),
+        (
+            vec!["upgrade", "--dry-run", "--formula", "--greedy", "hello"],
             "--greedy",
         ),
-        (vec!["check-update", "--greedy"], "--greedy"),
+        (vec!["check-update", "--formula", "--greedy"], "--greedy"),
+        (vec!["list", "--greedy"], "--greedy"),
         (vec!["list", "--sizes"], "--sizes"),
         (vec!["list", "--dates"], "--dates"),
     ] {
@@ -315,6 +322,78 @@ fn invalid_config_is_preserved_until_explicit_reset() {
     sandbox.assert_no_brew();
     assert_success(&sandbox.run(&["config", "reset"]));
     assert_success(&sandbox.run(&["config", "show"]));
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn migration_audit_reads_inventory_without_using_brew_or_writing() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.home.join("homebrew-source");
+    let dest = sandbox.home.join("unused-brewrs-destination");
+    let launchd = sandbox.home.join("launchd");
+    for path in [
+        source.join("Cellar/ripgrep/16.0.0"),
+        source.join("Cellar/example-tool/1.3"),
+        source.join("Caskroom/example-browser/2.0"),
+        source.join("Library/Taps/example/homebrew-tools"),
+        launchd.clone(),
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let receipt = source.join("Cellar/ripgrep/16.0.0/INSTALL_RECEIPT.json");
+    let original = r#"{"installed_on_request":true,"source":{"tap":"homebrew/core"}}"#;
+    fs::write(&receipt, original).unwrap();
+    fs::write(
+        source.join("Cellar/example-tool/1.3/INSTALL_RECEIPT.json"),
+        r#"{"installed_on_request":false,"source":{"tap":"example/tools"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        launchd.join("homebrew.mxcl.colima.plist"),
+        b"fixture: file existence only",
+    )
+    .unwrap();
+    fs::write(launchd.join("com.example.unrelated.plist"), b"unrelated").unwrap();
+
+    let output = sandbox.run(&[
+        "migrate",
+        "--brew-prefix",
+        source.to_str().unwrap(),
+        "--prefix",
+        dest.to_str().unwrap(),
+        "--service-dir",
+        launchd.to_str().unwrap(),
+    ]);
+    assert_success(&output);
+    let report = stdout(&output);
+    assert_row_containing(&report, "ripgrep", &["16.0.0", "Requested", "Unchecked"]);
+    assert_row_containing(&report, "example-tool", &["1.3", "Dependency", "Blocked"]);
+    assert_row_containing(&report, "example-browser", &["2.0", "Unchecked"]);
+    assert!(report.contains("example/tools"));
+    assert!(report.contains("homebrew.mxcl.colima"));
+    assert!(!report.contains("com.example.unrelated"));
+    assert!(report.contains("running state not checked"));
+    assert_eq!(fs::read_to_string(receipt).unwrap(), original);
+    assert!(!dest.exists() && !sandbox.config.exists());
+    assert!(!sandbox.home.join(".cache").exists());
+    assert!(!sandbox.home.join("Library/Caches").exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn migration_audit_rejects_overlapping_prefixes() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.home.join("homebrew-source");
+    let output = sandbox.run(&[
+        "migrate",
+        "--brew-prefix",
+        source.to_str().unwrap(),
+        "--prefix",
+        source.join("not-separate").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("must not overlap"));
+    assert!(!source.exists());
     sandbox.assert_no_brew();
 }
 
@@ -527,6 +606,72 @@ fn seed_native_graph(prefix: &Path, packages: &[(&str, bool, &[&str])]) {
 }
 
 #[test]
+fn colima_service_preview_uses_pinned_kegs_without_executing_them() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("Colima trial prefix");
+    seed_native_graph(&prefix, &[]);
+    let identity = |name, version| serde_json::json!({"name": name, "version": version, "sha256": "a".repeat(64)});
+    let mut colima = identity("colima", "0.10.3");
+    colima["requested"] = serde_json::json!(true);
+    colima["dependencies"] = serde_json::json!([identity("lima", "2.3.0")]);
+    let mut lima = identity("lima", "2.3.0");
+    lima["requested"] = serde_json::json!(false);
+    let receipts = prefix.join(".brewrs/state/receipts");
+    fs::write(receipts.join("colima.json"), colima.to_string()).unwrap();
+    fs::write(receipts.join("lima.json"), lima.to_string()).unwrap();
+
+    let colima_bin = prefix.join("Cellar/colima/0.10.3/bin/colima");
+    let lima_bin = prefix.join("Cellar/lima/2.3.0/bin/limactl");
+    for executable in [&colima_bin, &lima_bin] {
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(
+            executable,
+            b"#!/bin/sh\nprintf invoked > \"$HOME/service-invoked\"\nexit 98\n",
+        )
+        .unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let args = [
+        "services",
+        "plan",
+        "colima",
+        "--prefix",
+        prefix.to_str().unwrap(),
+    ];
+    let output = sandbox.run(&args);
+    assert_success(&output);
+    let report = stdout(&output);
+    assert!(report.contains("Proposed label"));
+    assert!(report.contains("local.brewrs."));
+    assert!(report.contains("Cellar/colima/0.10.3/bin/colima"));
+    assert!(report.contains("Cellar/lima/2.3.0/bin/limactl"));
+    assert!(report.contains("--foreground"));
+    assert!(report.contains("--activate=false") && report.contains("--ssh-config=false"));
+    assert!(report.contains("--mount=none") && report.contains("--template=false"));
+    assert!(report.contains("enforces no sandbox"));
+    assert!(report.contains("Working directory"));
+    assert!(report.contains("service-trials/colima/home"));
+    assert!(report.contains("COLIMA_HOME"));
+    assert!(report.contains("COLIMA_CACHE_HOME"));
+    assert!(report.contains("COLIMA_PROFILE"));
+    assert!(report.contains("brewrs-"));
+    assert!(report.contains("LIMA_HOME"));
+    assert!(report.contains("PATH"));
+    assert!(report.contains("Cellar/lima/2.3.0/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+    assert!(!report.contains("/opt/homebrew"));
+    assert!(!sandbox.home.join("service-invoked").exists());
+    assert!(!prefix.join(".brewrs/service-trials").exists());
+    assert!(!sandbox.config.exists());
+
+    lima["sha256"] = serde_json::json!("b".repeat(64));
+    fs::write(receipts.join("lima.json"), lima.to_string()).unwrap();
+    let failed = sandbox.run(&args);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(stderr(&failed).contains("unsatisfied receipt pins"));
+    sandbox.assert_no_brew();
+}
+
+#[test]
 fn reverse_dependencies_use_only_native_receipts() {
     let sandbox = Sandbox::new();
     let prefix = sandbox.home.join("native-prefix");
@@ -643,5 +788,306 @@ fn native_remove_previews_and_removes_only_the_owned_package() {
     assert_success(&applied);
     assert!(!receipt.exists() && !executable.exists() && fs::symlink_metadata(&link).is_err());
     assert_eq!(fs::read(&foreign).unwrap(), b"leave me alone");
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn shellenv_prints_exports_without_creating_prefix_or_config() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("Brew's Space Prefix");
+    let path = prefix.to_str().unwrap();
+
+    let posix = sandbox.run(&["shellenv", "--prefix", path, "--shell", "zsh"]);
+    assert_success(&posix);
+    let out = stdout(&posix);
+    assert!(out.contains("export BREWRS_PREFIX="), "{out}");
+    assert!(out.contains("Brew'\\''s Space Prefix"), "{out}");
+    assert!(out.contains("export PATH="), "{out}");
+    assert!(out.contains("/bin:"), "{out}");
+    assert!(out.contains("/sbin"), "{out}");
+
+    let fish = sandbox.run_with_env(
+        &["shellenv", "--prefix", path],
+        &[("SHELL", "/usr/bin/fish")],
+    );
+    assert_success(&fish);
+    let fish_out = stdout(&fish);
+    assert!(fish_out.contains("set -gx BREWRS_PREFIX "), "{fish_out}");
+    assert!(fish_out.contains("fish_add_path -gP "), "{fish_out}");
+    assert!(fish_out.contains("Brew\\'s Space Prefix"), "{fish_out}");
+
+    assert!(!prefix.exists());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_cask_list_remove_and_upgrade_work_offline_without_brew() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-cask-prefix");
+    let path = prefix.to_str().unwrap();
+
+    // Empty prefix checks for cask subcommands must stay offline and read-only.
+    assert_success(&sandbox.run(&["upgrade", "--prefix", path, "--cask", "--dry-run"]));
+    assert_success(&sandbox.run(&["check-update", "--prefix", path, "--greedy"]));
+    assert!(!prefix.exists());
+
+    // Seed an initialized store with a cask containing an .app, symlinked binary,
+    // and command_wrapper script, plus a foreign file in bin/.
+    let receipts = prefix.join(".brewrs/state/casks");
+    let app_dir = prefix.join("Applications/Demo.app/Contents/MacOS");
+    let caskroom_ver = prefix.join("Caskroom/demo-cask/1.2.3");
+    let bin_dir = prefix.join("bin");
+    for dir in [
+        &receipts,
+        &prefix.join(".brewrs/state/receipts"),
+        &prefix.join(".brewrs/stages"),
+        &prefix.join("Cellar"),
+        &app_dir,
+        &caskroom_ver,
+        &bin_dir,
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(prefix.join(".brewrs-root"), "brewrs native store v1\n").unwrap();
+    fs::write(
+        prefix.join("Applications/Demo.app/Contents/Info.plist"),
+        b"<plist/>",
+    )
+    .unwrap();
+    fs::write(app_dir.join("demo-gui"), b"gui").unwrap();
+    fs::write(caskroom_ver.join("demo-cli"), b"#!/bin/sh\necho cli\n").unwrap();
+    fs::set_permissions(
+        caskroom_ver.join("demo-cli"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let symlink_target = "../Caskroom/demo-cask/1.2.3/demo-cli";
+    symlink(symlink_target, bin_dir.join("demo-cli")).unwrap();
+
+    let wrapper_bytes = b"#!/bin/sh\nexec '/tmp/demo' \"$@\"\n";
+    let wrapper_sha = hex::encode(Sha256::digest(wrapper_bytes));
+    fs::write(bin_dir.join("demo-wrap"), wrapper_bytes).unwrap();
+    fs::set_permissions(bin_dir.join("demo-wrap"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let foreign = bin_dir.join("foreign-tool");
+    fs::write(&foreign, b"keep").unwrap();
+
+    let receipt = serde_json::json!({
+        "token": "demo-cask",
+        "version": "1.2.3",
+        "sha256": "a".repeat(64),
+        "auto_updates": false,
+        "apps": [{"bundle_name": "Demo.app", "path": prefix.join("Applications/Demo.app")}],
+        "caskroom_files": ["demo-cli"],
+        "links": [{"dest": "bin/demo-cli", "target": symlink_target}],
+        "wrappers": [{"dest": "bin/demo-wrap", "sha256": wrapper_sha}],
+        "conflicts_with_casks": [],
+        "conflicts_with_formulae": []
+    });
+    fs::write(receipts.join("demo-cask.json"), receipt.to_string()).unwrap();
+
+    let list_all = sandbox.run(&["list", "--prefix", path]);
+    assert_success(&list_all);
+    assert_row_containing(&stdout(&list_all), "demo-cask", &["1.2.3", "Demo.app"]);
+
+    let list_casks = sandbox.run(&["list", "--prefix", path, "--cask"]);
+    assert_success(&list_casks);
+    assert_row_containing(&stdout(&list_casks), "demo-cask", &["1.2.3"]);
+
+    let list_formulae = sandbox.run(&["list", "--prefix", path, "--formula"]);
+    assert_success(&list_formulae);
+    assert!(stdout(&list_formulae).contains("No brewrs-managed packages"));
+
+    let dry_rm = sandbox.run(&[
+        "remove",
+        "--prefix",
+        path,
+        "--cask",
+        "--dry-run",
+        "demo-cask",
+    ]);
+    assert_success(&dry_rm);
+    assert_row_containing(&stdout(&dry_rm), "demo-cask", &["1.2.3", "Remove"]);
+    assert!(receipts.join("demo-cask.json").is_file());
+
+    let applied_rm = sandbox.run(&["remove", "--prefix", path, "--cask", "--yes", "demo-cask"]);
+    assert_success(&applied_rm);
+    assert!(!receipts.join("demo-cask.json").exists());
+    assert!(!prefix.join("Applications/Demo.app").exists());
+    assert!(fs::symlink_metadata(bin_dir.join("demo-cli")).is_err());
+    assert!(!bin_dir.join("demo-wrap").exists());
+    assert!(!prefix.join("Caskroom/demo-cask").exists());
+    assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+
+    sandbox.assert_no_brew();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_cask_rejects_protected_prefix_and_appdir() {
+    let sandbox = Sandbox::new();
+    let homebrew = sandbox.home.join("fake-homebrew");
+    let safe_prefix = sandbox.home.join("safe-prefix");
+    let protected_appdir = homebrew.join("Applications");
+    fs::create_dir_all(&protected_appdir).unwrap();
+
+    let bad_prefix = sandbox.run_with_env(
+        &[
+            "install",
+            "--prefix",
+            homebrew.join("brewrs-sub").to_str().unwrap(),
+            "--cask",
+            "--dry-run",
+            "firefox",
+        ],
+        &[("HOMEBREW_PREFIX", homebrew.to_str().unwrap())],
+    );
+    assert_eq!(bad_prefix.status.code(), Some(1));
+    assert!(stderr(&bad_prefix).contains("inside the Homebrew prefix"));
+
+    let bad_appdir = sandbox.run_with_env(
+        &[
+            "install",
+            "--prefix",
+            safe_prefix.to_str().unwrap(),
+            "--cask",
+            "--appdir",
+            protected_appdir.to_str().unwrap(),
+            "--dry-run",
+            "firefox",
+        ],
+        &[("HOMEBREW_PREFIX", homebrew.to_str().unwrap())],
+    );
+    assert_eq!(bad_appdir.status.code(), Some(1));
+    assert!(stderr(&bad_appdir).contains("inside the Homebrew prefix"));
+    assert!(!safe_prefix.exists());
+
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn services_list_reports_only_observed_state_and_creates_nothing() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("Service state prefix");
+    let path = prefix.to_str().unwrap();
+
+    // An absent prefix is reported as such without creating it or a config.
+    let absent = sandbox.run(&["services", "list", "--prefix", path]);
+    assert_success(&absent);
+    let report = stdout(&absent);
+    assert!(report.contains("No local service state or reviewed Colima receipt observed"));
+    assert!(report.contains("not inspected (prefix is not an initialized brewrs store)"));
+    assert!(!report.to_lowercase().contains("running"));
+    assert!(!prefix.exists(), "services list must not create the prefix");
+    assert!(!sandbox.config.exists());
+
+    seed_native_graph(&prefix, &[]);
+    let receipts = prefix.join(".brewrs/state/receipts");
+    let identity = |name: &str, version: &str, sha: &str| serde_json::json!({"name": name, "version": version, "sha256": sha});
+    let mut colima = identity("colima", "0.10.3", &"a".repeat(64));
+    colima["requested"] = serde_json::json!(true);
+    colima["dependencies"] = serde_json::json!([identity("lima", "2.3.0", &"b".repeat(64))]);
+    let mut lima = identity("lima", "2.3.0", &"b".repeat(64));
+    lima["requested"] = serde_json::json!(false);
+    let mut zellij = identity("zellij", "0.46.0", &"c".repeat(64));
+    zellij["requested"] = serde_json::json!(true);
+    fs::write(receipts.join("colima.json"), colima.to_string()).unwrap();
+    fs::write(receipts.join("lima.json"), lima.to_string()).unwrap();
+    fs::write(receipts.join("zellij.json"), zellij.to_string()).unwrap();
+
+    // The reviewed Colima lane is reported; an installed formula with no
+    // recorded declaration is not turned into a fabricated service row.
+    let empty = sandbox.run(&["services", "list", "--prefix", path]);
+    assert_success(&empty);
+    let report = stdout(&empty);
+    assert!(report.contains("colima"));
+    assert!(report.contains("0.10.3"));
+    assert!(report.contains("reviewed trial (0.10.3)"));
+    assert!(report.contains("no brewrs service state"));
+    assert!(
+        !report.contains("zellij"),
+        "services list must not invent a service row for an installed formula whose declaration is not recorded"
+    );
+    assert!(!report.to_lowercase().contains("running"));
+
+    // Observed state is reported literally, including entries this build did
+    // not create, and is never labeled running or installed.
+    fs::create_dir_all(prefix.join(".brewrs/services/colima")).unwrap();
+    fs::create_dir_all(prefix.join(".brewrs/service-trials/colima")).unwrap();
+    fs::write(prefix.join(".brewrs/services/orphan"), b"note").unwrap();
+    let observed = sandbox.run(&["services", "list", "--prefix", path]);
+    assert_success(&observed);
+    let report = stdout(&observed);
+    assert!(report.contains(".brewrs/services directory present (runtime not inspected)"));
+    assert!(report.contains(".brewrs/service-trials directory present (runtime not inspected)"));
+    assert!(report.contains("orphan"));
+    assert!(report.contains("file under .brewrs/services (runtime not inspected)"));
+    assert!(!report.to_lowercase().contains("running"));
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn services_list_refuses_a_symlinked_state_root() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("Service symlink prefix");
+    seed_native_graph(&prefix, &[]);
+    let outside = sandbox.home.join("outside-service-state");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, prefix.join(".brewrs/services")).unwrap();
+
+    let output = sandbox.run(&["services", "list", "--prefix", prefix.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("must not be a symlink"));
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn services_plan_rejects_an_uninstalled_formula_before_any_metadata_fetch() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("Service plan prefix");
+    seed_native_graph(&prefix, &[]);
+
+    let output = sandbox.run(&[
+        "services",
+        "plan",
+        "zellij",
+        "--prefix",
+        prefix.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("not installed"));
+    assert!(!prefix.join(".brewrs/service-trials").exists());
+    assert!(!sandbox.config.exists());
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn services_help_lists_both_read_only_actions() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["services", "--help"]);
+    assert_success(&output);
+    let help = stdout(&output);
+    assert!(help.contains("plan"));
+    assert!(help.contains("list"));
     sandbox.assert_no_brew();
 }

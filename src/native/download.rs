@@ -172,7 +172,7 @@ fn parse_bottle_url(url: &str, sha256: &str) -> Result<BottleSource> {
 }
 
 /// Whether `value` is exactly 64 lowercase hexadecimal characters.
-fn is_lower_hex_digest(value: &str) -> bool {
+pub(super) fn is_lower_hex_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -200,19 +200,28 @@ fn is_valid_repository_segment(segment: &str) -> bool {
 
 /// Create and validate the isolated native bottle cache directory.
 fn bottle_cache_dir(config: &Config) -> Result<PathBuf> {
-    let directory = config.storage.cache_dir.join(BOTTLE_DIR_NAME);
+    ensure_isolated_cache_dir(config, BOTTLE_DIR_NAME, "native bottle")
+}
+
+/// Create and validate an isolated private cache directory below `storage.cache_dir`.
+pub(super) fn ensure_isolated_cache_dir(
+    config: &Config,
+    subdir: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let directory = config.storage.cache_dir.join(subdir);
 
     match fs::symlink_metadata(&directory) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
                 bail!(
-                    "refusing to use '{}': the native bottle directory is a symlink",
+                    "refusing to use '{}': the {label} directory is a symlink",
                     directory.display()
                 );
             }
             if !metadata.is_dir() {
                 bail!(
-                    "refusing to use '{}': the native bottle path is not a directory",
+                    "refusing to use '{}': the {label} path is not a directory",
                     directory.display()
                 );
             }
@@ -220,19 +229,19 @@ fn bottle_cache_dir(config: &Config) -> Result<PathBuf> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(&directory).with_context(|| {
                 format!(
-                    "failed to create the native bottle cache directory: {}",
+                    "failed to create the {label} cache directory: {}",
                     directory.display()
                 )
             })?;
             let metadata = fs::symlink_metadata(&directory).with_context(|| {
                 format!(
-                    "failed to inspect the native bottle cache directory: {}",
+                    "failed to inspect the {label} cache directory: {}",
                     directory.display()
                 )
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 bail!(
-                    "refusing to use '{}': the native bottle directory is not a real directory",
+                    "refusing to use '{}': the {label} directory is not a real directory",
                     directory.display()
                 );
             }
@@ -240,7 +249,7 @@ fn bottle_cache_dir(config: &Config) -> Result<PathBuf> {
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed to inspect the native bottle cache directory: {}",
+                    "failed to inspect the {label} cache directory: {}",
                     directory.display()
                 )
             });
@@ -252,7 +261,7 @@ fn bottle_cache_dir(config: &Config) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(|| {
             format!(
-                "failed to restrict permissions on the native bottle cache directory: {}",
+                "failed to restrict permissions on the {label} cache directory: {}",
                 directory.display()
             )
         })?;
@@ -266,7 +275,7 @@ fn bottle_cache_dir(config: &Config) -> Result<PathBuf> {
 /// Returns `Ok(None)` when the path is absent or held a mismatched regular
 /// file that was discarded. Anything that is not a regular file is an error so
 /// a symlink can never be followed out of the cache.
-fn reuse_cached_bottle(path: &Path, digest: &str) -> Result<Option<PathBuf>> {
+pub(super) fn reuse_cached_bottle(path: &Path, digest: &str) -> Result<Option<PathBuf>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -318,7 +327,7 @@ fn reuse_cached_bottle(path: &Path, digest: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Stream `path` through SHA-256 and compare it with `expected`.
-fn verify_file_digest(path: &Path, expected: &str) -> Result<()> {
+pub(super) fn verify_file_digest(path: &Path, expected: &str) -> Result<()> {
     verify_file_digest_bounded(path, expected, MAX_BOTTLE_BYTES)
 }
 
@@ -377,9 +386,14 @@ fn verify_file_digest_bounded(path: &Path, expected: &str, limit: u64) -> Result
 
 /// Build the HTTP client used for GHCR requests.
 fn build_client(config: &Config) -> Result<Client> {
+    build_verified_client(config, "bottle")
+}
+
+/// Build an HTTPS-only, manual-redirect HTTP client respecting proxy and agent settings.
+pub(super) fn build_verified_client(config: &Config, label: &str) -> Result<Client> {
     let mut builder = Client::builder()
-        // Redirects are followed manually so a bearer token can never be
-        // forwarded to a CDN host and every hop is validated.
+        // Redirects are followed manually so every hop can be validated before
+        // connecting or forwarding headers.
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .connect_timeout(request_timeout(config));
@@ -393,7 +407,7 @@ fn build_client(config: &Config) -> Result<Client> {
 
     builder
         .build()
-        .context("failed to build the bottle HTTP client")
+        .with_context(|| format!("failed to build the {label} HTTP client"))
 }
 
 /// Download the bottle blob, handling a public GHCR pull token and CDN redirects.
@@ -570,7 +584,7 @@ async fn request_pull_token(client: &Client, scope: &str, config: &Config) -> Re
 }
 
 /// Stream the response into a staging file, hashing and verifying as it goes.
-async fn stage_bottle(
+pub(super) async fn stage_bottle(
     directory: &Path,
     destination: &Path,
     digest: &str,
@@ -750,7 +764,7 @@ fn sync_directory(directory: &Path) {
 }
 
 /// Timeout for connection setup and response headers.
-fn request_timeout(config: &Config) -> Duration {
+pub(super) fn request_timeout(config: &Config) -> Duration {
     Duration::from_secs(config.downloads.timeout.clamp(1, 300))
 }
 
