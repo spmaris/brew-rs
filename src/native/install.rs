@@ -9,7 +9,8 @@ use crate::{config::Config, ui::DnfStyleFormatter};
 
 use super::plan::PlannedFormula;
 use super::store::{
-    Dependency, Prepared, Receipt, Store, validate_conflicts, validate_dependencies,
+    Dependency, Prepared, Receipt, Store, validate_conflicts, validate_dependencies_with_retained,
+    validate_retained_pin_closure,
 };
 use super::{archive, default_target, download, plan, relocate};
 
@@ -27,9 +28,10 @@ pub(crate) async fn install(
     let store = Store::open(&path, false)?;
     let tag = default_target()?;
     let existing = store.installed()?;
+    let retained = store.retained()?;
     let existing_casks = super::cask_store::installed(&store)?;
     let plan = plan::resolve(config, packages, &tag).await?;
-    let pending = pending_packages(&plan, &existing)?;
+    let pending = pending_packages(&plan, &existing, &retained)?;
     let mut projected = existing.clone();
     for item in &pending {
         projected.push(item.receipt.clone());
@@ -294,6 +296,7 @@ pub(crate) async fn upgrade(
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
     let installed = store.installed()?;
+    let retained = store.retained()?;
     let selected = if packages.is_empty() {
         installed.clone()
     } else {
@@ -304,7 +307,7 @@ pub(crate) async fn upgrade(
         return Ok(());
     }
 
-    let (tag, changes) = resolve_changes(config, &installed, &selected).await?;
+    let (tag, changes) = resolve_changes(config, &installed, &selected, &retained).await?;
     if changes.is_empty() {
         println!("All selected packages are up to date.");
         return Ok(());
@@ -384,8 +387,9 @@ pub(crate) async fn check_updates(config: &Config, prefix: Option<&Path>) -> Res
         println!("No brewrs-managed packages to upgrade.");
         return Ok(false);
     }
+    let retained = store.retained()?;
 
-    let (tag, changes) = resolve_changes(config, &installed, &installed).await?;
+    let (tag, changes) = resolve_changes(config, &installed, &installed, &retained).await?;
     let formatter = DnfStyleFormatter::new(config);
     if changes.is_empty() {
         println!("All brewrs-managed packages are up to date.");
@@ -412,6 +416,7 @@ async fn resolve_changes(
     config: &Config,
     installed: &[Receipt],
     selected: &[Receipt],
+    retained: &[Receipt],
 ) -> Result<(String, Vec<UpgradeChange>)> {
     let targets: Vec<_> = selected
         .iter()
@@ -419,7 +424,7 @@ async fn resolve_changes(
         .collect();
     let tag = default_target()?;
     let plan = plan::resolve(config, &targets, &tag).await?;
-    let changes = planned_changes(&plan, installed, selected)?;
+    let changes = planned_changes(&plan, installed, selected, retained)?;
     Ok((tag, changes))
 }
 
@@ -427,11 +432,14 @@ async fn resolve_changes(
 ///
 /// Eligibility is decided by [`upgrade_plan`]; the projected receipt graph is
 /// then validated so neither the preview nor a check reports an upgrade that
-/// would break an installed dependency pin.
+/// would break an installed dependency pin. A pin to the exact old version and
+/// digest of a replaced package is carried by retaining that old keg, exactly
+/// as the store applies it, so the preview agrees with the applied upgrade.
 fn planned_changes(
     plan: &[PlannedFormula],
     installed: &[Receipt],
     selected: &[Receipt],
+    retained: &[Receipt],
 ) -> Result<Vec<UpgradeChange>> {
     let changes: Vec<_> = upgrade_plan(plan, selected)?
         .into_iter()
@@ -441,6 +449,51 @@ fn planned_changes(
             formula: candidate.formula.clone(),
         })
         .collect();
+    let survivors: Vec<Receipt> = installed
+        .iter()
+        .filter(|receipt| !changes.iter().any(|change| change.old.name == receipt.name))
+        .cloned()
+        .collect();
+    let pinned_by = |target: &Receipt, owners: &[Receipt]| {
+        owners.iter().any(|receipt| {
+            receipt.dependencies.iter().any(|pin| {
+                pin.name == target.name
+                    && pin.version == target.version
+                    && pin.sha256 == target.sha256
+            })
+        })
+    };
+    // Retention candidates mirror the store's decision: surviving active
+    // receipts plus every retained record on disk force retention, and the
+    // transitive closure a retained old receipt's own pins force.
+    let mut owners = survivors.clone();
+    owners.extend(retained.iter().cloned());
+    let mut new_retained: Vec<Receipt> = changes
+        .iter()
+        .filter(|change| pinned_by(&change.old, &owners))
+        .map(|change| change.old.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for change in &changes {
+            if new_retained.contains(&change.old) {
+                continue;
+            }
+            if pinned_by(&change.old, &new_retained) {
+                new_retained.push(change.old.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut all_retained = retained.to_vec();
+    all_retained.extend(new_retained);
+    let replacements: Vec<Receipt> = changes.iter().map(|change| change.new.clone()).collect();
+    validate_dependencies_with_retained(&survivors, &replacements, &all_retained).context(
+        "Upgrade would leave unmet dependency pins; select compatible updates together or install missing requirements first",
+    )?;
     let mut projected = installed.to_vec();
     for change in &changes {
         let receipt = projected
@@ -449,9 +502,7 @@ fn planned_changes(
             .context("An upgrade target was missing from the installed snapshot")?;
         *receipt = change.new.clone();
     }
-    validate_dependencies(&projected).context(
-        "Upgrade would leave unmet dependency pins; select compatible updates together or install missing requirements first",
-    )?;
+    validate_retained_pin_closure(&all_retained, &projected, &all_retained)?;
     validate_conflicts(&projected)?;
     Ok(changes)
 }
@@ -599,7 +650,8 @@ pub(crate) fn remove(
 ) -> Result<()> {
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let installed = store.installed()?;
-    let pending = planned_removals(packages, &installed, autoremove)?;
+    let retained = store.retained()?;
+    let pending = planned_removals(packages, &installed, autoremove, &retained)?;
     apply_removal(config, &store, &pending, dry_run, yes, "Remove packages")
 }
 
@@ -607,32 +659,41 @@ fn planned_removals(
     packages: &[String],
     installed: &[Receipt],
     autoremove: bool,
+    retained: &[Receipt],
 ) -> Result<Vec<Receipt>> {
     let mut pending = removal_plan(packages, installed)?;
     let names: HashSet<_> = pending
         .iter()
         .map(|receipt| receipt.name.as_str())
         .collect();
-    let retained: Vec<_> = installed
+    let mut remaining: Vec<_> = installed
         .iter()
         .filter(|entry| !names.contains(entry.name.as_str()))
         .cloned()
         .collect();
-    validate_dependencies(&retained).context("Removal would leave unmet dependencies")?;
+    validate_dependencies_with_retained(&remaining, &[], retained)
+        .context("Removal would leave unmet dependencies")?;
     if autoremove {
-        validate_dependencies(installed).context("Cannot determine dependency ownership safely")?;
+        validate_dependencies_with_retained(installed, &[], retained)
+            .context("Cannot determine dependency ownership safely")?;
         let previously_needed = reachable_packages(installed, |entry| entry.requested);
         // Keep previously unused packages and whatever they still need.
-        let still_needed = reachable_packages(&retained, |entry| {
+        let still_needed: HashSet<String> = reachable_packages(&remaining, |entry| {
             entry.requested || !previously_needed.contains(entry.name.as_str())
-        });
+        })
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         pending.extend(
-            retained
+            remaining
                 .iter()
                 .filter(|entry| !still_needed.contains(entry.name.as_str()))
                 .cloned(),
         );
+        remaining.retain(|entry| still_needed.contains(entry.name.as_str()));
     }
+    validate_retained_pin_closure(retained, &remaining, retained)
+        .context("Removal would strand a retained keg's recorded dependency")?;
     Ok(pending)
 }
 
@@ -644,7 +705,8 @@ pub(crate) fn autoremove(
 ) -> Result<()> {
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let installed = store.installed()?;
-    let pending = autoremove_plan(&installed)?;
+    let retained = store.retained()?;
+    let pending = autoremove_plan(&installed, &retained)?;
     apply_removal(
         config,
         &store,
@@ -655,17 +717,31 @@ pub(crate) fn autoremove(
     )
 }
 
-fn autoremove_plan(installed: &[Receipt]) -> Result<Vec<Receipt>> {
-    validate_dependencies(installed).context("Cannot determine dependency ownership safely")?;
+fn autoremove_plan(installed: &[Receipt], retained: &[Receipt]) -> Result<Vec<Receipt>> {
+    validate_dependencies_with_retained(installed, &[], retained)
+        .context("Cannot determine dependency ownership safely")?;
     let needed = reachable_packages(installed, |entry| entry.requested);
-    Ok(installed
+    let pending: Vec<Receipt> = installed
         .iter()
         .filter(|entry| !needed.contains(entry.name.as_str()))
         .cloned()
-        .collect())
+        .collect();
+    let remaining: Vec<Receipt> = installed
+        .iter()
+        .filter(|entry| needed.contains(entry.name.as_str()))
+        .cloned()
+        .collect();
+    validate_retained_pin_closure(retained, &remaining, retained)
+        .context("Autoremove would strand a retained keg's recorded dependency")?;
+    Ok(pending)
 }
 
 // Exact pins are validated before the walk; visit each node at most once.
+//
+// The walk traverses the *active* receipt set only. A pin whose name has no
+// active receipt (it is satisfied by a retained keg) has nothing to visit, so
+// it is skipped instead of panicking or pretending a retained keg is a
+// removable active package.
 fn reachable_packages(
     installed: &[Receipt],
     keep_root: impl Fn(&Receipt) -> bool,
@@ -682,7 +758,7 @@ fn reachable_packages(
                 entry
                     .dependencies
                     .iter()
-                    .map(|dep| by_name[dep.name.as_str()]),
+                    .filter_map(|dep| by_name.get(dep.name.as_str()).copied()),
             );
         }
     }
@@ -944,6 +1020,7 @@ fn render_formula_list(formatter: &DnfStyleFormatter, mut receipts: Vec<Receipt>
 fn pending_packages<'a>(
     plan: &'a [PlannedFormula],
     installed: &[Receipt],
+    retained: &[Receipt],
 ) -> Result<Vec<Candidate<'a>>> {
     let mut pending = Vec::new();
     let mut projected = installed.to_vec();
@@ -969,7 +1046,8 @@ fn pending_packages<'a>(
         projected.push(receipt.clone());
         pending.push(Candidate { formula, receipt });
     }
-    validate_dependencies(&projected)?;
+    let newcomers: Vec<Receipt> = pending.iter().map(|entry| entry.receipt.clone()).collect();
+    validate_dependencies_with_retained(installed, &newcomers, retained)?;
     validate_conflicts(&projected)?;
     Ok(pending)
 }
@@ -1187,7 +1265,7 @@ mod tests {
         package.install_blockers.push("has a post-install hook");
         let plan = [package];
         assert!(
-            pending_packages(&plan, &[])
+            pending_packages(&plan, &[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("post-install")
@@ -1231,9 +1309,12 @@ mod tests {
             package_receipt("leaf", false, &[]),
             package_receipt("unused", false, &["leaf"]),
         ];
-        assert_eq!(autoremove_plan(&installed).unwrap(), [installed[3].clone()]);
-        assert!(autoremove_plan(&[]).unwrap().is_empty());
-        assert!(autoremove_plan(&installed[..2]).is_err());
+        assert_eq!(
+            autoremove_plan(&installed, &[]).unwrap(),
+            [installed[3].clone()]
+        );
+        assert!(autoremove_plan(&[], &[]).unwrap().is_empty());
+        assert!(autoremove_plan(&installed[..2], &[]).is_err());
     }
 
     #[test]
@@ -1246,21 +1327,21 @@ mod tests {
         ];
         let targets = ["app".into()];
         assert_eq!(
-            planned_removals(&targets, &installed, true).unwrap(),
+            planned_removals(&targets, &installed, true, &[]).unwrap(),
             [installed[0].clone(), installed[3].clone()]
         );
         assert_eq!(
-            planned_removals(&targets, &installed, false).unwrap(),
+            planned_removals(&targets, &installed, false, &[]).unwrap(),
             [installed[0].clone()]
         );
-        assert!(planned_removals(&["shared".into()], &installed, true).is_err());
+        assert!(planned_removals(&["shared".into()], &installed, true, &[]).is_err());
     }
 
     #[test]
     fn explicitly_installing_a_dependency_plans_a_promotion_without_a_download() {
         let installed = [package_receipt("hello", false, &[])];
         let mut plan = [formula()];
-        assert!(pending_packages(&plan, &installed).unwrap().is_empty());
+        assert!(pending_packages(&plan, &installed, &[]).unwrap().is_empty());
         assert_eq!(requested_promotions(&plan, &installed), installed);
         plan[0].requested = false;
         assert!(requested_promotions(&plan, &installed).is_empty());
@@ -1327,9 +1408,9 @@ mod tests {
         library.requested = false;
         library.sha256 = "c".repeat(64);
 
-        assert!(pending_packages(&[app.clone()], &[]).is_err());
+        assert!(pending_packages(&[app.clone()], &[], &[]).is_err());
         let plan = [library.clone(), app];
-        let pending = pending_packages(&plan, &[]).unwrap();
+        let pending = pending_packages(&plan, &[], &[]).unwrap();
         assert_eq!(pending.len(), 2);
         assert!(!pending[0].receipt.requested);
         assert_eq!(
@@ -1341,7 +1422,7 @@ mod tests {
             }]
         );
         let already_installed = [pending[0].receipt.clone()];
-        let pending = pending_packages(&plan, &already_installed).unwrap();
+        let pending = pending_packages(&plan, &already_installed, &[]).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].receipt.name, "hello");
     }
@@ -1367,7 +1448,11 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].1.receipt.name, "library");
         assert!(
-            validate_dependencies(&[changes[0].1.receipt.clone(), installed[1].clone()]).is_err()
+            crate::native::store::validate_dependencies(&[
+                changes[0].1.receipt.clone(),
+                installed[1].clone()
+            ])
+            .is_err()
         );
     }
 
@@ -1419,12 +1504,12 @@ mod tests {
             dependencies: Vec::new(),
         };
         assert!(
-            pending_packages(&plan, std::slice::from_ref(&receipt))
+            pending_packages(&plan, std::slice::from_ref(&receipt), &[])
                 .unwrap()
                 .is_empty()
         );
         receipt.sha256 = "b".repeat(64);
-        assert!(pending_packages(&plan, &[receipt]).is_err());
+        assert!(pending_packages(&plan, &[receipt], &[]).is_err());
     }
 
     fn receipt(name: &str, version: &str, digest: char) -> Receipt {
@@ -1445,7 +1530,7 @@ mod tests {
         let current = [receipt("hello", "1.2", 'a')];
         let mut available = formula();
         assert!(
-            planned_changes(&[available.clone()], &current, &current)
+            planned_changes(&[available.clone()], &current, &current, &[])
                 .unwrap()
                 .is_empty()
         );
@@ -1457,7 +1542,7 @@ mod tests {
 
         available.version = "1.3".into();
         available.sha256 = "b".repeat(64);
-        let changes = planned_changes(&[available], &current, &current).unwrap();
+        let changes = planned_changes(&[available], &current, &current, &[]).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old.name, "hello");
         assert_eq!(changes[0].old.version, "1.2");
@@ -1478,7 +1563,7 @@ mod tests {
         let current = [receipt("hello", "1.2", 'a')];
         let mut available = formula();
         available.sha256 = "b".repeat(64);
-        let message = planned_changes(&[available], &current, &current)
+        let message = planned_changes(&[available], &current, &current, &[])
             .unwrap_err()
             .to_string();
         assert!(message.contains("same version"), "{message}");
@@ -1493,7 +1578,7 @@ mod tests {
         let mut available = formula();
         available.version = "1.3".into();
         available.sha256 = "b".repeat(64);
-        let message = pending_packages(&[available], &current)
+        let message = pending_packages(&[available], &current, &[])
             .unwrap_err()
             .to_string();
         assert!(message.contains("hello 1.2 is installed"), "{message}");
@@ -1502,7 +1587,7 @@ mod tests {
 
         let mut available = formula();
         available.sha256 = "b".repeat(64);
-        let message = pending_packages(&[available], &current)
+        let message = pending_packages(&[available], &current, &[])
             .unwrap_err()
             .to_string();
         assert!(message.contains("same version"), "{message}");
@@ -1516,7 +1601,7 @@ mod tests {
         let mut library = formula();
         library.name = "library".into();
         library.requested = false;
-        let message = pending_packages(&[library, available], &current)
+        let message = pending_packages(&[library, available], &current, &[])
             .unwrap_err()
             .to_string();
         assert!(message.contains("hello 1.2"), "{message}");
@@ -1524,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_preview_rejects_a_change_that_breaks_a_dependency_pin() {
+    fn upgrade_preview_accepts_retaining_an_exact_old_pin() {
         let mut library = formula();
         library.name = "library".into();
         library.version = "1.2".into();
@@ -1539,15 +1624,18 @@ mod tests {
             version: "1.1".into(),
             sha256: "c".repeat(64),
         });
-        let installed = [old_library, old_app];
+        let mut installed = [old_library, old_app];
         let plan = [library, app];
 
-        let error = planned_changes(&plan, &installed, &installed).unwrap_err();
-        // The CLI renders the whole anyhow chain, so assert on that form.
-        let message = format!("{error:#}");
-        assert!(message.contains("unmet dependency pins"), "{message}");
-        assert!(message.contains("1.1"), "{message}");
-        assert!(message.contains("1.2"), "{message}");
+        let changes = planned_changes(&plan, &installed, &installed, &[]).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].old.version, "1.1");
+        assert_eq!(changes[0].new.version, "1.2");
+        assert_eq!(installed[1].dependencies[0].sha256, "c".repeat(64));
+
+        installed[1].dependencies[0].sha256 = "e".repeat(64);
+        let error = planned_changes(&plan, &installed, &installed, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("unmet dependency pins"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1572,7 +1660,7 @@ mod tests {
 
         // Conflict within one install batch.
         assert!(
-            pending_packages(&[app.clone(), other.clone()], &[])
+            pending_packages(&[app.clone(), other.clone()], &[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("conflicts with")
@@ -1582,7 +1670,7 @@ mod tests {
         let mut installed_app = receipt("app", "1.2", 'a');
         installed_app.conflicts_with = vec!["other".into()];
         assert!(
-            pending_packages(&[other.clone()], std::slice::from_ref(&installed_app))
+            pending_packages(&[other.clone()], std::slice::from_ref(&installed_app), &[])
                 .unwrap_err()
                 .to_string()
                 .contains("conflicts with")
@@ -1598,6 +1686,7 @@ mod tests {
                 &[app_v2],
                 &[receipt("app", "1.2", 'a'), installed_other],
                 &[receipt("app", "1.2", 'a')],
+                &[],
             )
             .unwrap_err()
             .to_string()

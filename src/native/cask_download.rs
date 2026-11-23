@@ -162,16 +162,11 @@ async fn request_cask_payload(client: &Client, initial: Url, config: &Config) ->
 
         match response.status() {
             StatusCode::OK => return Ok(response),
-            status
-                if matches!(
-                    status,
-                    StatusCode::MOVED_PERMANENTLY
-                        | StatusCode::FOUND
-                        | StatusCode::SEE_OTHER
-                        | StatusCode::TEMPORARY_REDIRECT
-                        | StatusCode::PERMANENT_REDIRECT
-                ) =>
-            {
+            StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT => {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
                     bail!("refusing to follow more than {MAX_REDIRECTS} cask redirects");

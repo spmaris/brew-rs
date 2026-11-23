@@ -18,7 +18,7 @@ use crate::{config::Config, ui::DnfStyleFormatter};
 
 use super::install::prefix_path;
 use super::plan::{self, InstalledServiceMetadata};
-use super::store::{Receipt, Store, validate_dependencies};
+use super::store::{Receipt, Store, validate_dependencies_with_retained};
 
 // Flags were checked against the Colima 0.10.3 start command. The preview is
 // deliberately separate from the upstream daemon definition: it uses a new
@@ -85,7 +85,8 @@ fn preview_colima(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let store = Store::open_existing(&prefix_path(prefix)?)
         .context("Colima service preview requires an initialized brewrs prefix")?;
     let prefix = store.prefix().canonicalize()?;
-    let plan = colima_plan(&prefix, &store.installed()?)?;
+    let retained = store.retained()?;
+    let plan = colima_plan(&prefix, &store.installed()?, &retained)?;
     let ui = DnfStyleFormatter::new(config);
     let args: Vec<String> = COLIMA_ARGS.iter().map(|arg| (*arg).to_string()).collect();
     println!("{}", ui.section("Colima service trial (preview only)"));
@@ -128,8 +129,8 @@ struct ColimaPlan {
     path: String,
 }
 
-fn colima_plan(prefix: &Path, installed: &[Receipt]) -> Result<ColimaPlan> {
-    validate_dependencies(installed)
+fn colima_plan(prefix: &Path, installed: &[Receipt], retained: &[Receipt]) -> Result<ColimaPlan> {
+    validate_dependencies_with_retained(installed, &[], retained)
         .context("Cannot preview a service with unsatisfied receipt pins")?;
     let colima = installed
         .iter()
@@ -182,7 +183,8 @@ async fn preview_formula(config: &Config, prefix: Option<&Path>, requested: &str
     })?;
     let prefix = store.prefix().canonicalize()?;
     let installed = store.installed()?;
-    validate_dependencies(&installed)
+    let retained = store.retained()?;
+    validate_dependencies_with_retained(&installed, &[], &retained)
         .context("Cannot preview a service with unsatisfied receipt pins")?;
     let receipt = installed
         .iter()
@@ -495,7 +497,8 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let owned = store.is_owned();
     let receipts = store.installed()?;
     if owned {
-        validate_dependencies(&receipts)
+        let retained = store.retained()?;
+        validate_dependencies_with_retained(&receipts, &[], &retained)
             .context("Cannot list services with unsatisfied receipt pins")?;
     }
     let prefix = store.prefix();
@@ -797,7 +800,7 @@ fn managed_binary(prefix: &Path, name: &str, version: &str, bin: &str) -> Result
 ///
 /// A shell command string is refused because this preview never parses a shell
 /// command line; only an explicit argv array is rendered.
-fn macos_run_args<'a>(service: &'a Map<String, Value>) -> Result<&'a [Value]> {
+fn macos_run_args(service: &Map<String, Value>) -> Result<&[Value]> {
     let run = service
         .get("run")
         .context("Service declaration has no run command")?;
@@ -1244,7 +1247,7 @@ mod tests {
         let canonical = prefix.canonicalize().unwrap();
         let (colima_bin, lima_bin, installed) = seed_colima_prefix(&canonical);
 
-        let plan = colima_plan(&canonical, &installed).unwrap();
+        let plan = colima_plan(&canonical, &installed, &[]).unwrap();
         assert!(plan.label.starts_with("local.brewrs."));
         assert!(plan.label.ends_with(".colima"));
         assert_eq!(
@@ -1269,7 +1272,7 @@ mod tests {
             )
         );
         // Same prefix produces the exact same deterministic plan.
-        let again = colima_plan(&canonical, &installed).unwrap();
+        let again = colima_plan(&canonical, &installed, &[]).unwrap();
         assert_eq!(again.label, plan.label);
         assert_eq!(again.profile, plan.profile);
     }
@@ -1284,13 +1287,13 @@ mod tests {
 
         // Unreviewed version
         installed[0].version = "0.10.2".into();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("0.10.2"));
         installed[0].version = "0.10.3".into();
 
         // Missing lima pin
         installed[0].dependencies.clear();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("Lima"));
         installed[0].dependencies.push(Dependency {
             name: "lima".into(),
@@ -1300,7 +1303,7 @@ mod tests {
 
         // Non-executable binary
         fs::set_permissions(&colima_bin, fs::Permissions::from_mode(0o644)).unwrap();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("not executable"));
         fs::set_permissions(&colima_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1309,7 +1312,7 @@ mod tests {
         fs::write(&other, b"#!/bin/sh\n").unwrap();
         fs::remove_file(&lima_bin).unwrap();
         std::os::unix::fs::symlink(&other, &lima_bin).unwrap();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("regular managed executable"));
         fs::remove_file(&lima_bin).unwrap();
         fs::write(&lima_bin, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -1318,7 +1321,7 @@ mod tests {
         // Existing trial directory
         let trial = canonical.join(".brewrs/service-trials/colima");
         fs::create_dir_all(&trial).unwrap();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("already exists"));
         fs::remove_dir_all(canonical.join(".brewrs")).unwrap();
 
@@ -1327,7 +1330,7 @@ mod tests {
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, canonical.join(".brewrs/service-trials")).unwrap();
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("not a managed directory"));
     }
 
@@ -1339,7 +1342,7 @@ mod tests {
         let canonical = prefix.canonicalize().unwrap();
         let (_, _, installed) = seed_colima_prefix(&canonical);
 
-        let err = colima_plan(&canonical, &installed).err().unwrap();
+        let err = colima_plan(&canonical, &installed, &[]).err().unwrap();
         assert!(err.to_string().contains("colons"));
     }
 

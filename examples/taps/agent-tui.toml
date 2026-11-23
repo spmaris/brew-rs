@@ -1,0 +1,18 @@
+# Example manifest for the explicit, declarative tap lane.
+# URLs and SHA-256 values transcribed from the pproenca/tap agent-tui 1.1.0 formula.
+# Review the publisher and pinned release before installation. This does not run Ruby.
+schema = 1
+tap = "pproenca/tap"
+
+[[packages]]
+token = "agent-tui"
+version = "1.1.0"
+bin = "agent-tui"
+
+[packages.artifacts.arm64]
+url = "https://github.com/pproenca/agent-tui/releases/download/v1.1.0/agent-tui-darwin-arm64"
+sha256 = "0daed495a2d90acce7a720cd5ef94c7613c54b1277bffc7466b998f3edf023b5"
+
+[packages.artifacts.x86_64]
+url = "https://github.com/pproenca/agent-tui/releases/download/v1.1.0/agent-tui-darwin-x64"
+sha256 = "81c071afb4df3c688059ebe6336f543cfe5e79082147d3571274c2508ea798cb"

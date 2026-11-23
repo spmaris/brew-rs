@@ -17,6 +17,9 @@ mod relocation_paths;
 mod relocation_text;
 pub(crate) mod services;
 mod store;
+pub(crate) mod tap;
+mod tap_artifact;
+mod tap_manifest;
 mod version;
 
 use anyhow::{Context, Result, bail};

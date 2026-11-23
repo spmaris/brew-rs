@@ -448,16 +448,11 @@ async fn request_bottle(
                 token = Some(request_pull_token(client, &source.pull_scope(), config).await?);
                 // Retry the same URL with the token; this is not a redirect.
             }
-            status
-                if matches!(
-                    status,
-                    StatusCode::MOVED_PERMANENTLY
-                        | StatusCode::FOUND
-                        | StatusCode::SEE_OTHER
-                        | StatusCode::TEMPORARY_REDIRECT
-                        | StatusCode::PERMANENT_REDIRECT
-                ) =>
-            {
+            StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT => {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
                     bail!("refusing to follow more than {MAX_REDIRECTS} bottle redirects");

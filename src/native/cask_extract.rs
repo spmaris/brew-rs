@@ -311,7 +311,7 @@ fn preflight_zip(path: &Path) -> Result<()> {
         .metadata()
         .with_context(|| format!("failed to inspect ZIP '{}'", path.display()))?
         .len();
-    if file_len < 22 || file_len > MAX_ARCHIVE_BYTES {
+    if !(22..=MAX_ARCHIVE_BYTES).contains(&file_len) {
         bail!(
             "ZIP archive '{}' has invalid size {file_len}",
             path.display()

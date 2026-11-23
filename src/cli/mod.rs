@@ -86,6 +86,18 @@ enum Commands {
         action: ServiceAction,
     },
 
+    /// Register, inspect, plan, or install an explicit local third-party tap
+    Tap {
+        #[command(subcommand)]
+        action: TapAction,
+    },
+
+    /// Remove a third-party tap that has no installed packages
+    Untap {
+        /// Fully qualified tap, for example pproenca/tap
+        tap: String,
+    },
+
     /// Print shell environment exports for this brewrs prefix
     Shellenv {
         /// Shell syntax to emit (defaults to $SHELL)
@@ -315,6 +327,34 @@ enum ServiceAction {
 }
 
 #[derive(Subcommand)]
+enum TapAction {
+    /// Register an explicit local TOML manifest for a fully qualified tap
+    Add {
+        /// Fully qualified tap, for example pproenca/tap
+        tap: String,
+        /// Local declarative manifest; it is copied and validated as data
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// List registered tap packages without consulting Homebrew
+    List,
+    /// Preview one fully qualified <owner>/<repo>/<token> tap package
+    Plan { package: String },
+    /// Install one fully qualified tap package from its pinned artifact
+    Install {
+        package: String,
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+    /// Remove one installed tap package
+    Uninstall {
+        package: String,
+        #[command(flatten)]
+        transaction: Transaction,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ConfigAction {
     /// Show current configuration
     Show,
@@ -429,6 +469,43 @@ impl Cli {
                     crate::native::services::list(&config, prefix)?;
                 }
             },
+            Commands::Tap { action } => match action {
+                TapAction::Add { tap, manifest } => {
+                    crate::native::tap::add(&config, prefix, &tap, &manifest)?;
+                }
+                TapAction::List => crate::native::tap::list(&config, prefix)?,
+                TapAction::Plan { package } => {
+                    crate::native::tap::plan(&config, prefix, &package)?;
+                }
+                TapAction::Install {
+                    package,
+                    transaction,
+                } => {
+                    crate::native::tap::install(
+                        &config,
+                        prefix,
+                        &package,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )
+                    .await?;
+                }
+                TapAction::Uninstall {
+                    package,
+                    transaction,
+                } => {
+                    crate::native::tap::uninstall(
+                        &config,
+                        prefix,
+                        &package,
+                        transaction.dry_run,
+                        transaction.yes,
+                    )?;
+                }
+            },
+            Commands::Untap { tap } => {
+                crate::native::tap::untap(&config, prefix, &tap)?;
+            }
             Commands::Shellenv { shell } => {
                 native::shellenv(prefix, shell.as_deref())?;
             }

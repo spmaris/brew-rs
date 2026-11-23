@@ -697,6 +697,44 @@ fn reverse_dependencies_use_only_native_receipts() {
 }
 
 #[test]
+fn reverse_dependencies_report_retained_kegs_without_claiming_active_pins() {
+    let sandbox = Sandbox::new();
+    let prefix = sandbox.home.join("native-prefix");
+    seed_native_graph(
+        &prefix,
+        &[("leaf", false, &[]), ("program", true, &["leaf"])],
+    );
+    let active = prefix.join(".brewrs/state/receipts/leaf.json");
+    let retained = prefix.join(".brewrs/state/retained/leaf/1.0.json");
+    fs::create_dir_all(retained.parent().unwrap()).unwrap();
+    fs::copy(&active, retained).unwrap();
+    fs::create_dir_all(prefix.join("Cellar/leaf/2.0")).unwrap();
+    fs::write(
+        active,
+        serde_json::json!({
+            "name": "leaf", "version": "2.0", "sha256": "b".repeat(64), "requested": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = sandbox.run(&[
+        "deps",
+        "--prefix",
+        prefix.to_str().unwrap(),
+        "leaf",
+        "--reverse",
+    ]);
+    assert_success(&output);
+    let report = stdout(&output);
+    let (active_part, retained_part) = report.split_once("Retained keg").unwrap();
+    assert!(active_part.contains("Active keg") && active_part.contains("leaf 2.0"));
+    assert!(!active_part.contains("program"));
+    assert!(retained_part.contains("leaf 1.0") && retained_part.contains("program"));
+    sandbox.assert_no_brew();
+}
+
+#[test]
 fn native_autoremove_previews_and_preserves_live_dependencies() {
     let sandbox = Sandbox::new();
     let prefix = sandbox.home.join("native-prefix");

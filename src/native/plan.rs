@@ -41,6 +41,7 @@
 //!   3. a build- and/or test-only entry (`{ "<formula>": "build" }`, `"test"`,
 //!      or `["build", "test"]`) with empty or recognized macOS `since`/`before`
 //!      bounds, because precompiled bottles do not execute build or test phases.
+//!
 //!   Every other runtime name, non-build/test tag, `before` bound or unsatisfied
 //!   `since` bound, mismatched bounds array, unknown or non-macOS platform, and
 //!   unrecognized JSON shape keeps an install blocker.

@@ -66,7 +66,7 @@ const MAX_DISPLAY_VERSION_LEN: usize = 64;
 const SCOPE_RUNTIME: &str = "runtime dependencies only: the host-tag `variations` override when declared, otherwise `dependencies`\nbuild, test, optional, recommended and `uses_from_macos` entries are excluded; `*` marks a variation override";
 
 /// Scope line for reverse queries.
-const SCOPE_REVERSE: &str = "installed brewrs receipts in this prefix only, matched by exact (name, version, sha256) pins\nno network access and no writes";
+const SCOPE_REVERSE: &str = "active and retained brewrs receipts in this prefix, matched by exact (name, version, sha256) pins\nno network access and no writes";
 
 /// Answer a native dependency query.
 ///
@@ -186,7 +186,9 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
     let name = plan::parse_target(package)?.to_string();
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
-    let receipts = store.installed()?;
+    let mut receipts = store.installed()?;
+    let active_count = receipts.len();
+    receipts.extend(store.retained()?);
     let formatter = DnfStyleFormatter::new(config);
     let prefix_display = store.prefix().display().to_string();
 
@@ -196,69 +198,74 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
         formatter.info(&prefix_display)
     );
 
-    let Some(target) = receipts.iter().find(|receipt| receipt.name == name) else {
-        println!("\n'{name}' is not installed in this brewrs prefix, so no local receipt pins it.");
-        println!("Use `brewrs native list` to see installed packages.");
+    let mut targets = receipts
+        .iter()
+        .enumerate()
+        .filter(|(_, receipt)| receipt.name == name)
+        .peekable();
+    if targets.peek().is_none() {
+        println!("\n'{name}' has no active or retained receipt in this brewrs prefix.");
+        println!("Use `brewrs list` to see active packages.");
         return Ok(());
-    };
-
-    println!(
-        "{}",
-        formatter.field(
-            "Formula",
-            &name_and_version(&target.name, Some(&target.version))
-        )
-    );
+    }
     println!("{}", formatter.field("Scope", SCOPE_REVERSE));
 
-    if !tree {
+    for (index, target) in targets {
+        let state = if index < active_count {
+            "Active keg"
+        } else {
+            "Retained keg"
+        };
+        println!(
+            "\n{}",
+            formatter.field(
+                state,
+                &name_and_version(&target.name, Some(&target.version))
+            )
+        );
+        if tree {
+            let root = build_dependent_tree(&receipts, target);
+            let count = root.count_descendants();
+            println!("{}", formatter.field("Dependents", &count.to_string()));
+            let rendered = render_forward_tree(&dependent_tree_to_tree(&root));
+            println!("\n{rendered}");
+            continue;
+        }
+
         let dependents = direct_dependents(&receipts, target);
+        println!(
+            "{}",
+            formatter.field("Dependents", &dependents.len().to_string())
+        );
         if dependents.is_empty() {
-            println!("\nNo installed packages depend on '{}'.", target.name);
-            return Ok(());
+            continue;
         }
         let rows: Vec<Vec<String>> = dependents
-            .iter()
+            .into_iter()
             .map(|dependent| {
+                let reason = if receipts[active_count..]
+                    .iter()
+                    .any(|retained| receipt_key(retained) == receipt_key(dependent))
+                {
+                    "Retained"
+                } else if dependent.requested {
+                    "Requested"
+                } else {
+                    "Dependency"
+                };
                 vec![
                     dependent.name.clone(),
                     dependent.version.clone(),
-                    dependent
-                        .dependencies
-                        .iter()
-                        .find(|dependency| pin_matches(dependency, target))
-                        .map_or_else(String::new, |pin| short_digest(&pin.sha256)),
-                    if dependent.requested {
-                        "Requested".to_string()
-                    } else {
-                        "Dependency".to_string()
-                    },
+                    short_digest(&target.sha256),
+                    reason.into(),
                 ]
             })
             .collect();
         println!(
-            "\n{}",
-            formatter.field("Dependents", &dependents.len().to_string())
-        );
-        println!(
             "{}",
             formatter.table(&["Dependent", "Version", "Pinned digest", "Reason"], &rows)
         );
-        return Ok(());
     }
-
-    let tree_root = build_dependent_tree(&receipts, target);
-    let count = tree_root.count_descendants();
-    if count == 0 {
-        println!(
-            "\nNo installed packages depend on '{}' recursively.",
-            target.name
-        );
-        return Ok(());
-    }
-    println!("{}", formatter.field("Dependents", &count.to_string()));
-    let rendered = render_forward_tree(&dependent_tree_to_tree(&tree_root));
-    println!("\n{rendered}");
     Ok(())
 }
 
@@ -855,8 +862,8 @@ impl DependentTree<'_> {
         names.len()
     }
 
-    fn collect_names<'a>(&'a self, names: &mut BTreeSet<&'a str>) {
-        names.insert(self.receipt.name.as_str());
+    fn collect_names<'a>(&'a self, names: &mut BTreeSet<ReceiptKey<'a>>) {
+        names.insert(receipt_key(self.receipt));
         for child in &self.children {
             child.collect_names(names);
         }
@@ -870,20 +877,27 @@ fn build_dependent_tree<'a>(receipts: &'a [Receipt], target: &'a Receipt) -> Dep
     expand_dependents(receipts, target, &mut path, &mut expanded)
 }
 
+type ReceiptKey<'a> = (&'a str, &'a str, &'a str);
+
+fn receipt_key(receipt: &Receipt) -> ReceiptKey<'_> {
+    (&receipt.name, &receipt.version, &receipt.sha256)
+}
+
 fn expand_dependents<'a>(
     receipts: &'a [Receipt],
     target: &'a Receipt,
-    path: &mut Vec<String>,
-    expanded: &mut HashSet<String>,
+    path: &mut Vec<ReceiptKey<'a>>,
+    expanded: &mut HashSet<ReceiptKey<'a>>,
 ) -> DependentTree<'a> {
-    if path.iter().any(|ancestor| ancestor == &target.name) {
+    let key = receipt_key(target);
+    if path.contains(&key) {
         return DependentTree {
             receipt: target,
             branch: Branch::Cycle,
             children: Vec::new(),
         };
     }
-    if expanded.contains(&target.name) {
+    if expanded.contains(&key) {
         return DependentTree {
             receipt: target,
             branch: Branch::Repeated,
@@ -891,13 +905,13 @@ fn expand_dependents<'a>(
         };
     }
 
-    path.push(target.name.clone());
+    path.push(key);
     let children = direct_dependents(receipts, target)
         .into_iter()
         .map(|dependent| expand_dependents(receipts, dependent, path, expanded))
         .collect();
     path.pop();
-    expanded.insert(target.name.clone());
+    expanded.insert(key);
 
     DependentTree {
         receipt: target,
@@ -1336,6 +1350,25 @@ mod tests {
              |- middle 2.0.0\n\
              |  `- top 3.0.0\n\
              `- top 3.0.0 (already shown)"
+        );
+    }
+
+    #[test]
+    fn reverse_tree_distinguishes_same_name_receipt_versions() {
+        let base = receipt("base", "1.0.0", false, &[]);
+        let old_library = receipt("library", "1.0.0", false, &[("base", "1.0.0", DIGEST_A)]);
+        let new_library = receipt("library", "2.0.0", false, &[("base", "1.0.0", DIGEST_A)]);
+        let app = receipt("app", "1.0.0", true, &[("library", "1.0.0", DIGEST_A)]);
+        let receipts = [old_library.clone(), new_library.clone(), app];
+
+        assert_eq!(direct_dependents(&receipts, &old_library).len(), 1);
+        assert!(direct_dependents(&receipts, &new_library).is_empty());
+        let tree = build_dependent_tree(&receipts, &base);
+        assert_eq!(tree.count_descendants(), 3);
+        assert!(
+            tree.children
+                .iter()
+                .all(|child| child.branch == Branch::Expanded)
         );
     }
 

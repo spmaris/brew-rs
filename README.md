@@ -1,6 +1,21 @@
-# brew-rs
+# brewrs
 
-`brewrs` is a Rust-native macOS package manager that uses Homebrew’s official repository and bottle archives. It manages its own prefix and shows compact tables of what will change. You don’t need Homebrew installed to use the native package commands.
+**A native macOS package manager in Rust, backed by Homebrew’s official repositories.** Install verified bottles and supported casks into a separate prefix, preview changes in compact transaction tables, and audit what could migrate from an existing Homebrew setup. `brewrs` does not invoke `brew`.
+
+This is an experimental package manager, not a drop-in Homebrew replacement.
+
+## Try it in a disposable prefix
+
+On macOS with Rust and the Apple Command Line Tools:
+
+```sh
+cargo build --release --locked
+sh scripts/demo.sh
+```
+
+The live demo previews, installs, and removes ripgrep using current official bottle metadata. It tests PCRE2 search and manpage discovery while keeping Homebrew off `PATH`. It uses a private home and prefix under `target/`, never starts a service, and prints where to inspect its files. Network access is required; it does not inherit proxy or config environment variables from the caller.
+
+Verified on Apple Silicon with macOS 15: ripgrep `16.0.0` and its PCRE2 dependency installed, a PCRE2 search matched, `man` found `rg.1`, and removal left no managed packages in the trial prefix.
 
 ## Install
 
@@ -25,7 +40,7 @@ brewrs analytics hello --period 90d
 brewrs update                     # Refresh the local search catalogs
 brewrs install --dry-run hello      # Preview a portable formula install
 brewrs install hello               # Download, verify, and install it
-brewrs install --cask firefox      # Download, verify, and install a cask into <prefix>/Applications
+brewrs install --cask keepingyouawake # Install a supported app under <prefix>/Applications
 brewrs list                        # List formulae and casks in the isolated prefix
 brewrs list --outdated             # Show available native formula and cask upgrades
 brewrs check-update [--greedy]     # Exit 100 when there are upgrades
@@ -56,17 +71,35 @@ Installation supports portable macOS bottles (`:any_skip_relocation`) and genera
 
 Native cask management (`install --cask`, `list --cask`, `upgrade --cask [--greedy]`, `remove --cask`, `check-update [--greedy]`) supports official `homebrew/cask` macOS casks with mandatory 64-character SHA-256 verification (`sha256: no_check` is refused) over public HTTPS URLs. Verified downloads are cached under `native-casks`, safely unpacked across naked binaries, ZIP archives (Central Directory preflighted before `/usr/bin/ditto` to preserve Apple code signatures), bounded `.tar.gz`/`.tar.bz2`/`.tar.xz` archives, and read-only `.dmg` disk images (`/usr/bin/hdiutil attach` with RAII `detach`). Supported cask artifacts are `.app` bundles (defaulting to `<prefix>/Applications`, or an explicit existing safe `--appdir`), `bin/` symlinks, safe `command_wrapper` scripts, and static `manpage`/`bash_completion`/`zsh_completion`/`fish_completion` links; `.pkg` installers, `installer` scripts, `font`, `preflight`/`postflight`, and `nested` containers remain blocked. Casks with `auto_updates: true` are skipped during `upgrade` and `check-update` unless `--greedy` is passed, and `old_tokens` fallback resolves renamed casks when querying the API.
 
-Fixed-prefix bottles, source builds, `.pkg`/scripted casks, third-party taps, recommended dependencies, Homebrew hooks, and service activation are still unsupported. A service declaration does not prevent its formula from being installed when the declaration and bottle are otherwise supported. The bottle extractor accepts bounded acyclic keg-contained relative symlink chains (including forward-referenced links, directory symlinks, and keg-contained executable symlinks in `bin/` and `sbin/`) and rejects escaping links, cycles, over-deep chains, and hardlinks. A successful plan or fetch does not imply the package can be installed natively.
+Fixed-prefix bottles, source builds, `.pkg`/scripted casks, Homebrew Ruby taps, recommended dependencies, Homebrew hooks, and service activation are still unsupported. A service declaration does not prevent its formula from being installed when the declaration and bottle are otherwise supported. The bottle extractor accepts bounded acyclic keg-contained relative symlink chains (including forward-referenced links, directory symlinks, and keg-contained executable symlinks in `bin/` and `sbin/`) and rejects escaping links, cycles, over-deep chains, and hardlinks. A successful plan or fetch does not imply the package can be installed natively.
 
 The store defaults to `~/Library/Application Support/brew-rs/native` on macOS; pass `brewrs --prefix /absolute/path …` for a different, empty or brewrs-owned directory. Active kegs are linked at `opt/<name>`. Non-keg-only formulae also link supported executables (`bin`, `sbin`), manpages (`share/man/man1` through `man8`), Bash/Zsh/Fish completions, and Docker CLI plugins into the same directories in the prefix. `keg_only` formulae are linked only under `opt/<name>`. Conflicting formulae (`conflicts_with`) are checked symmetrically on install and upgrade.
 
 Run `eval "$(brewrs shellenv)"` (or pass `--shell sh|bash|zsh|fish`) to add the prefix's `bin` and `sbin` to `PATH`. To use the installed manpages explicitly, run `man -M "$BREWRS_PREFIX/share/man" <command>`. Completions are installed under `etc/bash_completion.d`, `share/zsh/site-functions`, and `share/fish/vendor_completions.d`; configure your shell to load that directory if needed. `shellenv` does not load completions or edit shell configuration files.
 
-Native formula removal needs no network and only acts on the selected prefix's receipts, kegs, and exact matching managed links. Receipts pin each direct dependency by version and bottle checksum. Removal refuses to leave a package without its dependencies; remove the dependent in the same command if you intend to remove both. Upgrades likewise refuse to break a pin, so related packages may need to be upgraded together. A newly required dependency must already be installed in the native prefix.
+Native formula removal is offline and only acts on the selected prefix's receipts, kegs, and exact matching links. Receipts pin each direct dependency by version and bottle checksum. An upgrade can retain an older keg if existing receipts still reference it, without rewriting those pins. The new keg owns the active links; new installs and upgrade replacements pin only active dependencies. `deps --reverse` shows active and retained versions separately. Retained-keg garbage collection is not implemented: old kegs can continue to occupy disk space, and removal refuses to strand their recorded dependencies.
 
 Native upgrade stages verified replacements before changing installed files, compares Homebrew's `version_scheme` ahead of numeric dotted versions (including optional `_revision`), and rejects unknown version schemes, downgrades, and changed bottles at an equal version. Failed applies attempt to restore the previous installation; a crash during replacement may still require manual recovery. The old `--legacy` adapter has been removed. brewrs never invokes `brew` and does not adopt or manage an existing Homebrew installation.
 
 `info` and per-package `analytics` read formula or cask metadata from the official repository. Forward `deps` reports declared formula runtime dependencies, even for formulae that can't be installed natively. `deps --reverse` uses only the installed dependency receipts in the selected brewrs prefix and works offline.
+
+## Declarative third-party taps
+
+Use a reviewed local manifest for a specific release and architecture. Tap packages have a separate namespace and store; they never replace official formula metadata or participate in ordinary `brewrs upgrade`. The current lane supports pinned, standalone macOS Mach-O executables only, not Ruby formulae or source builds.
+
+```sh
+trial="$HOME/.brewrs-tap-trial"
+brewrs --prefix "$trial" tap add pproenca/tap --manifest examples/taps/agent-tui.toml
+brewrs --prefix "$trial" tap list
+brewrs --prefix "$trial" tap plan pproenca/tap/agent-tui
+brewrs --prefix "$trial" tap install pproenca/tap/agent-tui --dry-run
+# After reviewing the publisher and digest, install without --dry-run.
+# To clean up an installed package, then unregister the tap:
+# brewrs --prefix "$trial" tap uninstall pproenca/tap/agent-tui
+# brewrs --prefix "$trial" untap pproenca/tap
+```
+
+[`examples/taps/agent-tui.toml`](examples/taps/agent-tui.toml) pins the `1.1.0` artifacts for Apple Silicon and Intel. The Apple Silicon install and cleanup were verified without executing the downloaded binary. Registration and preview do not execute the manifest or artifact. Installation checks its declared digest and Mach-O architecture, not independent publisher trust. Use `tap list` and `tap uninstall` for these packages; ordinary `list`, `remove`, and `upgrade` manage official packages. To update a tap package, uninstall it, unregister the tap, and register a reviewed replacement manifest.
 
 ## Service trial previews
 
@@ -92,7 +125,7 @@ brewrs migrate --brew-prefix /opt/homebrew --prefix "$HOME/.brewrs-test"
 
 The audit reads Cellar receipts, Caskroom records, local tap directories, and Homebrew-named launchd plists. It does not run `brew` or `launchctl`, parse services, install anything, or change either prefix. Cask records do not prove an app is present; plist filenames do not prove a service is running. Use `--service-dir <absolute-directory>` to override the usual launchd locations.
 
-`--check` checks current metadata and dependency plans, prioritizing explicitly requested formulae and assessing recorded casks against official metadata. **Candidate** means the plan passed metadata checks, not that the same version is available or that the package will install and run. **Blocked** gives a known limitation. **Unresolved** means no reliable assessment was possible. Third-party taps and service migration still need separate support.
+`--check` checks current metadata and dependency plans, prioritizing explicitly requested formulae and assessing recorded casks against official metadata. **Candidate** means the plan passed metadata checks, not that the same version is available or that the package will install and run. **Blocked** gives a known limitation. **Unresolved** means no reliable assessment was possible. The audit does not import Ruby tap definitions or migrate services; declarative tap registration is a separate opt-in step.
 
 For a reversible trial, choose a fresh prefix and use absolute binary paths to test replacements:
 
@@ -134,7 +167,10 @@ These commands verify CLI and plugin discovery, not container, registry, credent
 ## Development
 
 ```sh
-cargo test --locked
+cargo fetch --locked   # First run only, or when the lockfile changes
+sh scripts/verify.sh
 ```
 
-Offline tests use temporary prefixes and a sentinel `brew` on an isolated `PATH` to catch accidental subprocess calls. They do not touch real installed packages.
+The offline suite uses temporary prefixes and checks that native commands do not call `brew`. It does not touch real installed packages.
+
+Licensed under the [MIT License](LICENSE).

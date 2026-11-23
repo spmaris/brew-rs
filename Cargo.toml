@@ -10,6 +10,7 @@ homepage = "https://github.com/spmaris/brew-rs"
 repository = "https://github.com/spmaris/brew-rs"
 keywords = ["package-manager", "homebrew", "macos", "cli"]
 categories = ["command-line-utilities"]
+exclude = ["/.github", "/.dsh-tui"]
 
 [dependencies]
 # CLI framework

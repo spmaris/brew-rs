@@ -106,6 +106,42 @@
 //! crash-atomic one receipt at a time; a process death can leave the new
 //! installs in place without their later promotions, which is the safe
 //! direction.
+//!
+//! # Retained kegs
+//!
+//! When an upgrade replaces a package whose old exact `(name, version,
+//! sha256)` is still pinned by a surviving receipt, the old keg is **retained**
+//! instead of quarantined: the old keg directory stays in place under
+//! `Cellar/<name>/<version>`, the old receipt moves to
+//! `.brewrs/state/retained/<name>/<version>.json`, and the managed links
+//! (`bin`, `sbin`, `opt`, manpages, completions, plugins) move to the new
+//! version exactly as an unpinned upgrade would. A retained keg never keeps a
+//! link and is never an install target: `opt` remains an active-version alias.
+//! An upgrade whose old version is not pinned by any surviving receipt is
+//! released exactly as before.
+//!
+//! Retained records preserve the old receipt bytes, so the retained identity
+//! is version- and digest-qualified. A surviving receipt's pin is satisfied by
+//! either the active receipt at that exact version and digest or a retained
+//! record at that exact version and digest; a pin introduced by a *new*
+//! receipt (an install or an upgrade replacement) is satisfied only by an
+//! active receipt, never by a retained keg, so a new install can never
+//! silently bind to a superseded keg. [`validate_dependencies_with_retained`]
+//! exposes that pure check; [`validate_dependencies`] remains strict
+//! active-only.
+//!
+//! Garbage collection is deferred: no transaction prunes a retained keg or
+//! its record yet, even when the last pinning receipt is removed or upgraded.
+//! A retained keg is inert (no links, no receipt), removal moves only the
+//! active keg, and an emptied `Cellar/<name>` is pruned only when it holds
+//! nothing at all, so retained kegs survive removals untouched. Fail-closed
+//! guardrails instead refuse ambiguous or foreign state: an upgrade refuses a
+//! `Cellar/<name>` entry that is neither the active keg nor a keg with a
+//! matching retained record, a keg that is both active and retained, and a
+//! retained directory or record that is a symlink or malformed; an install
+//! refuses a retained-only keg whose version it would recreate and may only
+//! create a version directory that is not already retained. Manual cleanup of
+//! retained kegs remains a future milestone.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -221,6 +257,7 @@ const LINK_DIRECTORIES: [LinkDirectory; 14] = [
 const META: &str = ".brewrs";
 const STATE: &str = "state";
 const RECEIPTS: &str = "receipts";
+const RETAINED: &str = "retained";
 const STAGES: &str = "stages";
 const LOCK_FILE: &str = "install.lock";
 /// Longest accepted package name or version.
@@ -396,6 +433,145 @@ impl Store {
         Ok(receipts)
     }
 
+    /// Read every retained keg record, sorted by name and version.
+    ///
+    /// A record is the exact receipt a past upgrade moved out of the active
+    /// receipts directory when a surviving receipt kept pinning its keg. The
+    /// directory layout is `.brewrs/state/retained/<name>/<version>.json`, so
+    /// several versions of one package can be retained at once. A missing
+    /// directory reads as empty, as does a binding to a prefix that is not an
+    /// owned store.
+    ///
+    /// Reading fails closed on anything foreign or ambiguous: a symlinked
+    /// retained or package directory, a package entry that is not a directory
+    /// or not a valid package name, and a record that is not a regular,
+    /// bounded JSON receipt naming exactly its directory and version stem.
+    /// Unrelated entries that do not end in `.json` are ignored rather than
+    /// misrepresented as pins.
+    pub(super) fn retained(&self) -> Result<Vec<Receipt>> {
+        if self.state != RootState::Owned {
+            return Ok(Vec::new());
+        }
+        // A read-only caller (for example a reverse dependency query) must
+        // not be redirected through a planted symlink: every ancestor of the
+        // retained records has to be a real directory.
+        for ancestor in [meta_dir(&self.prefix), state_dir(&self.prefix)] {
+            match fs::symlink_metadata(&ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("refusing to read '{}': it is a symlink", ancestor.display())
+                }
+                Ok(metadata) if !metadata.is_dir() => bail!(
+                    "refusing to read '{}': it is not a directory",
+                    ancestor.display()
+                ),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect '{}'", ancestor.display()));
+                }
+            }
+        }
+        let directory = retained_dir(&self.prefix);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "refusing to read '{}': the retained directory is a symlink",
+                directory.display()
+            ),
+            Ok(metadata) if !metadata.is_dir() => bail!(
+                "refusing to read '{}': the retained path is not a directory",
+                directory.display()
+            ),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+            }
+        }
+
+        let mut records = Vec::new();
+        for package in fs::read_dir(&directory)
+            .with_context(|| format!("failed to read '{}'", directory.display()))?
+        {
+            let package = package
+                .with_context(|| format!("failed to read an entry in '{}'", directory.display()))?;
+            let metadata = fs::symlink_metadata(package.path())
+                .with_context(|| format!("failed to inspect '{}'", package.path().display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing to read '{}': the retained package directory is a symlink",
+                    package.path().display()
+                );
+            }
+            if !metadata.is_dir() {
+                bail!(
+                    "refusing to read '{}': '{}' is not a retained package directory",
+                    directory.display(),
+                    package.path().display()
+                );
+            }
+            let Some(name) = package.file_name().to_str().map(str::to_owned) else {
+                bail!(
+                    "refusing to read '{}': a retained package directory has a non-UTF-8 name",
+                    directory.display()
+                );
+            };
+            if !is_safe_package_name(&name) {
+                bail!(
+                    "refusing to read '{}': '{}' is not a valid retained package name",
+                    directory.display(),
+                    name
+                );
+            }
+            let package_dir = package.path();
+            for record in fs::read_dir(&package_dir)
+                .with_context(|| format!("failed to read '{}'", package_dir.display()))?
+            {
+                let record = record.with_context(|| {
+                    format!("failed to read an entry in '{}'", package_dir.display())
+                })?;
+                let Some(file_name) = record.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(version) = file_name.strip_suffix(".json") else {
+                    continue;
+                };
+                if !is_safe_version(version) {
+                    bail!(
+                        "refusing to read '{}': '{}' is not a valid retained version",
+                        record.path().display(),
+                        version
+                    );
+                }
+                let receipt = read_receipt(&record.path())?;
+                if receipt.name != name {
+                    bail!(
+                        "retained record '{}' names '{}', not '{}'",
+                        record.path().display(),
+                        receipt.name,
+                        name
+                    );
+                }
+                if receipt.version != version {
+                    bail!(
+                        "retained record '{}' records version '{}', not '{}'",
+                        record.path().display(),
+                        receipt.version,
+                        version
+                    );
+                }
+                records.push(receipt);
+            }
+        }
+        records.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.version.cmp(&right.version))
+        });
+        Ok(records)
+    }
+
     /// Create a private staging directory below this store.
     pub(super) fn stage(&self) -> Result<tempfile::TempDir> {
         self.ensure_owned()?;
@@ -509,8 +685,16 @@ impl Store {
                 *receipt = promotion.promoted.clone();
             }
         }
-        projected.extend(pending.iter().map(|package| package.receipt.clone()));
-        validate_dependencies(&projected)?;
+        let newcomers: Vec<Receipt> = pending
+            .iter()
+            .map(|package| package.receipt.clone())
+            .collect();
+        let retained = self.retained()?;
+        validate_dependencies_with_retained(&projected, &newcomers, &retained)?;
+        let mut active = projected.clone();
+        active.extend(newcomers.iter().cloned());
+        verify_retained_pin_kegs(&projected, &active, &retained, &cellar_dir(&self.prefix))?;
+        projected.extend(newcomers);
         validate_conflicts(&projected)?;
 
         // New packages are applied first: if they fail, nothing was promoted.
@@ -540,9 +724,13 @@ impl Store {
     /// packages are installed, and a failure rolls the new paths back and
     /// restores the old ones while the caller still holds this process.
     ///
-    /// The projected receipt graph is validated first, so an upgrade that would
-    /// break a surviving receipt's dependency (a different version or digest)
-    /// is rejected unless the dependent is upgraded in the same call.
+    /// The projected receipt graph is validated first. A replacement that
+    /// would break a surviving receipt's pin to the exact old version and
+    /// digest retains the old keg and receipt instead of releasing them: the
+    /// old keg stays in place, the old receipt moves to the retained records,
+    /// and the managed links move to the replacement. A surviving pin that no
+    /// retained record can satisfy still rejects the upgrade unless the
+    /// dependent is upgraded in the same call.
     ///
     /// Like commits and removals, upgrades are not crash-atomic; see the module
     /// documentation for the files an interrupted upgrade can leave behind.
@@ -766,7 +954,9 @@ impl Store {
         // A removal must not strand a dependent that stays installed. The graph
         // this call would leave behind is the installed set minus the selection;
         // `installed` runs under the same lock as the moves below, so the check
-        // sees exactly the receipts those moves will delete.
+        // sees exactly the receipts those moves will delete. A remaining pin may
+        // be satisfied by a retained keg, which removal never touches, and every
+        // such pin must still own a real keg directory.
         let selected: HashSet<&str> = expected
             .iter()
             .map(|receipt| receipt.name.as_str())
@@ -776,7 +966,12 @@ impl Store {
             .into_iter()
             .filter(|receipt| !selected.contains(receipt.name.as_str()))
             .collect();
-        validate_dependencies(&remaining)?;
+        let retained = self.retained()?;
+        validate_dependencies_with_retained(&remaining, &[], &retained)?;
+        validate_retained_pin_closure(&retained, &remaining, &retained)?;
+        let mut pin_owners = remaining.clone();
+        pin_owners.extend(retained.iter().cloned());
+        verify_retained_pin_kegs(&pin_owners, &remaining, &retained, &cellar)?;
         Ok(removals)
     }
 
@@ -842,6 +1037,7 @@ impl Store {
                 for change in &applied {
                     let source = match change {
                         AppliedChange::Moved(moved) => &moved.source,
+                        AppliedChange::RetainedReceipt(_) => continue,
                         AppliedChange::Pruned(directory) => directory,
                     };
                     if let Some(parent) = source.parent() {
@@ -882,6 +1078,15 @@ impl Store {
         let opt = opt_dir(&self.prefix);
         let link_dirs = existing_link_directories(&self.prefix)?;
         let has_opt = check_optional_directory(&opt)?;
+        let retained = self.retained()?;
+        let retained_by_name: HashMap<&str, HashMap<&str, &Receipt>> =
+            retained.iter().fold(HashMap::new(), |mut by_name, record| {
+                by_name
+                    .entry(record.name.as_str())
+                    .or_default()
+                    .insert(record.version.as_str(), record);
+                by_name
+            });
         let mut names = HashSet::new();
         let mut link_names = HashSet::new();
         let mut upgrades = Vec::with_capacity(packages.len());
@@ -995,22 +1200,65 @@ impl Store {
                 }
             }
 
-            // The package directory must hold exactly the receipt's keg. An
-            // alternate version or any other entry would survive the old keg
-            // moving aside and collide with the replacement.
+            // The package directory may hold the receipt's keg plus any kegs
+            // with valid retained records. An entry with no retained record, a
+            // version that is both active and retained, or a retained keg that
+            // is not a real directory fails closed: only the active keg and
+            // recorded retained kegs may survive this upgrade.
+            if let Some(versions) = retained_by_name.get(old.name.as_str()) {
+                if versions.contains_key(old.version.as_str()) {
+                    bail!(
+                        "refusing to upgrade '{}': the active version {} also has a retained record; remove the stale retained record manually",
+                        old.name,
+                        old.version
+                    );
+                }
+            }
             for entry in fs::read_dir(&package)
                 .with_context(|| format!("failed to read '{}'", package.display()))?
             {
                 let entry = entry.with_context(|| {
                     format!("failed to read an entry in '{}'", package.display())
                 })?;
-                if entry.file_name().as_os_str() != OsStr::new(&old.version) {
+                let file_name = entry.file_name();
+                if file_name.as_os_str() == OsStr::new(&old.version) {
+                    continue;
+                }
+                let Some(version) = file_name.to_str() else {
                     bail!(
-                        "refusing to upgrade '{}': '{}' contains '{}', which is not the installed version {}; remove foreign entries first",
+                        "refusing to upgrade '{}': '{}' contains a foreign entry; remove it first",
+                        old.name,
+                        package.display()
+                    );
+                };
+                let Some(record) = retained_by_name
+                    .get(old.name.as_str())
+                    .and_then(|versions| versions.get(version))
+                else {
+                    bail!(
+                        "refusing to upgrade '{}': '{}' contains '{}', which is not the installed version {} and has no retained record; remove foreign entries first",
                         old.name,
                         package.display(),
-                        entry.file_name().to_string_lossy(),
+                        file_name.to_string_lossy(),
                         old.version
+                    );
+                };
+                if record.name != old.name || record.version != version {
+                    bail!(
+                        "refusing to upgrade '{}': the retained record for '{}' names '{} {}'; remove it manually",
+                        old.name,
+                        version,
+                        record.name,
+                        record.version
+                    );
+                }
+                let metadata = fs::symlink_metadata(entry.path())
+                    .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!(
+                        "refusing to upgrade '{}': retained keg '{}' is not a real directory",
+                        old.name,
+                        entry.path().display()
                     );
                 }
             }
@@ -1107,6 +1355,8 @@ impl Store {
                     keg,
                     links: owned_links,
                 },
+                old_receipt: old,
+                retain: false,
                 pending: Pending {
                     receipt,
                     stage,
@@ -1115,21 +1365,76 @@ impl Store {
             });
         }
 
-        // Validate the graph this upgrade would leave behind: every surviving
-        // receipt plus every replacement. Without the replacement in the same
-        // batch, a surviving package still pinned to the old version or digest
-        // blocks the upgrade, so a dependency bump cannot silently strand it.
-        let mut final_receipts: Vec<Receipt> = self
+        // Decide retention before validation. An upgrade whose old receipt is
+        // still pinned exactly (name, version, and digest) by a surviving
+        // receipt retains the old keg and identity instead of releasing them;
+        // the old keg stays in place and its receipt moves to the retained
+        // records. A surviving pin that no active or retained record can
+        // satisfy still rejects the upgrade, and a replacement pin must be
+        // satisfied by an active receipt only, never by a retained keg.
+        let survivors: Vec<Receipt> = self
             .installed()?
             .into_iter()
             .filter(|receipt| !names.contains(&receipt.name))
             .collect();
-        final_receipts.extend(
-            upgrades
+        let pinned_by = |target: &Receipt, owners: &[Receipt]| {
+            owners.iter().any(|receipt| {
+                receipt.dependencies.iter().any(|pin| {
+                    pin.name == target.name
+                        && pin.version == target.version
+                        && pin.sha256 == target.sha256
+                })
+            })
+        };
+        // A pin owner is any surviving active receipt plus every retained
+        // record already on disk: a retained keg's recorded identity keeps
+        // the versions it pins, so it forces retention in later batches too.
+        // (With garbage collection deferred, every retained record counts,
+        // which is a safe superset of the still-reachable ones.)
+        let mut owners = survivors.clone();
+        owners.extend(retained.iter().cloned());
+        let mut new_retained: Vec<Receipt> = Vec::new();
+        for upgrade in &mut upgrades {
+            if pinned_by(&upgrade.old_receipt, &owners) {
+                upgrade.retain = true;
+                new_retained.push(upgrade.old_receipt.clone());
+            }
+        }
+        // Transitive closure: a retained old receipt's own pins must keep the
+        // old receipts they match in this batch, so a chain of retained kegs
+        // stays coherent instead of leaving one of them danging.
+        loop {
+            let kept: Vec<Receipt> = upgrades
                 .iter()
-                .map(|upgrade| upgrade.pending.receipt.clone()),
-        );
-        validate_dependencies(&final_receipts)?;
+                .filter(|upgrade| upgrade.retain)
+                .map(|upgrade| upgrade.old_receipt.clone())
+                .collect();
+            let mut changed = false;
+            for upgrade in &mut upgrades {
+                if upgrade.retain {
+                    continue;
+                }
+                if pinned_by(&upgrade.old_receipt, &kept) {
+                    upgrade.retain = true;
+                    new_retained.push(upgrade.old_receipt.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut all_retained = retained;
+        all_retained.extend(new_retained);
+        let replacements: Vec<Receipt> = upgrades
+            .iter()
+            .map(|upgrade| upgrade.pending.receipt.clone())
+            .collect();
+        validate_dependencies_with_retained(&survivors, &replacements, &all_retained)?;
+        let mut final_receipts = survivors.clone();
+        final_receipts.extend(replacements.iter().cloned());
+        validate_retained_pin_closure(&all_retained, &final_receipts, &all_retained)?;
+        verify_retained_pin_kegs(&owners, &final_receipts, &all_retained, &cellar)?;
         validate_conflicts(&final_receipts)?;
         Ok(upgrades)
     }
@@ -1152,23 +1457,51 @@ impl Store {
         let move_outcome = (|| -> Result<()> {
             let mut index = 0usize;
             for upgrade in &upgrades {
-                let steps = std::iter::once(RemovalStep {
-                    source: upgrade.old.receipt_path.clone(),
-                    kind: StepKind::Receipt,
-                })
-                .chain(upgrade.old.links.iter().map(|link| RemovalStep {
-                    source: link.path.clone(),
-                    kind: StepKind::Link {
-                        target: link.target.clone(),
-                    },
-                }))
-                .chain(std::iter::once(RemovalStep {
-                    source: upgrade.old.keg.clone(),
-                    kind: StepKind::Directory,
-                }));
-                for step in steps {
-                    move_aside(&step, quarantine.path(), index, &mut moved)?;
-                    index += 1;
+                if upgrade.retain {
+                    // Retain the old keg in place. Only the owned links move
+                    // aside (the replacement claims them), and the old receipt
+                    // moves into the retained records so the exact old
+                    // identity survives. The keg directory is never touched.
+                    for link in &upgrade.old.links {
+                        move_aside(
+                            &RemovalStep {
+                                source: link.path.clone(),
+                                kind: StepKind::Link {
+                                    target: link.target.clone(),
+                                },
+                            },
+                            quarantine.path(),
+                            index,
+                            &mut moved,
+                        )?;
+                        index += 1;
+                    }
+                    retain_receipt(
+                        &self.prefix,
+                        &upgrade.old_receipt.name,
+                        &upgrade.old_receipt.version,
+                        &upgrade.old.receipt_path,
+                        &mut moved,
+                    )?;
+                } else {
+                    let steps = std::iter::once(RemovalStep {
+                        source: upgrade.old.receipt_path.clone(),
+                        kind: StepKind::Receipt,
+                    })
+                    .chain(upgrade.old.links.iter().map(|link| RemovalStep {
+                        source: link.path.clone(),
+                        kind: StepKind::Link {
+                            target: link.target.clone(),
+                        },
+                    }))
+                    .chain(std::iter::once(RemovalStep {
+                        source: upgrade.old.keg.clone(),
+                        kind: StepKind::Directory,
+                    }));
+                    for step in steps {
+                        move_aside(&step, quarantine.path(), index, &mut moved)?;
+                        index += 1;
+                    }
                 }
             }
             Ok(())
@@ -1187,10 +1520,24 @@ impl Store {
             Ok(()) => {
                 let mut flushed = HashSet::new();
                 for change in &moved {
-                    let AppliedChange::Moved(moved) = change else {
-                        continue;
-                    };
-                    if let Some(parent) = moved.source.parent() {
+                    let mut parents: Vec<&Path> = Vec::new();
+                    match change {
+                        AppliedChange::Moved(moved) => {
+                            if let Some(parent) = moved.source.parent() {
+                                parents.push(parent);
+                            }
+                        }
+                        AppliedChange::RetainedReceipt(moved) => {
+                            if let Some(parent) = moved.source.parent() {
+                                parents.push(parent);
+                            }
+                            if let Some(parent) = moved.parked.parent() {
+                                parents.push(parent);
+                            }
+                        }
+                        AppliedChange::Pruned(directory) => parents.push(directory),
+                    }
+                    for parent in parents {
                         if flushed.insert(parent.to_path_buf()) {
                             sync_directory(parent);
                         }
@@ -1368,6 +1715,7 @@ impl Store {
         }
         check_optional_directory(&sbin_dir(&self.prefix))?;
         check_optional_directory(&opt_dir(&self.prefix))?;
+        check_optional_directory(&retained_dir(&self.prefix))?;
         check_optional_directory(&self.prefix.join("Caskroom"))?;
         check_optional_directory(&self.prefix.join("Applications"))?;
         check_optional_directory(&state_dir(&self.prefix).join("casks"))?;
@@ -1381,6 +1729,15 @@ impl Store {
         let opt = opt_dir(&self.prefix);
         let link_dirs = existing_link_directories(&self.prefix)?;
         let has_opt = check_optional_directory(&opt)?;
+        let retained = self.retained()?;
+        let retained_by_name: HashMap<&str, HashMap<&str, &Receipt>> =
+            retained.iter().fold(HashMap::new(), |mut by_name, record| {
+                by_name
+                    .entry(record.name.as_str())
+                    .or_default()
+                    .insert(record.version.as_str(), record);
+                by_name
+            });
         let mut names = HashSet::new();
         let mut link_names = HashSet::new();
         let mut pending = Vec::with_capacity(packages.len());
@@ -1420,11 +1777,11 @@ impl Store {
 
             let installed_dir = cellar.join(&receipt.name);
             match fs::symlink_metadata(&installed_dir) {
-                Ok(_) => bail!(
-                    "refusing to install '{}': '{}' already exists without a receipt; remove it or use a clean prefix",
-                    receipt.name,
-                    installed_dir.display()
-                ),
+                Ok(_) => self.accept_existing_cellar(
+                    &installed_dir,
+                    &receipt,
+                    retained_by_name.get(receipt.name.as_str()),
+                )?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -1483,15 +1840,94 @@ impl Store {
             });
         }
 
-        // Full preflight of the graph this commit would leave behind: the
-        // receipts already on disk plus the ones about to be written. A
+        // Full preflight of the graph this commit would leave behind. A
         // dependency may name a package from this same batch, but its exact
-        // version and digest must match.
-        let mut final_receipts = self.installed()?;
-        final_receipts.extend(pending.iter().map(|package| package.receipt.clone()));
-        validate_dependencies(&final_receipts)?;
+        // version and digest must match, and a pin recorded by a *new* receipt
+        // is satisfied only by an active receipt, never by a retained keg.
+        // Receipts already on disk may pin a retained keg, and every such pin
+        // must still own a real keg directory.
+        let survivors = self.installed()?;
+        let newcomers: Vec<Receipt> = pending
+            .iter()
+            .map(|package| package.receipt.clone())
+            .collect();
+        validate_dependencies_with_retained(&survivors, &newcomers, &retained)?;
+        let mut final_receipts = survivors.clone();
+        final_receipts.extend(newcomers.iter().cloned());
+        verify_retained_pin_kegs(&survivors, &final_receipts, &retained, &cellar)?;
         validate_conflicts(&final_receipts)?;
         Ok(pending)
+    }
+
+    /// A package directory without an active receipt may exist only when every
+    /// entry is a retained keg backed by a valid retained record.
+    ///
+    /// Any other entry is foreign and fails closed: installing must never
+    /// adopt an unreceipted keg, and recreating a version that is still
+    /// retained is refused explicitly rather than rebinding it.
+    fn accept_existing_cellar(
+        &self,
+        directory: &Path,
+        receipt: &Receipt,
+        retained: Option<&HashMap<&str, &Receipt>>,
+    ) -> Result<()> {
+        let metadata = fs::symlink_metadata(directory)
+            .with_context(|| format!("failed to inspect '{}'", directory.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "refusing to install '{}': '{}' already exists without a receipt; remove it or use a clean prefix",
+                receipt.name,
+                directory.display()
+            );
+        }
+        for entry in fs::read_dir(directory)
+            .with_context(|| format!("failed to read '{}'", directory.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read an entry in '{}'", directory.display()))?;
+            let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
+                bail!(
+                    "refusing to install '{}': '{}' contains a foreign entry; remove it or use a clean prefix",
+                    receipt.name,
+                    directory.display()
+                );
+            };
+            if version == receipt.version {
+                bail!(
+                    "refusing to install '{} {}': '{}' is retained by surviving receipts; install a different version or clean up the retained keg manually",
+                    receipt.name,
+                    receipt.version,
+                    entry.path().display()
+                );
+            }
+            let Some(record) = retained.and_then(|versions| versions.get(version.as_str())) else {
+                bail!(
+                    "refusing to install '{}': '{}' contains '{}', which has no retained receipt; remove foreign entries first",
+                    receipt.name,
+                    directory.display(),
+                    version
+                );
+            };
+            if record.name != receipt.name || record.version != version {
+                bail!(
+                    "refusing to install '{}': the retained record for '{}' names '{} {}'; remove it manually",
+                    receipt.name,
+                    version,
+                    record.name,
+                    record.version
+                );
+            }
+            let metadata = fs::symlink_metadata(entry.path())
+                .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "refusing to install '{}': retained keg '{}' is not a real directory",
+                    receipt.name,
+                    entry.path().display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Recheck every promotion against the current receipts and kegs.
@@ -1631,20 +2067,44 @@ impl Store {
             let version = receipt.version.clone();
 
             let package_cellar = cellar.join(&name);
-            if !reuse_cellar {
-                fs::create_dir(&package_cellar).with_context(|| {
-                    format!(
-                        "failed to create '{}' for {} {}",
-                        package_cellar.display(),
-                        name,
-                        version
-                    )
-                })?;
+            // Preflight accepted a package directory that holds only retained
+            // kegs; `create_dir` then fails with AlreadyExists and the
+            // directory is reused. Anything else appearing here under the
+            // writer lock fails closed.
+            let mut cellar_created = !reuse_cellar;
+            if cellar_created {
+                match fs::create_dir(&package_cellar) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let metadata =
+                            fs::symlink_metadata(&package_cellar).with_context(|| {
+                                format!("failed to inspect '{}'", package_cellar.display())
+                            })?;
+                        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                            bail!(
+                                "refusing to install '{}': '{}' is no longer a real directory",
+                                name,
+                                package_cellar.display()
+                            );
+                        }
+                        cellar_created = false;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to create '{}' for {} {}",
+                                package_cellar.display(),
+                                name,
+                                version
+                            )
+                        });
+                    }
+                }
             }
             let keg = package_cellar.join(&version);
             applied.push(Applied {
                 cellar: package_cellar.clone(),
-                cellar_created: !reuse_cellar,
+                cellar_created,
                 keg: keg.clone(),
                 keg_created: false,
                 links: Vec::new(),
@@ -1729,6 +2189,11 @@ struct Promotion {
 /// A validated replacement with the old package it detaches first.
 struct Upgrade {
     old: Removal,
+    /// The exact old receipt this upgrade replaces; moved to the retained
+    /// records when `retain` is true.
+    old_receipt: Receipt,
+    /// Whether the old keg and receipt are retained instead of released.
+    retain: bool,
     pending: Pending,
 }
 
@@ -1782,6 +2247,9 @@ enum StepKind {
 enum AppliedChange {
     /// A path moved into the removal quarantine.
     Moved(MovedPath),
+    /// An active receipt moved into the retained records by a retaining
+    /// upgrade; its keg stays in place.
+    RetainedReceipt(MovedPath),
     /// An empty package directory that was removed.
     Pruned(PathBuf),
 }
@@ -1980,6 +2448,72 @@ fn move_aside(
     Ok(())
 }
 
+/// Move a preflighted active receipt into the retained records, rechecking
+/// that it is still a regular receipt and that no retained record already
+/// exists for that exact version.
+///
+/// The destination derives from the receipt's own validated name and version,
+/// so the move stays inside `.brewrs/state/retained/<name>/`. The keg stays
+/// in place; only the receipt file moves.
+fn retain_receipt(
+    prefix: &Path,
+    name: &str,
+    version: &str,
+    source: &Path,
+    applied: &mut Vec<AppliedChange>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+            "refusing to retain '{}': it disappeared after preflight",
+            source.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect '{}'", source.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "refusing to retain '{}': it is no longer a regular receipt",
+            source.display()
+        );
+    }
+
+    // The retained root may not exist yet (an initialized prefix from before
+    // retention shipped never had one), so both levels are created lazily;
+    // `ensure_directory` creates exactly one level and never a symlink.
+    ensure_directory(&retained_dir(prefix), true)?;
+    let package_dir = retained_dir(prefix).join(name);
+    ensure_directory(&package_dir, true)?;
+    let parked = package_dir.join(format!("{version}.json"));
+    match fs::symlink_metadata(&parked) {
+        Ok(_) => bail!(
+            "refusing to retain '{} {}': '{}' already exists; remove the stale retained record manually",
+            name,
+            version,
+            parked.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect '{}'", parked.display()));
+        }
+    }
+    fs::rename(source, &parked).with_context(|| {
+        format!(
+            "failed to move the receipt of '{} {}' into the retained records",
+            name, version
+        )
+    })?;
+    sync_directory(&package_dir);
+    sync_directory(&retained_dir(prefix));
+    sync_directory(&state_dir(prefix));
+    applied.push(AppliedChange::RetainedReceipt(MovedPath {
+        source: source.to_path_buf(),
+        parked,
+    }));
+    Ok(())
+}
+
 /// Remove the package directory, but only while it is empty.
 ///
 /// A non-recursive removal cannot delete a foreign entry that appeared after
@@ -2042,6 +2576,35 @@ fn rollback_removal(applied: &[AppliedChange]) -> Vec<String> {
                 if let Err(error) = fs::rename(&moved.parked, &moved.source) {
                     issues.push(format!(
                         "failed to restore '{}': {error}",
+                        moved.source.display()
+                    ));
+                }
+            }
+            AppliedChange::RetainedReceipt(moved) => {
+                // The new receipt is removed before this runs, so the active
+                // slot is expected to be free; anything else is never
+                // overwritten and the retained record is left in place.
+                match fs::symlink_metadata(&moved.source) {
+                    Ok(_) => {
+                        issues.push(format!(
+                            "left the retained record '{}' in place: '{}' still exists",
+                            moved.parked.display(),
+                            moved.source.display()
+                        ));
+                        continue;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        issues.push(format!(
+                            "failed to inspect '{}': {error}",
+                            moved.source.display()
+                        ));
+                        continue;
+                    }
+                }
+                if let Err(error) = fs::rename(&moved.parked, &moved.source) {
+                    issues.push(format!(
+                        "failed to restore the retained receipt '{}': {error}",
                         moved.source.display()
                     ));
                 }
@@ -2728,6 +3291,10 @@ fn validate_dependency(owner: &str, dependency: &Dependency) -> Result<()> {
 /// names must be unique, and each recorded direct dependency must resolve to a
 /// receipt with the same name, version, and digest. Errors name both the owner
 /// and the affected dependency.
+///
+/// Production code uses [`validate_dependencies_with_retained`]; this strict
+/// active-only form remains for tests of the pure graph rules.
+#[cfg(test)]
 pub(super) fn validate_dependencies(receipts: &[Receipt]) -> Result<()> {
     let mut installed: HashMap<&str, &Receipt> = HashMap::with_capacity(receipts.len());
     for receipt in receipts {
@@ -2761,6 +3328,239 @@ pub(super) fn validate_dependencies(receipts: &[Receipt]) -> Result<()> {
                     actual.version,
                     actual.sha256
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that every pin recorded by a retained receipt still resolves to an
+/// active receipt or another retained record at its exact version and digest.
+///
+/// A retained keg is inert but its recorded identity describes what it was
+/// built against; a removal or upgrade that would delete the active keg a
+/// retained record pins is refused rather than silently stranding the
+/// retained keg's recorded dependencies. This is pure: the caller supplies
+/// the retained records, the active receipts the operation would leave
+/// installed, and every retained record the operation would provide.
+pub(super) fn validate_retained_pin_closure(
+    retained: &[Receipt],
+    active: &[Receipt],
+    retained_set: &[Receipt],
+) -> Result<()> {
+    let active_by_name: HashMap<&str, &Receipt> = HashMap::from_iter(
+        active
+            .iter()
+            .map(|receipt| (receipt.name.as_str(), receipt)),
+    );
+    let retained_by_name: HashMap<&str, HashSet<(&str, &str)>> =
+        retained_set
+            .iter()
+            .fold(HashMap::new(), |mut by_name, record| {
+                by_name
+                    .entry(record.name.as_str())
+                    .or_default()
+                    .insert((record.version.as_str(), record.sha256.as_str()));
+                by_name
+            });
+    for record in retained {
+        for pin in &record.dependencies {
+            let active_match = active_by_name
+                .get(pin.name.as_str())
+                .is_some_and(|actual| actual.version == pin.version && actual.sha256 == pin.sha256);
+            if active_match {
+                continue;
+            }
+            let retained_match = retained_by_name
+                .get(pin.name.as_str())
+                .is_some_and(|versions| {
+                    versions.contains(&(pin.version.as_str(), pin.sha256.as_str()))
+                });
+            if !retained_match {
+                bail!(
+                    "the retained record for '{} {}' pins '{} {}' (sha256 {}), which this operation would strand; remove the retained record manually first",
+                    record.name,
+                    record.version,
+                    pin.name,
+                    pin.version,
+                    pin.sha256
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a projected receipt graph where pins recorded by *new* receipts
+/// may only resolve to active receipts, while pins recorded by surviving
+/// receipts may also resolve to retained records.
+///
+/// This is pure: the caller supplies the receipts the operation would leave
+/// installed, split into the receipts that already existed (`receipts`) and
+/// the receipts this operation writes (`new_receipts`), plus the retained
+/// records on disk (or the records this operation would create). Every
+/// receipt's own fields are validated, names must be unique across both
+/// slices, and a retained record must be a valid receipt whose exact `(name,
+/// version, sha256)` a pin can match.
+///
+/// A new receipt can never be satisfied by a retained keg: a retained record
+/// is the inert identity of a superseded version, not an install target, so
+/// an install or upgrade replacement that would pin one is refused explicitly
+/// rather than silently binding to it.
+pub(super) fn validate_dependencies_with_retained(
+    receipts: &[Receipt],
+    new_receipts: &[Receipt],
+    retained: &[Receipt],
+) -> Result<()> {
+    let mut active: HashMap<&str, &Receipt> =
+        HashMap::with_capacity(receipts.len() + new_receipts.len());
+    for receipt in receipts.iter().chain(new_receipts) {
+        validate_receipt(receipt)?;
+        if active.insert(receipt.name.as_str(), receipt).is_some() {
+            bail!(
+                "package '{}' appears more than once in the projected receipt graph",
+                receipt.name
+            );
+        }
+    }
+    let newcomers: HashSet<&str> = new_receipts
+        .iter()
+        .map(|receipt| receipt.name.as_str())
+        .collect();
+    let mut retained_by_name: HashMap<&str, HashSet<(&str, &str)>> = HashMap::new();
+    for record in retained {
+        validate_receipt(record)?;
+        if !retained_by_name
+            .entry(record.name.as_str())
+            .or_default()
+            .insert((record.version.as_str(), record.sha256.as_str()))
+        {
+            bail!(
+                "retained record '{} {}' (sha256 {}) appears more than once",
+                record.name,
+                record.version,
+                record.sha256
+            );
+        }
+    }
+
+    for receipt in receipts.iter().chain(new_receipts) {
+        for dependency in &receipt.dependencies {
+            let active_match = active.get(dependency.name.as_str()).filter(|actual| {
+                actual.version == dependency.version && actual.sha256 == dependency.sha256
+            });
+            if active_match.is_some() {
+                continue;
+            }
+            let retained_match =
+                retained_by_name
+                    .get(dependency.name.as_str())
+                    .is_some_and(|versions| {
+                        versions
+                            .contains(&(dependency.version.as_str(), dependency.sha256.as_str()))
+                    });
+            if newcomers.contains(receipt.name.as_str()) {
+                if retained_match {
+                    bail!(
+                        "'{}' depends on '{} {}' (sha256 {}), which only a retained keg provides; a new receipt must pin the installed version",
+                        receipt.name,
+                        dependency.name,
+                        dependency.version,
+                        dependency.sha256
+                    );
+                }
+                bail!(
+                    "'{}' depends on '{} {}' (sha256 {}), which the projected receipt graph does not contain; the dependency must be installed at that exact version and digest, or removed together with its dependent",
+                    receipt.name,
+                    dependency.name,
+                    dependency.version,
+                    dependency.sha256
+                );
+            }
+            if !retained_match {
+                bail!(
+                    "'{}' depends on '{} {}' (sha256 {}), which neither the projected receipt graph nor the retained records contain; the dependency must match an installed or retained version exactly",
+                    receipt.name,
+                    dependency.name,
+                    dependency.version,
+                    dependency.sha256
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that every pin only a retained record can satisfy still owns a real
+/// keg directory.
+///
+/// A pin that matches no active receipt is checked against the retained
+/// records, and each such pin must have a real (non-symlinked) keg at
+/// `Cellar/<name>/<version>`; a missing or foreign keg means the record alone
+/// cannot keep the dependent working, and the transaction fails closed
+/// instead of trusting the record.
+pub(super) fn verify_retained_pin_kegs(
+    receipts: &[Receipt],
+    active: &[Receipt],
+    retained: &[Receipt],
+    cellar: &Path,
+) -> Result<()> {
+    let active_by_name: HashMap<&str, &Receipt> = HashMap::from_iter(
+        active
+            .iter()
+            .map(|receipt| (receipt.name.as_str(), receipt)),
+    );
+    let retained_by_name: HashMap<&str, HashSet<(&str, &str)>> =
+        retained.iter().fold(HashMap::new(), |mut by_name, record| {
+            by_name
+                .entry(record.name.as_str())
+                .or_default()
+                .insert((record.version.as_str(), record.sha256.as_str()));
+            by_name
+        });
+    for receipt in receipts {
+        for pin in &receipt.dependencies {
+            let active_match = active_by_name
+                .get(pin.name.as_str())
+                .is_some_and(|actual| actual.version == pin.version && actual.sha256 == pin.sha256);
+            if active_match {
+                continue;
+            }
+            let retained_match = retained_by_name
+                .get(pin.name.as_str())
+                .is_some_and(|versions| {
+                    versions.contains(&(pin.version.as_str(), pin.sha256.as_str()))
+                });
+            if !retained_match {
+                bail!(
+                    "'{}' depends on '{} {}' (sha256 {}), which neither the projected receipt graph nor the retained records contain",
+                    receipt.name,
+                    pin.name,
+                    pin.version,
+                    pin.sha256
+                );
+            }
+            let keg = cellar.join(&pin.name).join(&pin.version);
+            match fs::symlink_metadata(&keg) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => bail!(
+                    "'{}' depends on '{} {}', but the retained keg '{}' is not a real directory",
+                    receipt.name,
+                    pin.name,
+                    pin.version,
+                    keg.display()
+                ),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+                    "'{}' depends on '{} {}', but the retained keg '{}' is missing; restore the keg or remove the retained record manually",
+                    receipt.name,
+                    pin.name,
+                    pin.version,
+                    keg.display()
+                ),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect '{}'", keg.display()));
+                }
             }
         }
     }
@@ -3120,6 +3920,12 @@ pub(super) fn state_dir(prefix: &Path) -> PathBuf {
 
 fn receipts_dir(prefix: &Path) -> PathBuf {
     state_dir(prefix).join(RECEIPTS)
+}
+
+/// Records of kegs retained because a surviving receipt still pins their exact
+/// version and digest: `<retained>/<name>/<version>.json`.
+fn retained_dir(prefix: &Path) -> PathBuf {
+    state_dir(prefix).join(RETAINED)
 }
 
 pub(super) fn stages_dir(prefix: &Path) -> PathBuf {
@@ -4765,7 +5571,7 @@ mod tests {
             .expect_err("a mismatched projected pin must fail");
 
         assert!(
-            format!("{error:#}").contains("must match exactly"),
+            format!("{error:#}").contains("does not contain"),
             "{error:#}"
         );
         assert_eq!(tree(store.prefix()), before);
@@ -4805,24 +5611,58 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_rejects_breaking_a_surviving_dependency_and_allows_coherent_batches() {
+    fn upgrade_retains_a_pinned_old_keg_and_allows_coherent_batches() {
         let (_temp, store) = new_store();
         let libfoo = install(&store, "libfoo", "1.0", &[("libfoo", true)]);
         let app = install_with_dependency(&store, "app", "1.0", &libfoo, &[("app", true)]);
         let prefix = store.prefix().to_path_buf();
-        let before = tree(&prefix);
 
+        // A surviving dependent pins the exact old version and digest, so the
+        // upgrade proceeds and retains the old keg and identity instead of
+        // releasing them.
         let breaking = prepare(&store, "libfoo", "2.0", &[("libfoo", true)]);
-        let error = store
+        store
             .upgrade(vec![(libfoo.clone(), breaking)])
-            .expect_err("a surviving dependent must block the upgrade");
-        let message = format!("{error:#}");
-        assert!(message.contains("'app'"), "{message}");
-        assert!(message.contains("libfoo 1.0"), "{message}");
-        assert!(message.contains("2.0"), "{message}");
-        assert_eq!(tree(&prefix), before);
+            .expect("a pinned old version is retained, not rejected");
+        let installed = store.installed().expect("installed");
+        assert_eq!(installed.len(), 2);
+        let app_receipt = installed.iter().find(|r| r.name == "app").expect("app");
+        assert_eq!(app_receipt.dependencies[0].version, "1.0");
+        let libfoo_receipt = installed
+            .iter()
+            .find(|r| r.name == "libfoo")
+            .expect("libfoo")
+            .clone();
+        assert_eq!(libfoo_receipt.version, "2.0");
 
-        // A dependent moved onto a version that is not installed also fails.
+        // The old keg and its exact identity survive; the active links move.
+        let retained_keg = prefix.join(CELLAR).join("libfoo").join("1.0");
+        assert!(retained_keg.is_dir(), "the pinned old keg must be retained");
+        assert!(prefix.join(CELLAR).join("libfoo").join("2.0").is_dir());
+        assert_eq!(
+            fs::read_link(prefix.join(BIN).join("libfoo")).expect("new link"),
+            Path::new("../Cellar/libfoo/2.0/bin/libfoo")
+        );
+        let retained_record = prefix
+            .join(META)
+            .join(STATE)
+            .join(RETAINED)
+            .join("libfoo")
+            .join("1.0.json");
+        assert_eq!(
+            fs::read(&retained_record).expect("retained record"),
+            encode_receipt(&libfoo).expect("old receipt bytes")
+        );
+        assert!(
+            fs::read_dir(prefix.join(META).join(STAGES))
+                .expect("stages")
+                .next()
+                .is_none(),
+            "a successful retention upgrade leaves no quarantine"
+        );
+
+        // A dependent moved onto a version that is not installed and not
+        // retained still fails.
         let absent = prepare_with(
             &store,
             "app",
@@ -4838,10 +5678,10 @@ mod tests {
             .upgrade(vec![(app.clone(), absent)])
             .expect_err("an unresolvable new dependency must fail");
         assert!(format!("{error:#}").contains("'app'"), "{error:#}");
-        assert_eq!(tree(&prefix), before);
+        assert_eq!(store.installed().expect("installed").len(), 2);
 
         // Upgrading both sides in one call keeps the graph coherent.
-        let libfoo_next = prepare(&store, "libfoo", "2.0", &[("libfoo", true)]);
+        let libfoo_next = prepare(&store, "libfoo", "3.0", &[("libfoo", true)]);
         let libfoo_next_receipt = libfoo_next.receipt.clone();
         let app_next = prepare_with(
             &store,
@@ -4851,14 +5691,18 @@ mod tests {
             &[dependency(&libfoo_next_receipt)],
         );
         store
-            .upgrade(vec![(libfoo, libfoo_next), (app, app_next)])
+            .upgrade(vec![(libfoo_receipt, libfoo_next), (app, app_next)])
             .expect("a coherent batch upgrade");
         let installed = store.installed().expect("installed");
         assert_eq!(installed.len(), 2);
         assert_eq!(installed[0].name, "app");
         assert_eq!(installed[0].version, "2.0");
-        assert_eq!(installed[0].dependencies[0].version, "2.0");
-        assert_eq!(installed[1].version, "2.0");
+        assert_eq!(installed[0].dependencies[0].version, "3.0");
+        assert_eq!(installed[1].version, "3.0");
+        // The retained 1.0 keg is now unpinned, but garbage collection is
+        // deferred: the keg and its record remain for a future milestone.
+        assert!(retained_keg.is_dir());
+        assert!(retained_record.is_file());
     }
 
     #[test]
