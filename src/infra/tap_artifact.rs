@@ -255,6 +255,14 @@ pub(crate) fn hash_regular_file(
     Ok(total)
 }
 
+fn read_header_word(header: &[u8], offset: usize) -> Result<u32> {
+    let bytes: [u8; 4] = header
+        .get(offset..offset + 4)
+        .and_then(|word| word.try_into().ok())
+        .with_context(|| format!("Mach-O header is too short to read offset {offset}"))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// Validate that `path` is a thin 64-bit Mach-O executable for `expected_arch`.
 pub(crate) fn validate_macho(path: &Path, expected_arch: &str) -> Result<()> {
     let expected_cpu = match expected_arch {
@@ -273,21 +281,21 @@ pub(crate) fn validate_macho(path: &Path, expected_arch: &str) -> Result<()> {
         )
     })?;
 
-    if FAT_MAGICS.contains(&header[0..4].try_into().expect("four byte magic")) {
+    if FAT_MAGICS.iter().any(|magic| header.starts_with(magic)) {
         bail!(
             "refusing '{}': universal (fat) Mach-O artifacts are unsupported; provide one naked executable per architecture",
             path.display()
         );
     }
-    let magic = u32::from_le_bytes(header[0..4].try_into().expect("four byte magic"));
+    let magic = read_header_word(&header, 0)?;
     if magic != MH_MAGIC_64 {
         bail!(
             "refusing '{}': expected a thin 64-bit little-endian Mach-O executable",
             path.display()
         );
     }
-    let cpu_type = u32::from_le_bytes(header[4..8].try_into().expect("four byte cpu type"));
-    let file_type = u32::from_le_bytes(header[12..16].try_into().expect("four byte file type"));
+    let cpu_type = read_header_word(&header, 4)?;
+    let file_type = read_header_word(&header, 12)?;
     if cpu_type != expected_cpu {
         bail!(
             "refusing '{}': Mach-O CPU type 0x{cpu_type:08x} does not match the selected {expected_arch} artifact",

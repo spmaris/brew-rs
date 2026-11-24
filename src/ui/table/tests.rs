@@ -2,6 +2,8 @@ use console::measure_text_width as cells;
 use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
 
+use super::format::summary_block;
+use super::mode::ModeInputs;
 use super::*;
 
 const BOXED: Mode = Mode {

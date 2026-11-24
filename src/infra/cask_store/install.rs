@@ -174,7 +174,9 @@ pub(super) fn apply_commit(
             caskroom_ver: None,
             apps: Vec::new(),
         });
-        let record = applied.last_mut().expect("just pushed");
+        let record = applied
+            .last_mut()
+            .context("internal error: applied cask record missing after push")?;
 
         if item.staged.has_caskroom_files {
             let staged_caskroom = item.stage.path().join("caskroom");

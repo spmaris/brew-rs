@@ -155,13 +155,11 @@ pub(super) fn stage_naked_payload(
             }
         }
     }
-    if payload_paths.len() != 1 {
-        bail!(
-            "naked cask payload must map to exactly one payload file (got {})",
-            payload_paths.len()
-        );
-    }
-    let rel = payload_paths.into_iter().next().expect("len == 1");
+    let payload_count = payload_paths.len();
+    let mut payload_paths = payload_paths.into_iter();
+    let (Some(rel), None) = (payload_paths.next(), payload_paths.next()) else {
+        bail!("naked cask payload must map to exactly one payload file (got {payload_count})");
+    };
     let dest = unpack_dir.join(rel);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;

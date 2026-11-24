@@ -1,3 +1,4 @@
+use super::limits::{MAX_RECEIPT_BYTES, MAX_VERSIONS_PER_PACKAGE, MAX_WARNINGS};
 use super::*;
 use std::fs;
 

@@ -17,7 +17,8 @@ use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
 
 use super::add::resolve;
-use super::stage::{preview_receipt_for, short_digest, stage_cask};
+use super::stage::{preview_receipt_for, stage_cask};
+use crate::ui::text::short_digest;
 
 pub(crate) async fn upgrade(
     config: &Config,

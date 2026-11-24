@@ -157,7 +157,7 @@ fn parse_zip64_eocd(file: &mut File, eocd_offset: u64) -> Result<(u64, u64, u64)
     if &locator[0..4] != b"PK\x06\x07" {
         bail!("missing ZIP64 EOCD locator");
     }
-    let z64_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
+    let z64_offset = read_u64_le(&locator, 8)?;
     if z64_offset + 56 > eocd_offset {
         bail!("ZIP64 EOCD offset is out of bounds");
     }
@@ -169,9 +169,9 @@ fn parse_zip64_eocd(file: &mut File, eocd_offset: u64) -> Result<(u64, u64, u64)
     if &z64[0..4] != b"PK\x06\x06" {
         bail!("invalid ZIP64 EOCD signature");
     }
-    let entries = u64::from_le_bytes(z64[32..40].try_into().unwrap());
-    let cd_size = u64::from_le_bytes(z64[40..48].try_into().unwrap());
-    let cd_offset = u64::from_le_bytes(z64[48..56].try_into().unwrap());
+    let entries = read_u64_le(&z64, 32)?;
+    let cd_size = read_u64_le(&z64, 40)?;
+    let cd_offset = read_u64_le(&z64, 48)?;
     Ok((entries, cd_size, cd_offset))
 }
 
@@ -197,7 +197,7 @@ fn read_u16_le(slice: &[u8], offset: usize) -> Result<u16> {
         .get(offset..offset + 2)
         .context("unexpected EOF reading u16")?
         .try_into()
-        .unwrap();
+        .context("unexpected EOF reading u16")?;
     Ok(u16::from_le_bytes(bytes))
 }
 
@@ -206,8 +206,17 @@ fn read_u32_le(slice: &[u8], offset: usize) -> Result<u32> {
         .get(offset..offset + 4)
         .context("unexpected EOF reading u32")?
         .try_into()
-        .unwrap();
+        .context("unexpected EOF reading u32")?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_le(slice: &[u8], offset: usize) -> Result<u64> {
+    let bytes: [u8; 8] = slice
+        .get(offset..offset + 8)
+        .context("unexpected EOF reading u64")?
+        .try_into()
+        .context("unexpected EOF reading u64")?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 pub(super) fn run_ditto_extract(zip_path: &Path, unpack_dir: &Path) -> Result<()> {

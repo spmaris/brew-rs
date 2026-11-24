@@ -70,8 +70,7 @@ pub(super) fn review_uses_from_macos(
                 if is_build_or_test_scoped_uses_from_macos(map, bounds) {
                     continue;
                 }
-                if is_no_linkage_uses_from_macos(map) {
-                    let name = map.keys().next().expect("map.len() == 1");
+                if let Some(name) = no_linkage_uses_from_macos_name(map) {
                     if !SYSTEM_SUPPLIED_LIBRARIES.contains(&name.as_str()) {
                         return Some(BLOCKER_USES_FROM_MACOS_DEPENDENCY);
                     }
@@ -118,21 +117,21 @@ fn review_system_library_bounds(bounds: &Value, host: MacosVersion) -> Option<&'
     }
 }
 
-fn is_no_linkage_uses_from_macos(map: &serde_json::Map<String, Value>) -> bool {
-    if map.len() != 1 {
-        return false;
-    }
-    let Some((name, scope)) = map.iter().next() else {
-        return false;
+/// The dependency name when `map` is a lone `{ name => "no_linkage" }` declaration.
+fn no_linkage_uses_from_macos_name(map: &serde_json::Map<String, Value>) -> Option<&String> {
+    let mut entries = map.iter();
+    let (Some((name, scope)), None) = (entries.next(), entries.next()) else {
+        return None;
     };
     if validate_formula_name(name, "uses_from_macos dependency").is_err() {
-        return false;
+        return None;
     }
-    match scope {
+    let no_linkage = match scope {
         Value::String(tag) => tag == "no_linkage",
         Value::Array(tags) => tags.len() == 1 && tags[0].as_str() == Some("no_linkage"),
         _ => false,
-    }
+    };
+    no_linkage.then_some(name)
 }
 
 fn is_build_or_test_scoped_uses_from_macos(

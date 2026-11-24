@@ -39,15 +39,15 @@ impl TappedTap {
     }
 }
 
-pub(super) fn receipt_relative_path(receipt: &TapReceipt) -> PathBuf {
-    let (owner, repo) = parse_tap_name(&receipt.tap).expect("validated tap name");
-    Path::new(".brewrs")
+pub(super) fn receipt_relative_path(receipt: &TapReceipt) -> Result<PathBuf> {
+    let (owner, repo) = parse_tap_name(&receipt.tap)?;
+    Ok(Path::new(".brewrs")
         .join("state")
         .join(TAPS)
         .join(owner)
         .join(repo)
         .join(RECEIPTS)
-        .join(format!("{}.json", receipt.token))
+        .join(format!("{}.json", receipt.token)))
 }
 
 pub(super) fn read_tapped(prefix: &Path, tap: &str) -> Result<TappedTap> {
@@ -247,10 +247,6 @@ pub(super) fn taps_root(prefix: &Path) -> PathBuf {
 
 pub(super) fn tap_dir(prefix: &Path, owner: &str, repo: &str) -> PathBuf {
     taps_root(prefix).join(owner).join(repo)
-}
-
-pub(super) fn short_digest(digest: &str) -> &str {
-    digest.get(..12).unwrap_or(digest)
 }
 
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {

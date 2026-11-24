@@ -27,9 +27,8 @@ impl Steps {
             let bar = ProgressBar::new_spinner();
             bar.set_draw_target(ProgressDrawTarget::stderr());
             bar.set_style(
-                ProgressStyle::default_spinner()
-                    .template("  {spinner:.cyan} {msg}")
-                    .unwrap()
+                ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner())
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
             );
             bar.enable_steady_tick(Duration::from_millis(80));

@@ -11,6 +11,7 @@ use crate::infra::cask_store::{
     CaskReceipt, InstalledApp, InstalledCaskLink, InstalledWrapper, PreparedCask,
 };
 use crate::infra::store::Store;
+use crate::ui::text::short_digest;
 
 pub(super) fn stage_cask(
     store: &Store,
@@ -137,10 +138,6 @@ pub(super) fn summarize_receipt_targets(receipt: &CaskReceipt) -> String {
     } else {
         parts.join(", ")
     }
-}
-
-pub(super) fn short_digest(digest: &str) -> &str {
-    digest.get(..12).unwrap_or(digest)
 }
 
 pub(super) fn cask_replacement_conflict(installed: &CaskReceipt, planned: &PlannedCask) -> String {

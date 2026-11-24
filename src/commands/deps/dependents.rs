@@ -4,9 +4,6 @@ use crate::infra::store::{Dependency, Receipt};
 
 use super::tree::{Branch, TreeNode};
 
-/// Digits of a digest rendered in a table.
-pub(super) const SHORT_DIGEST_LEN: usize = 12;
-
 /// One receipt in the reverse graph, with its expanded dependents.
 #[derive(Debug)]
 pub(super) struct DependentTree<'a> {
@@ -119,11 +116,6 @@ pub(super) fn dependent_tree_to_tree(tree: &DependentTree<'_>) -> TreeNode {
         branch: tree.branch,
         children: tree.children.iter().map(dependent_tree_to_tree).collect(),
     }
-}
-
-/// Render a shortened digest for a compact table.
-pub(super) fn short_digest(digest: &str) -> String {
-    digest.chars().take(SHORT_DIGEST_LEN).collect()
 }
 
 /// Replace control and non-ASCII characters and bound the rendered length.

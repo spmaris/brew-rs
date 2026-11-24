@@ -176,7 +176,7 @@ pub(super) fn commit_uninstall(prefix: &Path, receipt: &TapReceipt) -> Result<()
     let executable = prefix.join(&executable_rel);
     let parked_file = quarantine.path().join("artifact");
     let parked_receipt = quarantine.path().join("receipt.json");
-    let receipt_rel = receipt_relative_path(receipt);
+    let receipt_rel = receipt_relative_path(receipt)?;
 
     let result = (|| -> Result<()> {
         if fs::symlink_metadata(&link).is_ok() {

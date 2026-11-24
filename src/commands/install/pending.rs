@@ -6,8 +6,8 @@ use anyhow::{Result, bail};
 use crate::domain::plan::PlannedFormula;
 use crate::infra::store::{Receipt, validate_conflicts, validate_dependencies_with_retained};
 
-use super::format::short_digest;
 use super::stage::{Candidate, receipt_for};
+use crate::ui::text::short_digest;
 
 /// A formula that cannot be installed natively.
 #[derive(Debug)]

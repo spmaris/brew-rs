@@ -133,9 +133,3 @@ pub(super) fn next_path_hint(
     };
     Some(format!("{command}  (add it to ~/.zprofile to keep it)"))
 }
-
-/// Render a digest prefix for conflict messages, keeping full digests out of
-/// the terminal while still naming each side of the conflict.
-pub(super) fn short_digest(digest: &str) -> &str {
-    digest.get(..12).unwrap_or(digest)
-}

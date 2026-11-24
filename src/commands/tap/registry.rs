@@ -10,11 +10,12 @@ use crate::domain::tap_manifest::{
 };
 use crate::infra::store::{InstallLock, Store, ensure_directory, write_new_file_atomic};
 use crate::ui::DnfStyleFormatter;
+use crate::ui::text::short_digest;
 
 use super::fsguard::{directory_entries_exact, read_dir_names, verify_ancestor_dirs};
 use super::state::{
     MANIFEST_FILE, RECEIPTS, RECORD_FILE, TAPS, all_tapped, encode_json, read_receipts,
-    read_source_manifest, read_tapped, sha256_hex, short_digest, tap_dir, taps_root,
+    read_source_manifest, read_tapped, sha256_hex, tap_dir, taps_root,
 };
 
 /// Register a local declarative manifest for a fully qualified tap.

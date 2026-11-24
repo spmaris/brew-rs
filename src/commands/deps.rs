@@ -38,9 +38,10 @@ use crate::infra::api::http_client::HttpClient;
 use crate::infra::platform::default_target;
 use crate::infra::store::Store;
 use crate::ui::DnfStyleFormatter;
+use crate::ui::text::short_digest;
 
 use self::dependents::{
-    build_dependent_tree, dependent_tree_to_tree, direct_dependents, receipt_key, short_digest,
+    build_dependent_tree, dependent_tree_to_tree, direct_dependents, receipt_key,
 };
 use self::excluded::format_excluded;
 use self::graph::{MAX_DEPTH, build_forward_graph};
@@ -254,7 +255,7 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
                 vec![
                     dependent.name.clone(),
                     dependent.version.clone(),
-                    short_digest(&target.sha256),
+                    short_digest(&target.sha256).to_string(),
                     reason.into(),
                 ]
             })

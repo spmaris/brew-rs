@@ -246,7 +246,9 @@ impl Store {
                 )
             })?;
 
-            let record = applied.last_mut().expect("record was just pushed");
+            let record = applied
+                .last_mut()
+                .context("internal error: applied record missing after push")?;
             record.keg_created = true;
             let opt_link_path = opt.join(&name);
             let opt_target = opt_link_target(&name, &version);

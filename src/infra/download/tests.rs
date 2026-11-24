@@ -1,3 +1,7 @@
+use super::cache::verify_file_digest_bounded;
+use super::consts::BOTTLE_DIR_NAME;
+use super::stage::StagedBottle;
+use super::url::{is_allowed_redirect, is_ghcr_url, resolve_redirect};
 use super::*;
 use std::fs;
 use std::path::Path;

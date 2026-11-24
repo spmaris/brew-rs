@@ -21,9 +21,8 @@ impl ProgressManager {
 
         let pb = self.multi.add(ProgressBar::new_spinner());
         pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
                 .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
         );
         pb.set_message(message.to_string());

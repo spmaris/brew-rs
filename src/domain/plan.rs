@@ -33,11 +33,11 @@
 //!   cache). Requests and dependencies that resolve to the same canonical
 //!   `name` are deduplicated.
 //! * `uses_from_macos` is understood in three shapes on supported macOS tags:
-//!   1. a plain (untagged) runtime library name from [`SYSTEM_SUPPLIED_LIBRARIES`]
+//!   1. a plain (untagged) runtime library name from [`SYSTEM_SUPPLIED_LIBRARIES`](uses_from_macos::SYSTEM_SUPPLIED_LIBRARIES)
 //!      whose bounds entry is `{}` or `{ "since": "<known_codename>" }` with
 //!      host macOS release `>=` the `since` release;
 //!   2. a `no_linkage` entry (`{ "<formula>": "no_linkage" }` or `["no_linkage"]`)
-//!      whose formula is in [`SYSTEM_SUPPLIED_LIBRARIES`] with satisfied bounds;
+//!      whose formula is in [`SYSTEM_SUPPLIED_LIBRARIES`](uses_from_macos::SYSTEM_SUPPLIED_LIBRARIES) with satisfied bounds;
 //!   3. a build- and/or test-only entry (`{ "<formula>": "build" }`, `"test"`,
 //!      or `["build", "test"]`) with empty or recognized macOS `since`/`before`
 //!      bounds, because precompiled bottles do not execute build or test phases.

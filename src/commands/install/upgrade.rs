@@ -15,11 +15,12 @@ use crate::infra::store::{
 use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
 
-use super::format::{formula_note, plural, short_digest, upgraded_summary};
+use super::format::{formula_note, plural, upgraded_summary};
 use super::remove::removal_plan;
 use super::sources::validate_sources;
 use super::stage::{Candidate, fetch_formula, receipt_for, stage_formula};
 use super::{confirm, prefix_path};
+use crate::ui::text::short_digest;
 
 /// One planned upgrade: the installed receipt, its replacement receipt, and the
 /// planned formula that supplies the replacement bottle.

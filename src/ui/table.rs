@@ -22,11 +22,7 @@ mod width;
 pub use format::{clean_cell, display_path, field, fields, format_error, result};
 pub use mode::Mode;
 pub use model::{Panel, Row, Section};
-// Part of the module's public surface even though no caller outside the
-// table's own tests uses them today.
 pub use width::{panel_width, terminal_width};
-#[allow(unused_imports)]
-pub use {format::summary_block, mode::ModeInputs, tone::bold};
 
 #[cfg(test)]
 mod tests;

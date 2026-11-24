@@ -41,11 +41,11 @@ fn review_cask_macos_dep(value: &Value, tag: &str, blockers: &mut Vec<String>) {
             return;
         }
     };
-    if map.len() != 1 {
+    let mut entries = map.iter();
+    let (Some((op, versions_val)), None) = (entries.next(), entries.next()) else {
         blockers.push("declares an unsupported macOS dependency constraint".into());
         return;
-    }
-    let (op, versions_val) = map.iter().next().expect("len == 1");
+    };
     let Some(versions_arr) = versions_val.as_array() else {
         blockers.push("declares an unsupported macOS dependency constraint".into());
         return;
