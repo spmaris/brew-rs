@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::infra::store::{Receipt, Store};
 use crate::ui::DnfStyleFormatter;
+use crate::ui::table::{Row, Section};
 
 use super::prefix_path;
 
@@ -109,37 +110,64 @@ pub(super) fn reason_token(receipt: &Receipt) -> &'static str {
 
 pub(super) fn render_formula_list(formatter: &DnfStyleFormatter, mut receipts: Vec<Receipt>) {
     receipts.sort_by(|left, right| left.name.cmp(&right.name));
-    let rows: Vec<_> = receipts
-        .into_iter()
+    if formatter.boxed() {
+        println!("{}", boxed_formula_panel(formatter, &receipts));
+        return;
+    }
+    let rows: Vec<Vec<String>> = receipts
+        .iter()
         .map(|receipt| {
-            let reason = reason_token(&receipt).to_string();
             vec![
-                receipt.name,
-                receipt.version,
+                "formula".to_string(),
+                receipt.name.clone(),
+                receipt.version.clone(),
                 receipt.source.label().to_ascii_lowercase(),
-                reason,
+                reason_token(receipt).to_string(),
             ]
         })
         .collect();
-    let rendered = if formatter.boxed() {
-        formatter.table(
-            &format!("Packages ({})", rows.len()),
-            &["Package", "Version", "Source", "Reason"],
-            &rows,
-        )
-    } else {
-        let rows: Vec<Vec<String>> = rows
-            .into_iter()
-            .map(|mut cells| {
-                cells.insert(0, "formula".to_string());
-                cells
-            })
-            .collect();
+    println!(
+        "{}",
         formatter.table(
             "Packages",
             &["Type", "Name", "Version", "Source", "Reason"],
             &rows,
         )
+    );
+}
+
+/// Styled `list`: rows grouped into `Requested` and `Dependencies` sections
+/// (the section replaces the Reason column). Expects name-sorted receipts.
+fn boxed_formula_panel(formatter: &DnfStyleFormatter, receipts: &[Receipt]) -> String {
+    let section = |label: &str, requested: bool| {
+        let rows = receipts
+            .iter()
+            .filter(|receipt| receipt.requested == requested)
+            .map(|receipt| {
+                Row::plan(
+                    "",
+                    String::new(),
+                    vec![
+                        receipt.name.clone(),
+                        receipt.version.clone(),
+                        receipt.source.label().to_ascii_lowercase(),
+                    ],
+                )
+                .requested(requested)
+            })
+            .collect();
+        Section::new(label, rows)
     };
-    println!("{rendered}");
+    let sections: Vec<Section> = [section("Requested", true), section("Dependencies", false)]
+        .into_iter()
+        .filter(|section| !section.rows.is_empty())
+        .collect();
+    formatter
+        .plan_table(
+            &format!("Packages ({})", receipts.len()),
+            &["Package", "Version", "Source"],
+            sections,
+            &[],
+        )
+        .table
 }

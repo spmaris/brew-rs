@@ -5,13 +5,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::labels::remove_labels;
 use crate::commands::install::{confirm, prefix_path, removed_summary};
 use crate::config::Config;
 use crate::domain::cask_plan;
 use crate::infra::cask_store;
 use crate::infra::store::Store;
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
 pub(crate) fn remove(
     config: &Config,
@@ -70,15 +71,7 @@ pub(crate) fn remove(
         eprintln!("{summary}");
     }
     if dry_run {
-        let count = pending.len();
-        if count == 0 {
-            formatter.note("\nDry run: nothing to do.");
-        } else {
-            let noun = if count == 1 { "change" } else { "changes" };
-            formatter.note(&format!(
-                "\nDry run: {count} {noun} planned, nothing applied."
-            ));
-        }
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(0, pending.len())));
         return Ok(());
     }
     io::stdout().flush()?;
@@ -88,7 +81,7 @@ pub(crate) fn remove(
         if pending.len() == 1 { "cask" } else { "casks" }
     );
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("casks"));
         return Ok(());
     }
     let count = pending.len();
@@ -96,11 +89,16 @@ pub(crate) fn remove(
         cask_store::remove(&store, &pending)?;
     } else {
         eprintln!();
-        let noun = if count == 1 { "cask" } else { "casks" };
+        let tokens: Vec<String> = pending.iter().map(|r| r.token.clone()).collect();
+        let bundles: Vec<String> = pending
+            .iter()
+            .flat_map(|r| r.apps.iter().map(|app| app.bundle_name.clone()))
+            .collect();
+        let (active, finished) = remove_labels(&tokens, &bundles);
         let steps = crate::ui::steps::Steps::new(config);
-        let step = steps.start(&format!("Unlinking {count} {noun}"));
+        let step = steps.start(&active);
         match cask_store::remove(&store, &pending) {
-            Ok(()) => step.done(&format!("Unlinked {count} {noun}")),
+            Ok(()) => step.done(&finished),
             Err(error) => {
                 step.fail();
                 return Err(error.into());

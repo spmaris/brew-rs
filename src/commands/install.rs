@@ -33,10 +33,18 @@ pub(super) fn prefix_path(prefix: Option<&Path>) -> Result<PathBuf> {
         .context("Cannot determine the native prefix; pass --prefix with an absolute path")
 }
 
+/// The prompt is written to stderr and read from stdin, so a piped stdout
+/// does not prevent it.
+fn can_prompt(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
+}
+
 pub(super) fn confirm(question: &str) -> Result<bool> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+    if !can_prompt(io::stdin().is_terminal(), io::stderr().is_terminal()) {
         bail!("Confirmation requires a visible terminal; pass --assumeyes or --dry-run");
     }
+    // The plan table goes to stdout; flush it so it precedes the stderr prompt.
+    io::stdout().flush()?;
     eprint!("{question} [y/N] ");
     io::stderr().flush()?;
     let mut answer = String::new();
@@ -49,3 +57,16 @@ pub(super) fn confirm(question: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::can_prompt;
+
+    #[test]
+    fn prompt_needs_only_stdin_and_stderr_terminals() {
+        assert!(can_prompt(true, true));
+        assert!(!can_prompt(false, true));
+        assert!(!can_prompt(true, false));
+        assert!(!can_prompt(false, false));
+    }
+}

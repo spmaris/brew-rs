@@ -1,9 +1,9 @@
 //! Typed failures of the store layer.
 //!
-//! Every `Display` text here is the exact message the store has always
-//! produced. Where a message used to be built from context layers ("X: Y"),
-//! the outer layer is the variant's `Display` and the inner one is its
-//! `source`, so chain printing yields the same combined text.
+//! Each variant's `Display` is the user-facing message for that failure.
+//! Where a message is built from context layers ("X: Y"), the outer layer is
+//! the variant's `Display` and the inner one is its `source`, so chain
+//! printing yields the combined text.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -187,10 +187,12 @@ pub(crate) enum StoreError {
     NotInitialized { prefix: PathBuf },
     #[error("refusing to modify '{}': the store was opened read-only", prefix.display())]
     ReadOnly { prefix: PathBuf },
-    #[error("refusing to use the filesystem root as a brewrs prefix")]
+    #[error(
+        "Can't use the filesystem root as a brewrs prefix.\n  Omit --prefix to use the default brewrs prefix."
+    )]
     RootPrefix,
     #[error(
-        "refusing to use '{}' as a brewrs prefix: it is inside the Homebrew prefix '{}'; choose a dedicated directory such as ~/.brewrs",
+        "Can't use '{}' as a brewrs prefix: it is inside Homebrew's prefix '{}'.\n  Omit --prefix to use the default brewrs prefix.",
         prefix.display(),
         homebrew.display()
     )]

@@ -9,10 +9,10 @@ use crate::domain::plan;
 use crate::infra::store::{
     Receipt, Store, validate_dependencies_with_retained, validate_retained_pin_closure,
 };
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
-use super::format::{formula_note, plural, removed_summary};
+use super::format::{formula_note, limited_list, plural, removed_summary};
 use super::{confirm, prefix_path};
 
 pub(crate) fn remove(
@@ -27,7 +27,7 @@ pub(crate) fn remove(
     let installed = store.installed()?;
     let retained = store.retained()?;
     let pending = planned_removals(packages, &installed, autoremove, &retained)?;
-    apply_removal(
+    let applied = apply_removal(
         config,
         &store,
         &pending,
@@ -35,7 +35,39 @@ pub(crate) fn remove(
         yes,
         "Remove packages",
         prefix.is_some(),
-    )
+    )?;
+    if applied && !autoremove {
+        let orphans = orphans_after_removal(&installed, &pending, &retained);
+        if !orphans.is_empty() {
+            let formatter = DnfStyleFormatter::new(config);
+            formatter.note(&formatter.fields(&[(
+                "Unused",
+                format!("{} (run brewrs autoremove)", limited_list(&orphans)),
+            )]));
+        }
+    }
+    Ok(())
+}
+
+/// Names of installed dependencies that nothing needs once `pending` is gone,
+/// as `autoremove` would plan them. Empty when ownership cannot be determined:
+/// the hint is advisory and must never fail a removal.
+pub(super) fn orphans_after_removal(
+    installed: &[Receipt],
+    pending: &[Receipt],
+    retained: &[Receipt],
+) -> Vec<String> {
+    let removed: HashSet<_> = pending.iter().map(|entry| entry.name.as_str()).collect();
+    let remaining: Vec<Receipt> = installed
+        .iter()
+        .filter(|entry| !removed.contains(entry.name.as_str()))
+        .cloned()
+        .collect();
+    let mut names: Vec<String> = autoremove_plan(&remaining, retained)
+        .map(|plan| plan.into_iter().map(|entry| entry.name).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 pub(super) fn planned_removals(
@@ -98,7 +130,8 @@ pub(crate) fn autoremove(
         yes,
         "Remove unused dependencies",
         prefix.is_some(),
-    )
+    )?;
+    Ok(())
 }
 
 pub(super) fn autoremove_plan(installed: &[Receipt], retained: &[Receipt]) -> Result<Vec<Receipt>> {
@@ -149,6 +182,8 @@ pub(super) fn reachable_packages(
     needed
 }
 
+/// Returns whether packages were actually removed (false for an empty plan,
+/// a dry run, or a declined confirmation).
 pub(super) fn apply_removal(
     config: &Config,
     store: &Store,
@@ -157,11 +192,11 @@ pub(super) fn apply_removal(
     yes: bool,
     title: &str,
     show_prefix: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let formatter = DnfStyleFormatter::new(config);
     if pending.is_empty() {
         formatter.note("No unused dependencies to remove.");
-        return Ok(());
+        return Ok(false);
     }
     let rows: Vec<_> = pending
         .iter()
@@ -202,17 +237,14 @@ pub(super) fn apply_removal(
         eprintln!("{summary}");
     }
     if dry_run {
-        let noun = plural(count, "change", "changes");
-        formatter.note(&format!(
-            "\nDry run: {count} {noun} planned, nothing applied."
-        ));
-        return Ok(());
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(count, 0)));
+        return Ok(false);
     }
     io::stdout().flush()?;
     let question = format!("Remove {count} {}?", plural(count, "package", "packages"));
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
-        return Ok(());
+        eprintln!("{}", phrases::cancelled("packages"));
+        return Ok(false);
     }
     eprintln!();
     let steps = crate::ui::steps::Steps::new(config);
@@ -239,7 +271,7 @@ pub(super) fn apply_removal(
         "\n{}",
         formatter.result(&removed_summary(&requested_names, &unused_names))
     ));
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn removal_plan(packages: &[String], installed: &[Receipt]) -> Result<Vec<Receipt>> {

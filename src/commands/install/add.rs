@@ -9,8 +9,8 @@ use crate::domain::plan::{self, PlannedFormula, SourceFlag};
 use crate::infra::platform::default_target;
 use crate::infra::relocate;
 use crate::infra::store::{Receipt, Store, reject_protected_prefix};
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::format::{
     formula_note, install_question, installed_summary, next_path_hint, package_count, plural,
@@ -108,7 +108,7 @@ pub(crate) async fn install(
             formatter.note(&format!("{name} {} is already installed.", formula.version));
         }
         if dry_run {
-            formatter.note("\nDry run: nothing to do.");
+            formatter.note(&format!("\n{}", phrases::dry_run_summary(0, 0)));
         }
         return Ok(());
     }
@@ -185,16 +185,13 @@ pub(crate) async fn install(
 
     if dry_run {
         let count = pending.len() + promotions.len();
-        let noun = plural(count, "change", "changes");
-        formatter.note(&format!(
-            "\nDry run: {count} {noun} planned, nothing applied."
-        ));
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(count, 0)));
         return Ok(());
     }
     io::stdout().flush()?;
     let question = install_question(pending.len(), promotions.len());
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("packages"));
         return Ok(());
     }
 
@@ -275,17 +272,15 @@ pub(crate) async fn install(
     let count = prepared.len();
     let any_keg_only = prepared.iter().any(|package| package.receipt.keg_only);
     if count != 0 {
-        let step = steps.start("Linking into prefix");
+        let noun = plural(count, "package", "packages");
+        let step = steps.start(&format!("Linking {count} {noun}"));
         let result = if promotions.is_empty() {
             store.commit(prepared)
         } else {
             store.commit_with_promotions(prepared, &promotions)
         };
         match result {
-            Ok(()) => step.done(&format!(
-                "Linked {count} {}",
-                plural(count, "package", "packages")
-            )),
+            Ok(()) => step.done(&format!("Linked {count} {noun}")),
             Err(error) => {
                 step.fail();
                 return Err(error.into());

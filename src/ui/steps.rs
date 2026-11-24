@@ -1,8 +1,9 @@
 //! Per-step progress for install and upgrade runs.
 //!
-//! Everything here writes to stderr so stdout stays clean for pipes. On a
-//! colour-capable stderr an animated spinner marks the active step; otherwise
-//! only the finished line is printed.
+//! Everything here writes to stderr so stdout stays clean for pipes. On an
+//! interactive stderr an animated spinner marks the active step (coloured
+//! unless `NO_COLOR` or `ui.colored = false`); otherwise only the finished
+//! line is printed.
 
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -11,23 +12,45 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::ui::table::Mode;
 
+/// How steps are drawn; `colored` implies `animate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Look {
+    animate: bool,
+    colored: bool,
+}
+
+impl Look {
+    fn from_mode(mode: Mode) -> Self {
+        // `boxed` is the interactive-terminal decision (TTY and not dumb).
+        Self {
+            animate: mode.boxed,
+            colored: mode.colored,
+        }
+    }
+}
+
 pub struct Steps {
-    styled: bool,
+    look: Look,
 }
 
 impl Steps {
     pub fn new(config: &Config) -> Self {
         Self {
-            styled: Mode::detect_stderr(config.ui.colored).colored,
+            look: Look::from_mode(Mode::detect_stderr(config.ui.colored)),
         }
     }
 
     pub fn start(&self, active: &str) -> Step {
-        let bar = if self.styled {
+        let bar = if self.look.animate {
+            let template = if self.look.colored {
+                "  {spinner:.cyan} {msg}"
+            } else {
+                "  {spinner} {msg}"
+            };
             let bar = ProgressBar::new_spinner();
             bar.set_draw_target(ProgressDrawTarget::stderr());
             bar.set_style(
-                ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                ProgressStyle::with_template(template)
                     .unwrap_or_else(|_| ProgressStyle::default_spinner())
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
             );
@@ -39,14 +62,14 @@ impl Steps {
         };
         Step {
             bar,
-            styled: self.styled,
+            colored: self.look.colored,
         }
     }
 }
 
 pub struct Step {
     bar: Option<ProgressBar>,
-    styled: bool,
+    colored: bool,
 }
 
 impl Step {
@@ -54,7 +77,7 @@ impl Step {
         if let Some(bar) = self.bar {
             bar.finish_and_clear();
         }
-        if self.styled {
+        if self.colored {
             eprintln!("  {} {finished}", "✔".green().bold());
         } else {
             eprintln!("{}", plain_line(finished));

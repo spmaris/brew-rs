@@ -12,9 +12,10 @@ use crate::infra::cask_source::HttpCaskSource;
 use crate::infra::platform::default_target;
 use crate::infra::store::{Store, reject_protected_prefix};
 use crate::infra::{cask_download, cask_store};
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
+use super::labels::commit_labels;
 use super::stage::{
     cask_replacement_conflict, preview_receipt_for, stage_cask, summarize_artifacts,
 };
@@ -84,7 +85,7 @@ pub(crate) async fn install(
         }
         if !cask.install_blockers.is_empty() {
             bail!(
-                "Cannot install cask {} natively: {}.",
+                "Cannot install cask {}: it {}.",
                 cask.token,
                 cask.install_blockers.join("; ")
             );
@@ -143,15 +144,7 @@ pub(crate) async fn install(
         return Ok(());
     }
     if dry_run {
-        let count = pending.len();
-        if count == 0 {
-            formatter.note("\nDry run: nothing to do.");
-        } else {
-            let noun = if count == 1 { "change" } else { "changes" };
-            formatter.note(&format!(
-                "\nDry run: {count} {noun} planned, nothing applied."
-            ));
-        }
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(0, pending.len())));
         return Ok(());
     }
     io::stdout().flush()?;
@@ -161,28 +154,53 @@ pub(crate) async fn install(
         if count == 1 { "cask" } else { "casks" }
     );
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("casks"));
         return Ok(());
     }
 
+    eprintln!();
+    let steps = crate::ui::steps::Steps::new(config);
     let mut downloaded = Vec::with_capacity(pending.len());
     for cask in &pending {
-        let path = cask_download::fetch(config, &cask.url, &cask.sha256)
-            .await
-            .with_context(|| format!("Failed to fetch cask {} {}", cask.token, cask.version))?;
-        downloaded.push((cask, path));
+        let step = steps.start(&format!("Downloading {} {}", cask.token, cask.version));
+        match cask_download::fetch(config, &cask.url, &cask.sha256).await {
+            Ok(path) => {
+                step.done(&format!(
+                    "Downloaded {} {} (checksum verified)",
+                    cask.token, cask.version
+                ));
+                downloaded.push((cask, path));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(anyhow::Error::from(error).context(format!(
+                    "Failed to fetch cask {} {}",
+                    cask.token, cask.version
+                )));
+            }
+        }
     }
 
     let store = Store::open(&prefix_dir, true)?;
     let mut prepared = Vec::with_capacity(downloaded.len());
     for (cask, download_path) in downloaded {
-        prepared.push(stage_cask(
+        let step = steps.start(&format!("Unpacking {}", cask.token));
+        match stage_cask(
             &store,
             cask,
             &resolved_appdir,
             appdir.is_some(),
             &download_path,
-        )?);
+        ) {
+            Ok(package) => {
+                step.done(&format!("Unpacked {}", cask.token));
+                prepared.push(package);
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
     }
 
     let installed: Vec<String> = prepared
@@ -193,7 +211,24 @@ pub(crate) async fn install(
     let any_bin = prepared.iter().any(|p| {
         p.receipt.links.iter().any(|l| l.dest.starts_with("bin/")) || !p.receipt.wrappers.is_empty()
     });
-    cask_store::commit(&store, prepared)?;
+    let tokens: Vec<String> = prepared.iter().map(|p| p.receipt.token.clone()).collect();
+    let bundles: Vec<String> = prepared
+        .iter()
+        .flat_map(|p| p.receipt.apps.iter().map(|app| app.bundle_name.clone()))
+        .collect();
+    let app_paths: Vec<String> = prepared
+        .iter()
+        .flat_map(|p| p.receipt.apps.iter().map(|app| display_path(&app.path)))
+        .collect();
+    let (active, finished) = commit_labels(&tokens, &bundles);
+    let step = steps.start(&active);
+    match cask_store::commit(&store, prepared) {
+        Ok(()) => step.done(&finished),
+        Err(error) => {
+            step.fail();
+            return Err(error.into());
+        }
+    }
 
     formatter.note(&format!(
         "\n{}",
@@ -201,6 +236,7 @@ pub(crate) async fn install(
     ));
     let mut follow_up = Vec::new();
     if any_apps {
+        follow_up.push(("App", app_paths.join("\n")));
         follow_up.push(("Appdir", display_path(&resolved_appdir)));
     }
     if any_bin {

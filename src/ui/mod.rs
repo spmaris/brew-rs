@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod formatters;
+pub mod phrases;
 pub mod progress_bars;
 pub mod steps;
 pub mod table;

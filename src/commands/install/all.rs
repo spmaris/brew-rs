@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use crate::config::Config;
 use crate::domain::plan;
 use crate::infra::store::{Store, reject_protected_prefix};
-use crate::ui::DnfStyleFormatter;
+use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::prefix_path;
 use super::upgrade::{check_updates, upgrade};
@@ -21,24 +21,28 @@ pub(crate) async fn check_all_updates(
         return crate::commands::casks::check_updates(config, prefix, greedy, false).await;
     }
     if formula_only {
-        return check_updates(config, prefix).await;
+        return check_updates(config, prefix, true).await;
     }
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let formulae = store.installed()?;
     let casks = crate::infra::cask_store::installed(&store)?;
     let formatter = DnfStyleFormatter::new(config);
     if formulae.is_empty() && casks.is_empty() {
-        formatter.note("No packages installed yet.");
+        formatter.note(phrases::no_packages_installed());
         return Ok(false);
     }
+    let both = !formulae.is_empty() && !casks.is_empty();
     let mut has_updates = false;
     if !formulae.is_empty() {
-        has_updates |= check_updates(config, prefix).await?;
+        has_updates |= check_updates(config, prefix, !both).await?;
     }
     if !casks.is_empty() {
         has_updates |=
             crate::commands::casks::check_updates(config, prefix, greedy, !formulae.is_empty())
                 .await?;
+    }
+    if both && !has_updates {
+        formatter.note(phrases::everything_up_to_date());
     }
     Ok(has_updates)
 }
@@ -74,7 +78,7 @@ pub(crate) async fn upgrade_all(
     if packages.is_empty() {
         let formatter = DnfStyleFormatter::new(config);
         if installed_formulae.is_empty() && installed_casks.is_empty() {
-            formatter.note("No packages installed yet.");
+            formatter.note(phrases::no_packages_installed());
             return Ok(());
         }
         let both = !installed_formulae.is_empty() && !installed_casks.is_empty();
@@ -88,7 +92,7 @@ pub(crate) async fn upgrade_all(
                     .await?;
         }
         if both && !changed {
-            formatter.note("Everything is up to date.");
+            formatter.note(phrases::everything_up_to_date());
         }
         return Ok(());
     }
@@ -141,7 +145,7 @@ pub(crate) async fn upgrade_all(
         .await?;
     }
     if both && !changed {
-        DnfStyleFormatter::new(config).note("Everything is up to date.");
+        DnfStyleFormatter::new(config).note(phrases::everything_up_to_date());
     }
     Ok(())
 }

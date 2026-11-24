@@ -7,7 +7,7 @@ use crate::infra::api::catalog_cache;
 use crate::infra::formula_source::HttpFormulaSource;
 use crate::infra::hint_probe::SystemHintProbe;
 use crate::infra::platform::default_target;
-use crate::{config::Config, ui::DnfStyleFormatter, ui::errors};
+use crate::{config::Config, ui::DnfStyleFormatter, ui::errors, ui::phrases};
 
 /// Build a native install plan for `targets` on host tag `tag` from the
 /// official formula API, with friendly hints on a not-found target.
@@ -106,15 +106,7 @@ pub async fn run(
         eprintln!("{summary}");
     }
     if !fetch {
-        println!(
-            "\n{} {} planned, nothing applied.",
-            plan.len(),
-            if plan.len() == 1 {
-                "package"
-            } else {
-                "packages"
-            }
-        );
+        println!("\n{}", phrases::dry_run_summary(plan.len(), 0));
         return Ok(());
     }
 

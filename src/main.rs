@@ -23,7 +23,7 @@ use cli::Cli;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let disable_color = std::env::var_os("NO_COLOR").is_some()
+    let disable_color = ui::table::Mode::no_color_requested()
         || std::env::args_os()
             .skip(1)
             .take_while(|arg| arg != "--")

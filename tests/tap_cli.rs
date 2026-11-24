@@ -207,7 +207,7 @@ fn tap_install_refuses_a_protected_prefix_before_planning() {
         .args(["tap", "install", "pproenca/tap/agent-tui", "--yes"])
         .output()
         .expect("failed to run brewrs");
-    assert_failure(&output, "inside the Homebrew prefix");
+    assert_failure(&output, "inside Homebrew's prefix");
     assert!(!protected.exists(), "a refused prefix must not be created");
     assert!(sandbox.brew_invocations().is_empty());
 }
@@ -246,7 +246,7 @@ fn tap_add_list_plan_and_untap_are_offline_and_read_only() {
 
     let dry_run = sandbox.run(&["tap", "install", "pproenca/tap/agent-tui", "--dry-run"]);
     assert_success(&dry_run);
-    assert!(stderr(&dry_run).contains("Dry run: 1 change planned, nothing applied."));
+    assert!(stderr(&dry_run).contains("Dry run: 1 package would change, nothing applied."));
     assert!(
         !sandbox.home.join(".cache/brew-rs/native-casks").exists(),
         "a dry run must not create the download cache"

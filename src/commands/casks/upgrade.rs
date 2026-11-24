@@ -13,10 +13,11 @@ use crate::infra::cask_store::CaskReceipt;
 use crate::infra::platform::default_target;
 use crate::infra::store::{Store, reject_protected_prefix};
 use crate::infra::{cask_download, cask_store};
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::add::resolve;
+use super::labels::replace_labels;
 use super::stage::{preview_receipt_for, stage_cask};
 use crate::ui::text::short_digest;
 
@@ -39,7 +40,7 @@ pub(crate) async fn upgrade(
     let selected = select_installed_casks(packages, &installed)?;
     let formatter = DnfStyleFormatter::new(config);
     if selected.is_empty() {
-        formatter.note("No casks installed yet.");
+        formatter.note(phrases::no_casks_installed());
         return Ok(false);
     }
 
@@ -47,7 +48,7 @@ pub(crate) async fn upgrade(
         resolve_cask_changes(config, &store, &installed, &selected, greedy).await?;
     if changes.is_empty() {
         if announce_current {
-            formatter.note("All casks are up to date.");
+            formatter.note(phrases::all_casks_up_to_date());
         }
         print_auto_update_skip_note(&formatter, skipped_auto);
         return Ok(false);
@@ -63,10 +64,7 @@ pub(crate) async fn upgrade(
     print_auto_update_skip_note(&formatter, skipped_auto);
     if dry_run {
         let count = changes.len();
-        let noun = if count == 1 { "change" } else { "changes" };
-        formatter.note(&format!(
-            "\nDry run: {count} {noun} planned, nothing applied."
-        ));
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(0, count)));
         return Ok(true);
     }
     io::stdout().flush()?;
@@ -76,42 +74,76 @@ pub(crate) async fn upgrade(
         if changes.len() == 1 { "cask" } else { "casks" }
     );
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("casks"));
         return Ok(true);
     }
 
+    eprintln!();
+    let steps = crate::ui::steps::Steps::new(config);
     let mut downloaded = Vec::with_capacity(changes.len());
     for change in changes {
-        let download_path =
-            cask_download::fetch(config, &change.planned.url, &change.planned.sha256)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to fetch cask {} {}",
-                        change.planned.token, change.planned.version
-                    )
-                })?;
-        downloaded.push((change, download_path));
+        let planned = &change.planned;
+        let step = steps.start(&format!(
+            "Downloading {} {}",
+            planned.token, planned.version
+        ));
+        match cask_download::fetch(config, &planned.url, &planned.sha256).await {
+            Ok(download_path) => {
+                step.done(&format!(
+                    "Downloaded {} {} (checksum verified)",
+                    planned.token, planned.version
+                ));
+                downloaded.push((change, download_path));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(anyhow::Error::from(error).context(format!(
+                    "Failed to fetch cask {} {}",
+                    planned.token, planned.version
+                )));
+            }
+        }
     }
 
     let store = Store::open_existing(&path)?;
     let mut replacements = Vec::with_capacity(downloaded.len());
     for (change, download_path) in downloaded {
-        let prepared = stage_cask(
+        let step = steps.start(&format!("Unpacking {}", change.planned.token));
+        match stage_cask(
             &store,
             &change.planned,
             &change.appdir,
             change.old.appdir.is_some(),
             &download_path,
-        )?;
-        replacements.push((change.old, prepared));
+        ) {
+            Ok(prepared) => {
+                step.done(&format!("Unpacked {}", change.planned.token));
+                replacements.push((change.old, prepared));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
     }
 
     let upgraded: Vec<String> = replacements
         .iter()
         .map(|(old, new)| format!("{} {} → {}", old.token, old.version, new.receipt.version))
         .collect();
-    cask_store::upgrade(&store, replacements)?;
+    let tokens: Vec<String> = replacements
+        .iter()
+        .map(|(old, _)| old.token.clone())
+        .collect();
+    let (active, finished) = replace_labels(&tokens);
+    let step = steps.start(&active);
+    match cask_store::upgrade(&store, replacements) {
+        Ok(()) => step.done(&finished),
+        Err(error) => {
+            step.fail();
+            return Err(error.into());
+        }
+    }
     formatter.note(&format!(
         "\n{}",
         formatter.result(&upgraded_summary(&upgraded))
@@ -134,7 +166,7 @@ pub(crate) async fn check_updates(
     let formatter = DnfStyleFormatter::new(config);
     if installed.is_empty() {
         if !quiet_if_empty {
-            formatter.note("No casks installed yet.");
+            formatter.note(phrases::no_casks_installed());
         }
         return Ok(false);
     }
@@ -143,7 +175,7 @@ pub(crate) async fn check_updates(
         resolve_cask_changes(config, &store, &installed, &installed, greedy).await?;
     if changes.is_empty() {
         if !quiet_if_empty {
-            formatter.note("All casks are up to date.");
+            formatter.note(phrases::all_casks_up_to_date());
         }
         print_auto_update_skip_note(&formatter, skipped_auto);
         return Ok(false);
@@ -261,7 +293,7 @@ pub(super) async fn resolve_cask_changes(
             CaskVersionOrder::Upgrade => {
                 if !new.install_blockers.is_empty() {
                     bail!(
-                        "Cannot upgrade cask {} natively: {}.",
+                        "Cannot upgrade cask {}: it {}.",
                         old.token,
                         new.install_blockers.join("; ")
                     );

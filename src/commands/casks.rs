@@ -5,6 +5,7 @@
 //! tracks installed casks via `.brewrs/state/casks/<token>.json`.
 
 mod add;
+mod labels;
 mod list;
 mod remove;
 mod stage;

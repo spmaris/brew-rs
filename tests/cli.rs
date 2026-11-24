@@ -490,7 +490,10 @@ fn native_upgrade_without_receipts_is_offline_and_read_only() {
     let path = prefix.to_str().unwrap();
     let output = sandbox.run(&["upgrade", "--prefix", path, "--dry-run"]);
     assert_success(&output);
-    assert!(stderr(&output).contains("No packages installed yet."));
+    assert!(
+        stderr(&output)
+            .contains("No packages installed yet. Install one with: brewrs install <name>")
+    );
     let missing = sandbox.run(&["upgrade", "--prefix", path, "--yes", "hello"]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(stderr(&missing).contains("'hello' is not installed"));
@@ -511,7 +514,10 @@ fn default_update_queries_never_consult_homebrew_on_an_empty_prefix() {
     ] {
         let output = sandbox.run(args);
         assert_success(&output);
-        assert!(stderr(&output).contains("No packages installed yet."));
+        assert!(
+            stderr(&output)
+                .contains("No packages installed yet. Install one with: brewrs install <name>")
+        );
     }
     assert!(!prefix.exists());
     assert!(!sandbox.config.exists());
@@ -550,7 +556,7 @@ fn native_refuses_a_prefix_inside_the_homebrew_prefix() {
     );
     let message = stderr(&output);
     assert!(
-        message.contains("inside the Homebrew prefix"),
+        message.contains("inside Homebrew's prefix"),
         "stderr should explain the protected-prefix refusal:\n{message}"
     );
     assert!(
@@ -995,7 +1001,7 @@ fn native_cask_rejects_protected_prefix_and_appdir() {
         &[("HOMEBREW_PREFIX", homebrew.to_str().unwrap())],
     );
     assert_eq!(bad_prefix.status.code(), Some(1));
-    assert!(stderr(&bad_prefix).contains("inside the Homebrew prefix"));
+    assert!(stderr(&bad_prefix).contains("inside Homebrew's prefix"));
 
     let bad_appdir = sandbox.run_with_env(
         &[
@@ -1011,7 +1017,7 @@ fn native_cask_rejects_protected_prefix_and_appdir() {
         &[("HOMEBREW_PREFIX", homebrew.to_str().unwrap())],
     );
     assert_eq!(bad_appdir.status.code(), Some(1));
-    assert!(stderr(&bad_appdir).contains("inside the Homebrew prefix"));
+    assert!(stderr(&bad_appdir).contains("inside Homebrew's prefix"));
     assert!(!safe_prefix.exists());
 
     sandbox.assert_no_brew();
@@ -1051,7 +1057,7 @@ fn install_and_upgrade_refuse_a_protected_prefix_before_planning_or_network() {
         );
         let message = stderr(&output);
         assert!(
-            message.contains("inside the Homebrew prefix"),
+            message.contains("inside Homebrew's prefix"),
             "{args:?} should refuse the protected prefix first:\n{message}"
         );
         assert!(

@@ -9,7 +9,7 @@ use crate::infra::store::{Receipt, validate_conflicts, validate_dependencies_wit
 use super::stage::{Candidate, receipt_for};
 use crate::ui::text::short_digest;
 
-/// A formula that cannot be installed natively.
+/// A formula that cannot be installed.
 #[derive(Debug)]
 pub(super) struct InstallBlocked(String);
 
@@ -40,22 +40,25 @@ pub(super) fn pending_packages<'a>(
             bail!("{}", replacement_conflict(existing, &receipt));
         }
         if !formula.install_blockers.is_empty() {
-            let mut message = format!(
-                "Cannot install {} natively: {}.",
-                formula.name,
-                formula.install_blockers.join("; ")
-            );
+            let blockers = formula.install_blockers.join("; ");
+            let needed_by = if formula.requested {
+                Vec::new()
+            } else {
+                requested_dependents(plan, &formula.name)
+            };
+            let mut message = if needed_by.is_empty() {
+                format!("Cannot install {}: it {blockers}.", formula.name)
+            } else {
+                format!(
+                    "Cannot install {}: its dependency {} {blockers}.",
+                    needed_by.join(", "),
+                    formula.name
+                )
+            };
             for blocker in &formula.install_blockers {
                 if let Some(reason) = blocker_reason(blocker) {
                     message.push_str("\n  ");
                     message.push_str(reason);
-                }
-            }
-            if !formula.requested {
-                let needed_by = requested_dependents(plan, &formula.name);
-                if !needed_by.is_empty() {
-                    message.push_str("\n  Needed by: ");
-                    message.push_str(&needed_by.join(", "));
                 }
             }
             return Err(InstallBlocked(message).into());
@@ -74,7 +77,7 @@ pub(super) fn pending_packages<'a>(
 pub(super) fn blocker_reason(blocker: &str) -> Option<&'static str> {
     match blocker {
         "requires a fixed Homebrew prefix" => Some(
-            "Homebrew built this bottle for /opt/homebrew only; brewrs installs into its own prefix, so this bottle can't be used.",
+            "Homebrew built this bottle for /opt/homebrew only, and brewrs installs into its own prefix, so it can't be used.",
         ),
         "requires bottle relocation not yet supported for this formula or platform" => {
             Some("brewrs can't relocate this bottle on this macOS version yet.")
@@ -119,13 +122,14 @@ pub(super) fn replacement_conflict(installed: &Receipt, planned: &Receipt) -> St
     if installed.version_scheme != planned.version_scheme {
         if planned.version_scheme > installed.version_scheme {
             format!(
-                "{} {} (scheme {}) is installed but {} {} (scheme {}) is available; run native upgrade to replace the installed version",
+                "{} {} (scheme {}) is installed but {} {} (scheme {}) is available.\nUpgrade with: brewrs upgrade {}",
                 installed.name,
                 installed.version,
                 installed.version_scheme,
                 planned.name,
                 planned.version,
-                planned.version_scheme
+                planned.version_scheme,
+                installed.name
             )
         } else {
             format!(
@@ -141,8 +145,8 @@ pub(super) fn replacement_conflict(installed: &Receipt, planned: &Receipt) -> St
     } else if installed.version != planned.version {
         match crate::domain::version::compare(&planned.version, &installed.version) {
             Ok(Ordering::Greater) => format!(
-                "{} {} is installed but {} {} is available; run native upgrade to replace the installed version",
-                installed.name, installed.version, planned.name, planned.version
+                "{} {} is installed but {} {} is available.\nUpgrade with: brewrs upgrade {}",
+                installed.name, installed.version, planned.name, planned.version, installed.name
             ),
             Ok(Ordering::Less) => format!(
                 "{} {} is installed but the plan resolves older {} {}; refusing to replace it in place",

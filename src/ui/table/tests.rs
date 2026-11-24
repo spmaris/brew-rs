@@ -260,9 +260,9 @@ fn summary_rows_sit_inside_the_borders() {
              │   pcre2    10.44    homebrew                             │\n\
              │ ──────────────────────────────────────────────────────── │\n\
              │ Summary                                                  │\n\
-             │   Install    2 packages (1 requested, 1 dependency)      │\n\
-             │   Target     arm64_sequoia                               │\n\
-             │   Prefix     ~/p                                         │\n\
+             │   Install     2 packages (1 requested, 1 dependency)     │\n\
+             │   Target      arm64_sequoia                              │\n\
+             │   Prefix      ~/p                                        │\n\
              ╰──────────────────────────────────────────────────────────╯"
     );
     let styled = panel.render(STYLED, Some(60));
@@ -295,9 +295,9 @@ fn plain_render_excludes_the_summary_which_is_rendered_separately() {
     assert_eq!(
         panel.plain_summary(Mode::PLAIN),
         "Summary\n\
-             \x20 Install    2 packages (1 requested, 1 dependency)\n\
-             \x20 Target     arm64_sequoia\n\
-             \x20 Prefix     ~/p"
+             \x20 Install     2 packages (1 requested, 1 dependency)\n\
+             \x20 Target      arm64_sequoia\n\
+             \x20 Prefix      ~/p"
     );
     let stacked = Panel::flat(
         "T",
@@ -306,7 +306,7 @@ fn plain_render_excludes_the_summary_which_is_rendered_separately() {
     )
     .with_summary(&summary)
     .render(BOXED, Some(12));
-    assert!(stacked.ends_with("  Prefix     ~/p"), "{stacked}");
+    assert!(stacked.ends_with("  Prefix      ~/p"), "{stacked}");
 }
 
 #[test]
@@ -436,6 +436,23 @@ fn errors_are_red_bold_with_indented_hints() {
 }
 
 #[test]
+fn prose_mentioning_brewrs_is_not_bold() {
+    let message = "Blocked.\n  Homebrew built it for /opt/homebrew only, and brewrs installs into its own prefix.\n  brewrs can't relocate it.";
+    let styled = format_error(STYLED, message);
+    assert!(!styled.contains("\x1b[1mbrewrs"), "{styled:?}");
+    assert!(styled.contains("and brewrs installs into"), "{styled:?}");
+}
+
+#[test]
+fn command_after_prose_is_bold_to_end_of_line() {
+    let message = "Blocked.\n  brewrs installs here; run brewrs install --source upstream jq now";
+    assert_eq!(
+        format_error(STYLED, message),
+        "\x1b[1;31mError:\x1b[0m Blocked.\n  brewrs installs here; run \x1b[1mbrewrs install --source upstream jq now\x1b[0m"
+    );
+}
+
+#[test]
 fn runnable_hints_are_bold_from_the_command_onwards() {
     let message = "Something failed.\n  Try: brewrs install neovim --verbose";
     let styled = format_error(STYLED, message);
@@ -457,23 +474,49 @@ fn summary_block_aligns_plain_labels_under_a_bold_cyan_heading() {
     ];
     assert_eq!(
         summary_block(Mode::PLAIN, &rows),
-        "Summary\n  Install    2 packages\n  Prefix     ~/p"
+        "Summary\n  Install     2 packages\n  Prefix      ~/p"
     );
     assert_eq!(
         summary_block(STYLED, &rows),
-        "\x1b[1;36mSummary\x1b[0m\n  Install    2 packages\n  Prefix     ~/p"
+        "\x1b[1;36mSummary\x1b[0m\n  Install     2 packages\n  Prefix      ~/p"
     );
 }
 
 #[test]
 fn fields_are_indented_with_plain_labels_and_no_colon() {
     let rows = [("Bin", "~/bin".to_string()), ("Opt", "~/opt".into())];
-    assert_eq!(fields(Mode::PLAIN, &rows), "  Bin    ~/bin\n  Opt    ~/opt");
-    assert_eq!(fields(STYLED, &rows), "  Bin    ~/bin\n  Opt    ~/opt");
+    let expected = "  Bin         ~/bin\n  Opt         ~/opt";
+    assert_eq!(fields(Mode::PLAIN, &rows), expected);
+    assert_eq!(fields(STYLED, &rows), expected);
     assert_eq!(
         field(Mode::PLAIN, "Scope", "runtime\nsecond"),
         "  Scope           runtime\n                  second"
     );
+}
+
+#[test]
+fn field_labels_share_one_width_and_longer_labels_push_their_value() {
+    let short = fields(Mode::PLAIN, &[("Bin", "a".to_string())]);
+    let other = fields(Mode::PLAIN, &[("Service", "a".to_string())]);
+    assert_eq!(short.find('a'), Some(14));
+    assert_eq!(other.find('a'), Some(14));
+    assert_eq!(
+        fields(Mode::PLAIN, &[("Destination", "a".to_string())]),
+        "  Destination    a"
+    );
+}
+
+#[test]
+fn summary_labels_share_one_width_across_panels() {
+    let value_column = |label: &str| {
+        let panel =
+            Panel::flat("T", &["A"], &[row(&["a"])]).with_summary(&[(label, "value".to_string())]);
+        let text = panel.render(BOXED, Some(40));
+        let line = text.lines().find(|line| line.contains("value")).unwrap();
+        line.chars().take_while(|ch| *ch != 'v').count()
+    };
+    assert_eq!(value_column("Prefix"), value_column("Install"));
+    assert_eq!(value_column("Appdir"), value_column("Mark"));
 }
 
 #[test]

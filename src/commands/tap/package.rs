@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::domain::tap_manifest::{TapReceipt, parse_qualified};
 use crate::infra::store::{InstallLock, Store, reject_protected_prefix, stages_dir};
 use crate::infra::tap_artifact::stage_verified;
-use crate::ui::DnfStyleFormatter;
+use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::commit::{commit_install, commit_uninstall};
 use super::fsguard::verify_ancestor_dirs;
@@ -68,11 +68,11 @@ pub(crate) async fn install(
     }
 
     if dry_run {
-        ui.note("\nDry run: 1 change planned, nothing applied.");
+        ui.note(&format!("\n{}", phrases::dry_run_summary(1, 0)));
         return Ok(());
     }
     if config.general.confirm_operations && !yes && !confirm("Install 1 package?")? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("packages"));
         return Ok(());
     }
 
@@ -206,11 +206,11 @@ pub(crate) fn uninstall(
     }
 
     if dry_run {
-        ui.note("\nDry run: 1 change planned, nothing applied.");
+        ui.note(&format!("\n{}", phrases::dry_run_summary(1, 0)));
         return Ok(());
     }
     if config.general.confirm_operations && !yes && !confirm("Remove 1 package?")? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("packages"));
         return Ok(());
     }
 

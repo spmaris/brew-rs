@@ -12,8 +12,8 @@ use crate::infra::store::{
     Receipt, Store, reject_protected_prefix, validate_conflicts,
     validate_dependencies_with_retained, validate_retained_pin_closure,
 };
-use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::format::{formula_note, plural, upgraded_summary};
 use super::remove::removal_plan;
@@ -58,14 +58,14 @@ pub(crate) async fn upgrade(
         removal_plan(packages, &installed)?
     };
     if selected.is_empty() {
-        formatter.note("No packages installed yet.");
+        formatter.note(phrases::no_packages_installed());
         return Ok(false);
     }
 
     let (_, changes) = resolve_changes(config, &installed, &selected, &retained).await?;
     if changes.is_empty() {
         if announce_current {
-            formatter.note("All packages are up to date.");
+            formatter.note(phrases::all_packages_up_to_date());
         }
         return Ok(false);
     }
@@ -79,10 +79,7 @@ pub(crate) async fn upgrade(
     );
     if dry_run {
         let count = changes.len();
-        let noun = plural(count, "change", "changes");
-        formatter.note(&format!(
-            "\nDry run: {count} {noun} planned, nothing applied."
-        ));
+        formatter.note(&format!("\n{}", phrases::dry_run_summary(count, 0)));
         return Ok(true);
     }
     io::stdout().flush()?;
@@ -92,7 +89,7 @@ pub(crate) async fn upgrade(
         plural(changes.len(), "package", "packages")
     );
     if config.general.confirm_operations && !yes && !confirm(&question)? {
-        eprintln!("Cancelled. No packages changed.");
+        eprintln!("{}", phrases::cancelled("packages"));
         return Ok(true);
     }
 
@@ -171,7 +168,7 @@ pub(crate) async fn upgrade(
         .collect();
     let step = steps.start("Replacing installed versions");
     match store.upgrade(replacements) {
-        Ok(()) => step.done("Replaced old versions"),
+        Ok(()) => step.done("Replaced installed versions"),
         Err(error) => {
             step.fail();
             return Err(error.into());
@@ -189,12 +186,18 @@ pub(crate) async fn upgrade(
 /// This is the read-only counterpart of [`upgrade`]. It binds the prefix
 /// without creating or modifying it, resolves the same plan, applies the same
 /// eligibility and dependency-pin checks, and prints the same compact
-/// `Package`/`Installed`/`Available` table as the upgrade preview. It never
+/// `Package`/`Version`/`Source` table as the upgrade preview. It never
 /// downloads a bottle, stages a keg, writes a file, or invokes Homebrew.
 ///
 /// Returns `true` when at least one upgrade is available. An empty prefix, or
-/// one whose packages are all current, reports that and returns `false`.
-pub(crate) async fn check_updates(config: &Config, prefix: Option<&Path>) -> Result<bool> {
+/// one whose packages are all current, reports that (unless `announce_current`
+/// is off because the caller reports for formulae and casks together) and
+/// returns `false`.
+pub(crate) async fn check_updates(
+    config: &Config,
+    prefix: Option<&Path>,
+    announce_current: bool,
+) -> Result<bool> {
     if std::env::consts::OS != "macos" {
         bail!("Native upgrades are supported on macOS only");
     }
@@ -203,14 +206,16 @@ pub(crate) async fn check_updates(config: &Config, prefix: Option<&Path>) -> Res
     let installed = store.installed()?;
     let formatter = DnfStyleFormatter::new(config);
     if installed.is_empty() {
-        formatter.note("No packages installed yet.");
+        formatter.note(phrases::no_packages_installed());
         return Ok(false);
     }
     let retained = store.retained()?;
 
     let (_, changes) = resolve_changes(config, &installed, &installed, &retained).await?;
     if changes.is_empty() {
-        formatter.note("All packages are up to date.");
+        if announce_current {
+            formatter.note(phrases::all_packages_up_to_date());
+        }
         return Ok(false);
     }
     render_upgrade_preview(
@@ -425,10 +430,10 @@ pub(super) fn upgrade_plan<'a>(
         }
         let Some(new_scheme) = new.version_scheme else {
             bail!(
-                "Cannot upgrade {} natively: {}",
+                "Cannot upgrade {}: it {}.",
                 old.name,
                 if new.install_blockers.is_empty() {
-                    "unknown version scheme".into()
+                    "has an unknown version scheme".into()
                 } else {
                     new.install_blockers.join("; ")
                 }
@@ -436,7 +441,7 @@ pub(super) fn upgrade_plan<'a>(
         };
         if !new.install_blockers.is_empty() {
             bail!(
-                "Cannot upgrade {} natively: {}",
+                "Cannot upgrade {}: it {}.",
                 old.name,
                 new.install_blockers.join("; ")
             );

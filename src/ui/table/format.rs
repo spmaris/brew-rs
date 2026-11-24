@@ -55,15 +55,21 @@ pub(super) fn aligned_fields(rows: &[(&str, String)], min_width: usize) -> Strin
 /// Spaces between the widest label and its value.
 pub(super) const FIELD_GAP: usize = 4;
 
+/// Label width shared by panel summaries and result fields (`Bin`, `Next`,
+/// ...). A longer label pushes its value right instead of being cut.
+pub(super) const LABEL_WIDTH: usize = 8;
+
 /// One `  Label    value` line. Labels pad to a common minimum width so
-/// separate calls line up with each other.
+/// separate calls line up with each other. Labels are plain: dimming them
+/// loses contrast on dark themes.
 pub fn field(_mode: Mode, label: &str, value: &str) -> String {
     aligned_fields(&[(label, value.to_string())], 12)
 }
 
-/// A group of `  Label    value` lines aligned to each other.
+/// A group of `  Label    value` lines aligned to each other, with labels
+/// padded to the fixed [`LABEL_WIDTH`] so every command lines up the same.
 pub fn fields(_mode: Mode, rows: &[(&str, String)]) -> String {
-    aligned_fields(rows, 0)
+    aligned_fields(rows, LABEL_WIDTH)
 }
 
 /// A bold cyan `Summary` heading over aligned, labelled lines.
@@ -87,12 +93,46 @@ pub fn result(mode: Mode, text: &str) -> String {
     format!("{check}{text}")
 }
 
-/// Prefix of a runnable command inside an error hint.
-const RUNNABLE_COMMAND: &str = "brewrs ";
+/// Subcommands of `brewrs`; only these make a hint's `brewrs …` a command.
+const SUBCOMMANDS: &[&str] = &[
+    "install",
+    "remove",
+    "upgrade",
+    "autoremove",
+    "list",
+    "info",
+    "deps",
+    "search",
+    "shellenv",
+    "services",
+    "tap",
+    "untap",
+    "migrate",
+    "plan",
+    "fetch",
+    "check-update",
+    "update",
+    "clean",
+    "config",
+    "analytics",
+    "native",
+];
+
+/// Byte offset of the first `brewrs <subcommand>` in `line`, if any.
+fn command_start(line: &str) -> Option<usize> {
+    line.match_indices("brewrs ").find_map(|(index, _)| {
+        let word_start = line[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric() && before != '-');
+        let subcommand = line[index + "brewrs ".len()..].split_whitespace().next()?;
+        (word_start && SUBCOMMANDS.contains(&subcommand)).then_some(index)
+    })
+}
 
 /// `Error:` in bold red, then the message; hint lines are indented and keep
 /// any deeper indentation they carry. A hint that names a runnable command
-/// shows the command in bold, from its name to the end of the line.
+/// (`brewrs` plus a subcommand) shows it in bold to the end of the line.
 pub fn format_error(mode: Mode, message: &str) -> String {
     let mut lines = message.lines();
     let first = lines.next().unwrap_or_default();
@@ -102,7 +142,7 @@ pub fn format_error(mode: Mode, message: &str) -> String {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             out.push_str("  ");
         }
-        match line.find(RUNNABLE_COMMAND).filter(|_| mode.colored) {
+        match command_start(line).filter(|_| mode.colored) {
             Some(index) => {
                 let (before, command) = line.split_at(index);
                 out.push_str(before);

@@ -242,6 +242,23 @@ fn combined_removal_leaves_existing_orphans_and_their_dependencies() {
 }
 
 #[test]
+fn removal_reports_dependencies_it_leaves_unused() {
+    let installed = [
+        package_receipt("app", true, &["shared", "sole"]),
+        package_receipt("other", true, &["shared"]),
+        package_receipt("shared", false, &[]),
+        package_receipt("sole", false, &[]),
+    ];
+    let pending = planned_removals(&["app".into()], &installed, false, &[]).unwrap();
+    assert_eq!(
+        orphans_after_removal(&installed, &pending, &[]),
+        ["sole".to_string()]
+    );
+    let pending = planned_removals(&["other".into()], &installed, false, &[]).unwrap();
+    assert!(orphans_after_removal(&installed, &pending, &[]).is_empty());
+}
+
+#[test]
 fn explicitly_installing_a_dependency_plans_a_promotion_without_a_download() {
     let installed = [package_receipt("hello", false, &[])];
     let mut plan = [formula()];
@@ -517,7 +534,10 @@ fn install_explains_newer_versions_and_differing_pins() {
         .to_string();
     assert!(message.contains("hello 1.2 is installed"), "{message}");
     assert!(message.contains("1.3 is available"), "{message}");
-    assert!(message.contains("native upgrade"), "{message}");
+    assert!(
+        message.contains("Upgrade with: brewrs upgrade "),
+        "{message}"
+    );
 
     let mut available = formula();
     available.sha256 = "b".repeat(64);
@@ -577,7 +597,7 @@ fn upgrade_preview_accepts_retaining_an_exact_old_pin() {
 async fn check_updates_is_read_only_and_absent_for_an_empty_prefix() {
     let home = tempfile::tempdir().unwrap();
     let prefix = home.path().join("native");
-    let updates = check_updates(&Config::default(), Some(&prefix))
+    let updates = check_updates(&Config::default(), Some(&prefix), true)
         .await
         .unwrap();
     assert!(!updates);
@@ -683,7 +703,9 @@ fn blocked_target_with_catalog_entry_gets_an_upstream_hint() {
         .install_blockers
         .push("requires a fixed Homebrew prefix");
     let message = blocked_message(&[gettext, neovim]);
-    assert!(message.starts_with("Cannot install gettext natively: requires a fixed"));
+    assert!(message.starts_with(
+        "Cannot install neovim: its dependency gettext requires a fixed Homebrew prefix."
+    ));
     assert!(message.contains(
         "An official upstream build is available: brewrs install --source upstream neovim"
     ));
@@ -700,7 +722,7 @@ fn blocked_dependency_gets_a_reason_and_its_requested_dependents() {
         .to_string();
     assert_eq!(
         message,
-        "Cannot install lib natively: requires a fixed Homebrew prefix.\n  Homebrew built this bottle for /opt/homebrew only; brewrs installs into its own prefix, so this bottle can't be used.\n  Needed by: app"
+        "Cannot install app: its dependency lib requires a fixed Homebrew prefix.\n  Homebrew built this bottle for /opt/homebrew only, and brewrs installs into its own prefix, so it can't be used."
     );
 }
 
@@ -709,10 +731,7 @@ fn blocked_target_without_catalog_entry_gets_no_hint() {
     let mut tool = named("sometool", true, &[]);
     tool.install_blockers.push("needs relocation");
     let message = blocked_message(&[tool]);
-    assert_eq!(
-        message,
-        "Cannot install sometool natively: needs relocation."
-    );
+    assert_eq!(message, "Cannot install sometool: it needs relocation.");
 }
 
 #[test]

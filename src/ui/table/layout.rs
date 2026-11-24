@@ -4,7 +4,7 @@ use console::measure_text_width as cells;
 use ratatui::text::Line;
 
 use super::Panel;
-use super::format::{FIELD_GAP, clean_cell};
+use super::format::{FIELD_GAP, LABEL_WIDTH, clean_cell};
 use super::tone::style_line;
 
 pub(super) fn wrap_cell(cell: &str, width: usize) -> Vec<String> {
@@ -115,7 +115,8 @@ impl<'a> Panel<'a> {
             .iter()
             .map(|(label, _)| cells(label))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(LABEL_WIDTH);
         let value_offset = 2 + summary_label + FIELD_GAP;
         let inner = match width {
             Some(width) => floor.max(usize::from(width).saturating_sub(4)),

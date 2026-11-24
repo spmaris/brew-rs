@@ -53,85 +53,23 @@ pub(super) struct PackageKind {
 
 #[derive(Subcommand)]
 pub(super) enum Commands {
-    /// Alternate spelling for native package commands
-    #[command(hide = true)]
-    Native {
-        #[command(subcommand)]
-        action: NativeAction,
-    },
-
-    /// Audit a Homebrew installation without changing it
-    Migrate {
-        /// Absolute Homebrew prefix to inspect (otherwise use HOMEBREW_PREFIX or the platform default)
-        #[arg(long)]
-        brew_prefix: Option<PathBuf>,
-        /// Query official metadata for formula and dependency compatibility
-        #[arg(long)]
-        check: bool,
-        /// Inspect these launchd directories instead of the standard locations
-        #[arg(long = "service-dir", value_name = "DIR")]
-        service_dirs: Vec<PathBuf>,
-    },
-
-    /// Preview or list services for installed packages without starting them
-    Services {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
-
-    /// Register, inspect, plan, or install an explicit local third-party tap
-    Tap {
-        #[command(subcommand)]
-        action: TapAction,
-    },
-
-    /// Remove a third-party tap that has no installed packages
-    Untap {
-        /// Fully qualified tap, for example pproenca/tap
-        tap: String,
-    },
-
-    /// Print shell environment exports for this brewrs prefix
-    Shellenv {
-        /// Shell syntax to emit (defaults to $SHELL)
-        #[arg(long, value_parser = ["sh", "bash", "zsh", "fish"])]
-        shell: Option<String>,
-    },
-
-    /// Resolve a formula plan from Homebrew's repository without invoking brew
-    Plan {
-        #[arg(required = true)]
-        packages: Vec<String>,
-        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
-        #[arg(long)]
-        target: Option<String>,
-    },
-
-    /// Download and verify formula bottles without installing them
-    Fetch {
-        #[arg(required = true)]
-        packages: Vec<String>,
-        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
-        #[arg(long)]
-        target: Option<String>,
-    },
-
     /// Install formula bottles or supported casks into the brewrs prefix
     #[command(alias = "in")]
     Install {
+        /// Formula or cask names to install (aliases like nvim work)
         #[arg(required = true)]
         packages: Vec<String>,
         /// Target directory for installed cask .app bundles (defaults to <prefix>/Applications)
         #[arg(long, conflicts_with = "formula")]
         appdir: Option<PathBuf>,
         /// Force replacement (unsupported for portable bottle installs)
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         force: bool,
         /// Skip formula dependencies (unsupported)
-        #[arg(long, conflicts_with = "cask")]
+        #[arg(long, conflicts_with = "cask", hide = true)]
         no_deps: bool,
         /// Install from HEAD (unsupported; only stable bottles are supported)
-        #[arg(long, conflicts_with = "cask")]
+        #[arg(long, conflicts_with = "cask", hide = true)]
         head: bool,
         /// Package source: `homebrew` (default) or the reviewed official `upstream` build
         #[arg(long, value_enum, conflicts_with = "cask")]
@@ -145,6 +83,7 @@ pub(super) enum Commands {
     /// Remove packages from the brewrs prefix
     #[command(alias = "rm")]
     Remove {
+        /// Formula or cask names to remove (aliases like nvim work)
         #[arg(required = true)]
         packages: Vec<String>,
         /// Also remove newly unneeded dependencies
@@ -159,10 +98,37 @@ pub(super) enum Commands {
         transaction: Transaction,
     },
 
-    /// Remove formulae no longer needed as dependencies
-    Autoremove {
+    /// Upgrade installed packages
+    #[command(alias = "up")]
+    Upgrade {
+        /// Formula or cask names to upgrade (all if omitted)
+        packages: Vec<String>,
+        /// Include auto-updating casks
+        #[arg(short, long)]
+        greedy: bool,
+        #[command(flatten)]
+        kind: PackageKind,
         #[command(flatten)]
         transaction: Transaction,
+    },
+
+    /// List packages in the brewrs prefix
+    #[command(alias = "ls")]
+    List {
+        /// Show available updates instead of the installed inventory
+        #[arg(long, conflicts_with_all = ["sizes", "dates"])]
+        outdated: bool,
+        /// Include auto-updating casks when checking outdated packages
+        #[arg(short, long)]
+        greedy: bool,
+        /// Show disk usage (unsupported)
+        #[arg(long, hide = true)]
+        sizes: bool,
+        /// Show recorded install dates (unsupported)
+        #[arg(long, hide = true)]
+        dates: bool,
+        #[command(flatten)]
+        kind: PackageKind,
     },
 
     /// Search for packages by name or description
@@ -196,23 +162,21 @@ pub(super) enum Commands {
         kind: PackageKind,
     },
 
-    /// List packages in the brewrs prefix
-    #[command(alias = "ls")]
-    List {
-        /// Show available updates instead of the installed inventory
-        #[arg(long, conflicts_with_all = ["sizes", "dates"])]
-        outdated: bool,
-        /// Include auto-updating casks when checking outdated packages
-        #[arg(short, long)]
-        greedy: bool,
-        /// Show disk usage (unsupported)
+    /// Show formula dependencies or installed dependents
+    Deps {
+        package: String,
+        /// Show a dependency tree (recursive dependents with --reverse)
         #[arg(long)]
-        sizes: bool,
-        /// Show recorded install dates (unsupported)
+        tree: bool,
+        /// Show installed formulae that depend on this package
         #[arg(long)]
-        dates: bool,
+        reverse: bool,
+    },
+
+    /// Remove formulae no longer needed as dependencies
+    Autoremove {
         #[command(flatten)]
-        kind: PackageKind,
+        transaction: Transaction,
     },
 
     /// List available updates (exit 100 when updates are found)
@@ -225,17 +189,68 @@ pub(super) enum Commands {
         kind: PackageKind,
     },
 
-    /// Upgrade installed packages
-    #[command(alias = "up")]
-    Upgrade {
+    /// Print shell environment exports for this brewrs prefix
+    Shellenv {
+        /// Shell syntax to emit (defaults to $SHELL)
+        #[arg(long, value_parser = ["sh", "bash", "zsh", "fish"])]
+        shell: Option<String>,
+    },
+
+    /// Preview or list services for installed packages without starting them
+    Services {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
+    /// Register, inspect, plan, or install an explicit local third-party tap
+    Tap {
+        #[command(subcommand)]
+        action: TapAction,
+    },
+
+    /// Remove a third-party tap that has no installed packages
+    Untap {
+        /// Fully qualified tap, for example pproenca/tap
+        tap: String,
+    },
+
+    /// Resolve a formula plan from Homebrew's repository without invoking brew
+    Plan {
+        /// Formula names to plan (aliases like nvim work)
+        #[arg(required = true)]
         packages: Vec<String>,
-        /// Include auto-updating casks
-        #[arg(short, long)]
-        greedy: bool,
-        #[command(flatten)]
-        kind: PackageKind,
-        #[command(flatten)]
-        transaction: Transaction,
+        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Download and verify formula bottles without installing them
+    Fetch {
+        /// Formula names to download (aliases like nvim work)
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Override the Homebrew bottle platform tag (e.g. arm64_sequoia)
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Audit a Homebrew installation without changing it
+    Migrate {
+        /// Absolute Homebrew prefix to inspect (otherwise use HOMEBREW_PREFIX or the platform default)
+        #[arg(long)]
+        brew_prefix: Option<PathBuf>,
+        /// Query official metadata for formula and dependency compatibility
+        #[arg(long)]
+        check: bool,
+        /// Inspect these launchd directories instead of the standard locations
+        #[arg(long = "service-dir", value_name = "DIR")]
+        service_dirs: Vec<PathBuf>,
+    },
+
+    /// Show and modify configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
 
     /// Refresh the brewrs formula and cask catalogs
@@ -251,23 +266,6 @@ pub(super) enum Commands {
         dry_run: bool,
     },
 
-    /// Show and modify configuration
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-
-    /// Show formula dependencies or installed dependents
-    Deps {
-        package: String,
-        /// Show a dependency tree (recursive dependents with --reverse)
-        #[arg(long)]
-        tree: bool,
-        /// Show installed formulae that depend on this package
-        #[arg(long)]
-        reverse: bool,
-    },
-
     /// Show analytics and popularity data
     Analytics {
         package: Option<String>,
@@ -277,6 +275,13 @@ pub(super) enum Commands {
         /// Maximum results (global analytics only)
         #[arg(short, long, default_value_t = 20)]
         top: usize,
+    },
+
+    /// Alternate spelling for native package commands
+    #[command(hide = true)]
+    Native {
+        #[command(subcommand)]
+        action: NativeAction,
     },
 }
 
@@ -363,4 +368,40 @@ pub(super) enum ConfigAction {
     Set { key: String, value: String },
     /// Reset configuration to defaults
     Reset,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    fn help(args: &[&str]) -> String {
+        let mut command = Cli::command();
+        for arg in args {
+            command = command.find_subcommand(arg).unwrap().clone();
+        }
+        command.render_help().to_string()
+    }
+
+    #[test]
+    fn help_orders_commands_by_use_and_hides_unsupported_flags() {
+        let top = help(&[]);
+        let position = |name: &str| top.find(&format!("\n  {name} ")).unwrap();
+        assert!(position("install") < position("remove"));
+        assert!(position("remove") < position("migrate"));
+
+        let install = help(&["install"]);
+        assert!(!install.contains("--head"));
+        assert!(!install.contains("--no-deps"));
+        assert!(!install.contains("--force"));
+        assert!(install.contains("Formula or cask names to install"));
+        assert!(!help(&["list"]).contains("--sizes"));
+    }
+
+    #[test]
+    fn hidden_flags_still_parse() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["brewrs", "install", "--head", "--force", "jq"]).is_ok());
+    }
 }

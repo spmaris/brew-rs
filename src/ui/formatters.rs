@@ -38,7 +38,8 @@ impl DnfStyleFormatter {
     }
 
     /// One indented `Label    value` line (continuation lines align under the
-    /// value). Labels are dim, values normal.
+    /// value). Labels and values are both plain; dimming labels loses contrast on
+    /// dark themes.
     pub fn field(&self, label: &str, value: &str) -> String {
         table::field(self.mode, label, value)
     }
