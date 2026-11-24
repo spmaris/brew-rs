@@ -4,9 +4,44 @@
 
 This is an experimental package manager, not a drop-in Homebrew replacement.
 
+## Install
+
+### Prebuilt binary (Apple Silicon)
+
+Download the `aarch64-apple-darwin.tar.gz` archive and its `.sha256` file from [GitHub Releases](https://github.com/spmaris/brew-rs/releases). In the download directory, verify and install the archive (replace `v0.1.0` with the version you downloaded):
+
+```sh
+archive=brewrs-v0.1.0-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c "$archive.sha256" &&
+  tar -xzf "$archive" brewrs &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 0755 brewrs "$HOME/.local/bin/brewrs" &&
+  "$HOME/.local/bin/brewrs" --version
+```
+
+Add `~/.local/bin` to your `PATH` if needed. Building `brewrs` requires Rust; using the prebuilt executable does not. Bottle relocation requires the Apple Command Line Tools (`xcode-select --install` if needed). Homebrew is not required.
+
+### Build from source
+
+With [Rust](https://rustup.rs/) 1.85 or newer and the Apple Command Line Tools on macOS, install directly from GitHub:
+
+```sh
+cargo install --git https://github.com/spmaris/brew-rs.git --locked
+brewrs --version
+```
+
+If you already cloned the repository, run `cargo install --path . --locked` from its root. If `brewrs` isn’t found, add Cargo’s bin directory to your `PATH` (usually `~/.cargo/bin`).
+
+To put packages installed by brewrs on your `PATH` in zsh or Bash, run:
+
+```sh
+eval "$(brewrs shellenv)"
+brewrs install --dry-run ripgrep
+```
+
 ## Try it in a disposable prefix
 
-On macOS with Rust and the Apple Command Line Tools:
+From a local checkout on macOS:
 
 ```sh
 cargo build --release --locked
@@ -16,15 +51,6 @@ sh scripts/demo.sh
 The live demo previews, installs, and removes ripgrep using current official bottle metadata. It tests PCRE2 search and manpage discovery while keeping Homebrew off `PATH`. It uses a private home and prefix under `target/`, never starts a service, and prints where to inspect its files. Network access is required; it does not inherit proxy or config environment variables from the caller.
 
 Verified on Apple Silicon with macOS 15: ripgrep `16.0.0` and its PCRE2 dependency installed, a PCRE2 search matched, `man` found `rg.1`, and removal left no managed packages in the trial prefix.
-
-## Install
-
-With Rust 1.85 or newer, run from this repository:
-
-```sh
-cargo install --path . --locked
-brewrs --help
-```
 
 ## Everyday commands
 

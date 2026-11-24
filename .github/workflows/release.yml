@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test (Apple Silicon)
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: '1.97.1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag and runner
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(uname -m)" = arm64
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+
+      - name: Run release checks
+        run: |
+          cargo fetch --locked
+          sh scripts/verify.sh
+
+      - name: Package and verify executable
+        shell: bash
+        run: |
+          asset="brewrs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+          expected="brewrs ${GITHUB_REF_NAME#v}"
+          test "$(target/release/brewrs --version)" = "$expected"
+          /usr/bin/codesign --verify target/release/brewrs
+          mkdir -p target/release-assets
+          archive="$PWD/target/release-assets/$asset"
+          stage=$(mktemp -d)
+          /usr/bin/install -m 0755 target/release/brewrs "$stage/brewrs"
+          /usr/bin/install -m 0644 LICENSE "$stage/LICENSE"
+          COPYFILE_DISABLE=1 /usr/bin/tar -czf "$archive" -C "$stage" brewrs LICENSE
+          check=$(mktemp -d)
+          /usr/bin/tar -xzf "$archive" -C "$check"
+          test "$("$check/brewrs" --version)" = "$expected"
+          cd target/release-assets
+          /usr/bin/shasum -a 256 "$asset" > "$asset.sha256"
+          /usr/bin/shasum -a 256 -c "$asset.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apple-silicon-release
+          path: target/release-assets/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: apple-silicon-release
+          path: release-assets
+
+      - name: Publish verified archive and checksum
+        working-directory: release-assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          asset="brewrs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+          sha256sum -c "$asset.sha256"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "brewrs $GITHUB_REF_NAME" \
+            --generate-notes "$asset" "$asset.sha256"
