@@ -1,4 +1,18 @@
-use super::*;
+use std::fs;
+use std::path::Path;
+
+use crate::config::Config;
+use crate::domain::plan::{PackageSource, PlannedFormula};
+use crate::infra::store::{Dependency, Receipt};
+
+use super::add::*;
+use super::format::*;
+use super::pending::*;
+use super::remove::*;
+use super::shellenv::*;
+use super::sources::*;
+use super::stage::*;
+use super::upgrade::*;
 
 #[test]
 fn package_count_wording() {

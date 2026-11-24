@@ -1,5 +1,8 @@
-use super::*;
+use console::measure_text_width as cells;
+use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
+
+use super::*;
 
 const BOXED: Mode = Mode {
     colored: false,

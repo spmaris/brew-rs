@@ -1,6 +1,12 @@
-use super::*;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
+use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
+use tar::EntryType;
 use tempfile::tempdir;
+
+use super::limits::{MAX_DEPTH, MAX_FILE_BYTES, MAX_LINK_COMPONENTS, MAX_LINK_TARGET_BYTES};
+use super::*;
 
 const NAME: &str = "hello";
 const VERSION: &str = "2.12.1";

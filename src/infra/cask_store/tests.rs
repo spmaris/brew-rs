@@ -1,4 +1,6 @@
 use super::*;
+use crate::infra::cask_extract::StagedCaskLink;
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use tempfile::tempdir;
 

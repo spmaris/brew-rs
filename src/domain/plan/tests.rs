@@ -1,4 +1,21 @@
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+
+use super::macos::{MacosVersion, parse_macos_version};
+use super::node::{BLOCKER_POUR_BOTTLE_ONLY, BLOCKER_RECOMMENDED_DEPENDENCY};
+use super::requirements::{
+    BLOCKER_REQUIREMENTS_ARCH, BLOCKER_REQUIREMENTS_PLATFORM, BLOCKER_REQUIREMENTS_SHAPE,
+    BLOCKER_REQUIREMENTS_VERSION,
+};
+use super::service::BLOCKER_SERVICE;
+use super::uses_from_macos::{
+    BLOCKER_USES_FROM_MACOS_DEPENDENCY, BLOCKER_USES_FROM_MACOS_PLATFORM,
+    BLOCKER_USES_FROM_MACOS_SCOPING, BLOCKER_USES_FROM_MACOS_SHAPE,
+};
+use super::validate::CORE_TAP;
 use super::*;
+use crate::domain::plan_error::ApiFailure;
 
 const TAG: &str = "arm64_sequoia";
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

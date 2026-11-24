@@ -1,6 +1,17 @@
-use super::*;
-use crate::config::Config;
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::domain::tap_manifest::{TapReceipt, host_arch};
+use crate::infra::store::{InstallLock, Store, stages_dir};
+use crate::infra::tap_artifact::stage_verified;
+
+use super::commit::*;
+use super::selection::*;
+use super::state::*;
+use super::verify::*;
+use super::*;
 
 const TAP: &str = "owner/tap";
 

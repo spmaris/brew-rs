@@ -1,3 +1,4 @@
+use super::super::paths::Paths;
 use super::*;
 use crate::infra::store::{Dependency, Receipt};
 use std::fs;

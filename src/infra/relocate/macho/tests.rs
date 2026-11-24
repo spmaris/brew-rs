@@ -1,3 +1,9 @@
+use super::apply::{compare_rewrite, signing_arguments, verify_stage};
+use super::constants::*;
+use super::fat::{FAT_CIGAM_BYTES, FAT_MAGIC_64_BYTES, FAT_MAGIC_BYTES};
+use super::model::{Kind, Parsed};
+use super::parse::{MACH_HEADER_64_BYTES, MAX_LOAD_COMMANDS, validate_name};
+use super::rewrite_plan::{Change, Plan, scan_markers};
 use super::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

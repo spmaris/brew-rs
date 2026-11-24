@@ -1,5 +1,11 @@
+use super::paths::{cellar_dir, opt_dir, receipts_dir, sbin_dir};
+use super::receipt::{encode_receipt, is_safe_bin_name, is_safe_package_name, replace_receipt};
 use super::*;
+use crate::domain::plan::PackageSource;
+use crate::domain::validate::{is_lower_hex_digest, is_safe_version};
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use tempfile::{TempDir, tempdir};
 
 fn digest() -> String {
