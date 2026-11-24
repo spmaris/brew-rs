@@ -142,7 +142,7 @@ enum Commands {
         head: bool,
         /// Package source: `homebrew` (default) or the reviewed official `upstream` build
         #[arg(long, value_enum, conflicts_with = "cask")]
-        source: Option<crate::native::install::SourceFlag>,
+        source: Option<crate::commands::install::SourceFlag>,
         #[command(flatten)]
         kind: PackageKind,
         #[command(flatten)]
@@ -295,7 +295,7 @@ enum NativeAction {
         packages: Vec<String>,
         /// Package source: `homebrew` (default) or the reviewed official `upstream` build
         #[arg(long, value_enum)]
-        source: Option<crate::native::install::SourceFlag>,
+        source: Option<crate::commands::install::SourceFlag>,
         #[command(flatten)]
         transaction: Transaction,
     },
@@ -404,7 +404,7 @@ impl Cli {
             ConfigEditor::set_parallel_downloads(&mut config, parallel)?;
         }
         let prefix = self.prefix.as_deref();
-        use crate::native::install as native;
+        use crate::commands::install as native;
 
         match self.command {
             Commands::Native { action } => match action {
@@ -461,7 +461,7 @@ impl Cli {
                 check,
                 service_dirs,
             } => {
-                crate::native::migration::audit(
+                crate::commands::migration::audit(
                     &config,
                     prefix,
                     brew_prefix.as_deref(),
@@ -472,25 +472,25 @@ impl Cli {
             }
             Commands::Services { action } => match action {
                 ServiceAction::Plan { package } => {
-                    crate::native::services::preview(&config, prefix, &package).await?;
+                    crate::commands::services::preview(&config, prefix, &package).await?;
                 }
                 ServiceAction::List => {
-                    crate::native::services::list(&config, prefix)?;
+                    crate::commands::services::list(&config, prefix)?;
                 }
             },
             Commands::Tap { action } => match action {
                 TapAction::Add { tap, manifest } => {
-                    crate::native::tap::add(&config, prefix, &tap, &manifest)?;
+                    crate::commands::tap::add(&config, prefix, &tap, &manifest)?;
                 }
-                TapAction::List => crate::native::tap::list(&config, prefix)?,
+                TapAction::List => crate::commands::tap::list(&config, prefix)?,
                 TapAction::Plan { package } => {
-                    crate::native::tap::plan(&config, prefix, &package)?;
+                    crate::commands::tap::plan(&config, prefix, &package)?;
                 }
                 TapAction::Install {
                     package,
                     transaction,
                 } => {
-                    crate::native::tap::install(
+                    crate::commands::tap::install(
                         &config,
                         prefix,
                         &package,
@@ -503,7 +503,7 @@ impl Cli {
                     package,
                     transaction,
                 } => {
-                    crate::native::tap::uninstall(
+                    crate::commands::tap::uninstall(
                         &config,
                         prefix,
                         &package,
@@ -513,16 +513,16 @@ impl Cli {
                 }
             },
             Commands::Untap { tap } => {
-                crate::native::tap::untap(&config, prefix, &tap)?;
+                crate::commands::tap::untap(&config, prefix, &tap)?;
             }
             Commands::Shellenv { shell } => {
                 native::shellenv(prefix, shell.as_deref())?;
             }
             Commands::Plan { packages, target } => {
-                crate::native::run(&config, &packages, target.as_deref(), false).await?;
+                crate::commands::run(&config, &packages, target.as_deref(), false).await?;
             }
             Commands::Fetch { packages, target } => {
-                crate::native::run(&config, &packages, target.as_deref(), true).await?;
+                crate::commands::run(&config, &packages, target.as_deref(), true).await?;
             }
             Commands::Install {
                 packages,
@@ -540,7 +540,7 @@ impl Cli {
                     (force, "--force"),
                 ])?;
                 if kind.cask {
-                    crate::native::cask_install::install(
+                    crate::commands::casks::install(
                         &config,
                         prefix,
                         appdir.as_deref(),
@@ -575,7 +575,7 @@ impl Cli {
                     if autoremove {
                         bail!("--autoremove is not supported with --cask; no changes were made.");
                     }
-                    crate::native::cask_install::remove(
+                    crate::commands::casks::remove(
                         &config,
                         prefix,
                         &packages,
@@ -603,7 +603,7 @@ impl Cli {
                 offline,
                 refresh,
             } => {
-                use crate::api::CachePolicy;
+                use crate::infra::api::CachePolicy;
                 let policy = if offline {
                     CachePolicy::Offline
                 } else if refresh {
@@ -619,7 +619,7 @@ impl Cli {
                 deps,
                 kind,
             } => {
-                crate::native::info::info(
+                crate::commands::info::info(
                     &config,
                     prefix,
                     &package,
@@ -691,7 +691,7 @@ impl Cli {
                 tree,
                 reverse,
             } => {
-                crate::native::deps::deps(&config, prefix, &package, tree, reverse).await?;
+                crate::commands::deps::deps(&config, prefix, &package, tree, reverse).await?;
             }
             Commands::Analytics {
                 package,
@@ -699,7 +699,7 @@ impl Cli {
                 top,
             } => {
                 if let Some(package) = package {
-                    crate::native::info::analytics(&config, &package, &period).await?;
+                    crate::commands::info::analytics(&config, &package, &period).await?;
                 } else {
                     handlers::handle_analytics(config, period, top).await?;
                 }

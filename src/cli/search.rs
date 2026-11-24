@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
-use crate::api::catalog_cache::{self, CachePolicy};
-use crate::api::{BrewApiClient, Cask, Formula};
 use crate::config::Config;
+use crate::infra::api::catalog_cache::{self, CachePolicy};
+use crate::infra::api::{BrewApiClient, Cask, Formula};
 use crate::ui::{DnfStyleFormatter, ProgressManager};
 
 /// Package families a search is allowed to return.

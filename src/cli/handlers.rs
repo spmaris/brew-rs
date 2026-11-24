@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 
-use crate::api::{AnalyticsItem, BrewApiClient};
-use crate::cache::CacheManager;
 use crate::cli::ConfigAction;
 use crate::config::{Config, ConfigEditor, ConfigLoader};
+use crate::infra::api::{AnalyticsItem, BrewApiClient};
+use crate::infra::cache::CacheManager;
 use crate::ui::DnfStyleFormatter;
 
 /// Refresh the local search catalogs from the native API.
 pub async fn refresh_catalogs(config: &Config) -> Result<()> {
-    use crate::api::{CachePolicy, catalog_cache};
+    use crate::infra::api::{CachePolicy, catalog_cache};
 
     let client = BrewApiClient::new(config)?;
     let (formulae, casks) = tokio::try_join!(
@@ -52,7 +52,7 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
         return Ok(());
     }
 
-    let (catalog_files, catalog_bytes) = crate::api::clean_catalogs(&config, all).await?;
+    let (catalog_files, catalog_bytes) = crate::infra::api::clean_catalogs(&config, all).await?;
     let bottles = if all {
         cache.clean_all().await?
     } else {

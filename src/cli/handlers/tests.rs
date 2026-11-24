@@ -1,6 +1,6 @@
 use super::{analytics_days, analytics_rows, handle_clean};
-use crate::api::AnalyticsItem;
 use crate::config::Config;
+use crate::infra::api::AnalyticsItem;
 use anyhow::Result;
 use std::fs;
 use std::path::Path;

@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), deny(warnings))]
 
-mod api;
-mod cache;
 mod cli;
+mod commands;
 mod config;
-mod native;
+mod domain;
+mod infra;
 mod ui;
 
 use std::process::ExitCode;
