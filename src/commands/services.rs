@@ -18,6 +18,8 @@ use crate::{config::Config, ui::DnfStyleFormatter};
 
 use super::install::prefix_path;
 use crate::domain::plan::{self, InstalledServiceMetadata};
+use crate::infra::formula_source::fetch_installed_service;
+use crate::infra::platform::default_target;
 use crate::infra::store::{Receipt, Store, validate_dependencies_with_retained};
 
 // Flags were checked against the Colima 0.10.3 start command. The preview is
@@ -190,11 +192,11 @@ async fn preview_formula(config: &Config, prefix: Option<&Path>, requested: &str
         .iter()
         .find(|receipt| receipt.name == requested)
         .with_context(|| format!("'{requested}' is not installed in this brewrs prefix"))?;
-    let tag = crate::domain::plan::default_target()?;
+    let tag = default_target()?;
     if !plan::is_supported_macos_tag(&tag) {
         bail!("Service previews are only supported on a macOS host tag, not '{tag}'");
     }
-    let metadata = plan::fetch_installed_service(
+    let metadata = fetch_installed_service(
         config,
         &receipt.name,
         &tag,

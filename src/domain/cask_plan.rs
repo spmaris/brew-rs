@@ -26,18 +26,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::config::Config;
-use crate::infra::api::catalog_cache;
-use crate::infra::api::http_client::{HttpClient, is_not_found};
-
 use super::plan::{
     arch_for_tag, is_supported_macos_tag, macos_version_for_tag, parse_macos_version_or_codename,
 };
-use crate::infra::cask_download::validate_cask_url;
-use crate::infra::download::is_lower_hex_digest;
+use super::validate::{is_lower_hex_digest, validate_cask_url};
 
-/// Official Homebrew cask API base.
-const API_BASE: &str = "https://formulae.brew.sh/api";
 /// Official cask tap supported by the native backend.
 const CASK_TAP: &str = "homebrew/cask";
 /// Maximum cask targets accepted in one invocation.
@@ -193,77 +186,14 @@ pub(crate) fn validate_cask_identifier<'a>(value: &'a str, what: &str) -> Result
     Ok(value)
 }
 
-/// Resolve cask install plans for `targets` on host tag `tag`.
-pub(crate) async fn resolve(
-    config: &Config,
-    targets: &[String],
-    tag: &str,
-) -> Result<Vec<PlannedCask>> {
-    let source = HttpCaskSource {
-        http: HttpClient::new(config)?,
-        alias_config: Some(config.clone()),
-    };
-    resolve_with(&source, targets, tag).await
-}
-
-/// Read-only cask planner reused across `migrate --check`.
-pub(crate) struct AuditCaskPlanner {
-    source: HttpCaskSource,
-}
-
-impl AuditCaskPlanner {
-    pub(crate) fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            source: HttpCaskSource {
-                http: HttpClient::new(config)?,
-                alias_config: None,
-            },
-        })
-    }
-
-    pub(crate) async fn resolve_one(&self, token: &str, tag: &str) -> Result<PlannedCask> {
-        let mut plan = resolve_with(&self.source, &[token.to_string()], tag).await?;
-        plan.pop()
-            .context("cask planner returned an empty plan for one target")
-    }
-}
-
-trait CaskSource {
+/// A source of cask metadata: the port the resolver reads through.
+pub(crate) trait CaskSource {
     async fn fetch_cask(&self, token: &str) -> Result<Value>;
 }
 
-struct HttpCaskSource {
-    http: HttpClient,
-    alias_config: Option<Config>,
-}
-
-impl CaskSource for HttpCaskSource {
-    async fn fetch_cask(&self, token: &str) -> Result<Value> {
-        let url = format!("{API_BASE}/cask/{token}.json");
-        match self.http.fetch_json(&url).await {
-            Ok(payload) => Ok(payload),
-            Err(error) => {
-                if is_not_found(&error)
-                    && let Some(config) = &self.alias_config
-                    && let Ok(Some(canonical)) =
-                        catalog_cache::resolve_cask_old_token(config, token).await
-                    && !canonical.contains('/')
-                    && validate_cask_identifier(&canonical, "cask old_token").is_ok()
-                {
-                    let alias_url = format!("{API_BASE}/cask/{canonical}.json");
-                    return self.http.fetch_json(&alias_url).await.with_context(|| {
-                                    format!(
-                                        "failed to fetch cask '{canonical}' (resolved from '{token}') from {alias_url}"
-                                    )
-                                });
-                }
-                Err(error).with_context(|| format!("failed to fetch cask '{token}' from {url}"))
-            }
-        }
-    }
-}
-
-async fn resolve_with<S: CaskSource>(
+/// Resolve cask install plans for `targets` on host tag `tag`, reading
+/// metadata through `source`.
+pub(crate) async fn resolve_with<S: CaskSource>(
     source: &S,
     targets: &[String],
     tag: &str,

@@ -16,13 +16,14 @@ use crate::{
 
 use crate::domain::plan::PlannedFormula;
 pub(crate) use crate::domain::plan::SourceFlag;
-use crate::domain::plan::{self, default_target};
+use crate::domain::plan::{self, PackageSource};
 use crate::domain::portable::Catalog;
+use crate::infra::platform::default_target;
 use crate::infra::store::{
-    Dependency, PackageSource, Prepared, Receipt, Store, validate_conflicts,
-    validate_dependencies_with_retained, validate_retained_pin_closure,
+    Dependency, Prepared, Receipt, Store, validate_conflicts, validate_dependencies_with_retained,
+    validate_retained_pin_closure,
 };
-use crate::infra::{archive, download, relocate};
+use crate::infra::{archive, download, portable_fetch, relocate};
 
 pub(crate) async fn install(
     config: &Config,
@@ -61,7 +62,7 @@ pub(crate) async fn install(
         Some(SourceFlag::Upstream) => {
             crate::domain::portable::catalog()?.plan_targets(packages, &tag)?
         }
-        Some(SourceFlag::Homebrew) | None => plan::resolve(config, packages, &tag).await?,
+        Some(SourceFlag::Homebrew) | None => super::plan::resolve(config, packages, &tag).await?,
     };
     validate_sources(&plan, &existing)?;
     let pending = pending_packages(&plan, &existing, &retained).map_err(|error| {
@@ -582,7 +583,7 @@ fn requested_promotions(plan: &[PlannedFormula], installed: &[Receipt]) -> Vec<R
 
 pub(super) async fn fetch_formula(config: &Config, formula: &PlannedFormula) -> Result<PathBuf> {
     let download = match formula.source {
-        PackageSource::Upstream => crate::domain::portable::fetch(config, formula).await,
+        PackageSource::Upstream => portable_fetch::fetch(config, formula).await,
         PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256).await,
     };
     download.with_context(|| format!("Failed to fetch {} {}", formula.name, formula.version))
@@ -611,16 +612,13 @@ fn stage_formula(store: &Store, candidate: Candidate<'_>, bottle: &Path) -> Resu
     let stage = store.stage()?;
     let receipt = candidate.receipt;
     match candidate.formula.source {
-        PackageSource::Upstream => {
-            crate::domain::portable::stage(candidate.formula, bottle, stage.path()).with_context(
-                || {
-                    format!(
-                        "Failed to stage upstream {} {}",
-                        receipt.name, receipt.version
-                    )
-                },
-            )?
-        }
+        PackageSource::Upstream => portable_fetch::stage(candidate.formula, bottle, stage.path())
+            .with_context(|| {
+            format!(
+                "Failed to stage upstream {} {}",
+                receipt.name, receipt.version
+            )
+        })?,
         PackageSource::Homebrew => archive::unpack(
             bottle,
             stage.path(),
@@ -972,7 +970,7 @@ async fn resolve_changes(
             .context("Cannot plan upgrades for upstream-installed packages")?
     };
     if !homebrew.is_empty() {
-        plan.extend(plan::resolve(config, &homebrew, &tag).await?);
+        plan.extend(super::plan::resolve(config, &homebrew, &tag).await?);
     }
     validate_sources(&plan, installed)?;
     let changes = planned_changes(&plan, installed, selected, retained)?;

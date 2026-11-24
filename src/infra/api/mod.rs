@@ -1,3 +1,6 @@
+/// Official Homebrew formula and cask API base.
+pub(crate) const API_BASE: &str = "https://formulae.brew.sh/api";
+
 pub mod brew_client;
 pub mod catalog_cache;
 pub mod http_client;

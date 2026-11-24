@@ -1,6 +1,6 @@
 //! Native install planning for `homebrew/core`.
 //!
-//! [`resolve`] turns a list of requested formula names into a dependency-first
+//! [`resolve_with`] turns a list of requested formula names into a dependency-first
 //! plan built exclusively from the official Homebrew formula API:
 //! `https://formulae.brew.sh/api/formula/<name>.json`. It never runs `brew`,
 //! never evaluates Ruby, never writes a file, and never extracts an archive.
@@ -71,18 +71,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::Config;
-use crate::infra::api::catalog_cache;
-use crate::infra::api::http_client::{HttpClient, is_not_found};
+use super::plan_error::{ApiFailure, api_failure, from_fetch_error};
 
-use crate::infra::store::PackageSource;
-use crate::ui::errors;
-
-/// Official Homebrew formula API base.
-pub(crate) const API_BASE: &str = "https://formulae.brew.sh/api";
 /// Tap supported by this planner.
 const CORE_TAP: &str = "homebrew/core";
 /// Host that serves official Homebrew bottles.
@@ -207,6 +200,25 @@ pub enum SourceFlag {
     Upstream,
 }
 
+/// The source used for installation and retained for future upgrades.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSource {
+    #[default]
+    Homebrew,
+    Upstream,
+}
+
+impl PackageSource {
+    /// Human-readable name used in user-facing messages.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Homebrew => "Homebrew",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
 /// One formula in a native install plan.
 ///
 /// `name` is the canonical API name, `version` is the stable version with the
@@ -235,64 +247,18 @@ pub struct PlannedFormula {
     pub source: PackageSource,
 }
 
-/// Build a native install plan for `targets` on host tag `tag`.
-///
-/// Targets are bare canonical formula names, or `homebrew/core/<name>`; any
-/// other tap is rejected. `tag` is a Homebrew bottle platform key such as
-/// `arm64_sequoia`, `x86_64_linux`, or `arm64_linux`. The returned vector is
-/// dependency-first, stable for the same inputs and API payload, and contains
-/// each canonical formula once.
-///
-/// # Errors
-///
-/// Returns an error for an unsafe target or tag, an unsupported tap, a missing
-/// formula, a disabled or source-only formula, a formula without a bottle for
-/// `tag`, malformed metadata, a dependency cycle, or an over-large graph.
-pub async fn resolve(
-    config: &Config,
-    targets: &[String],
-    tag: &str,
-) -> anyhow::Result<Vec<PlannedFormula>> {
-    let source = HttpFormulaSource {
-        http: HttpClient::new(config)?,
-        alias_config: Some(config.clone()),
-    };
-    match resolve_with(&source, targets, tag).await {
-        Ok(plan) => Ok(plan),
-        Err(error) => Err(errors::add_hints_online(error, config).await),
-    }
-}
-
-/// A read-only audit reuses metadata across independently resolved formulae.
-/// The cache is scoped to one audit; readiness never writes a metadata cache.
-pub(crate) struct AuditPlanner {
-    source: Memoized<HttpFormulaSource>,
-}
-
-impl AuditPlanner {
-    pub(crate) fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            source: Memoized::new(HttpFormulaSource {
-                http: HttpClient::new(config)?,
-                alias_config: None,
-            }),
-        })
-    }
-
-    pub(crate) async fn resolve(&self, name: &str, tag: &str) -> Result<Vec<PlannedFormula>> {
-        resolve_with(&self.source, &[name.into()], tag).await
-    }
-}
-
 const MAX_AUDIT_REQUESTS: usize = 512;
 
-struct Memoized<S> {
+/// A [`FormulaSource`] that reuses metadata across independently resolved
+/// formulae. The cache is scoped to one audit; readiness never writes a
+/// metadata cache.
+pub(crate) struct Memoized<S> {
     source: S,
     cached: std::cell::RefCell<HashMap<String, std::result::Result<FormulaResponse, String>>>,
 }
 
 impl<S> Memoized<S> {
-    fn new(source: S) -> Self {
+    pub(crate) fn new(source: S) -> Self {
         Self {
             source,
             cached: Default::default(),
@@ -309,7 +275,7 @@ impl<S: FormulaSource> FormulaSource for Memoized<S> {
             bail!("Migration audit exceeded the {MAX_AUDIT_REQUESTS}-request metadata budget");
         }
         let answer = self.source.fetch(name).await.map_err(|error| {
-            if is_not_found(&error) {
+            if api_failure(&error) == Some(ApiFailure::NotFound) {
                 format!(
                     "No current official formula record for '{name}' (HTTP 404). It may have been renamed or removed; this audit does not resolve aliases."
                 )
@@ -322,46 +288,17 @@ impl<S: FormulaSource> FormulaSource for Memoized<S> {
     }
 }
 
-/// A source of formula metadata, kept as a seam for offline fixture tests.
-trait FormulaSource {
+/// A source of formula metadata: the port the resolver reads through.
+///
+/// Implementations report transport failures as an [`ApiFailure`] in the error
+/// chain so the planner can render them without knowing the transport.
+pub(crate) trait FormulaSource {
     async fn fetch(&self, name: &str) -> Result<FormulaResponse>;
-}
-
-/// [`FormulaSource`] backed by the official API over [`HttpClient`].
-struct HttpFormulaSource {
-    http: HttpClient,
-    alias_config: Option<Config>,
-}
-
-impl FormulaSource for HttpFormulaSource {
-    async fn fetch(&self, name: &str) -> Result<FormulaResponse> {
-        let url = format!("{API_BASE}/formula/{name}.json");
-        match self.http.fetch_json(&url).await {
-            Ok(payload) => Ok(payload),
-            Err(error) => {
-                if is_not_found(&error)
-                    && let Some(config) = &self.alias_config
-                    && let Ok(Some(canonical)) =
-                        catalog_cache::resolve_formula_alias(config, name).await
-                    && validate_formula_name(&canonical, "alias target").is_ok()
-                {
-                    let alias_url = format!("{API_BASE}/formula/{canonical}.json");
-                    return self.http.fetch_json(&alias_url).await.with_context(|| {
-                        format!(
-                            "failed to fetch formula '{canonical}' (resolved from alias '{name}')"
-                        )
-                    });
-                }
-                log::debug!("GET {url} failed: {error:#}");
-                Err(error).with_context(|| format!("failed to fetch formula '{name}'"))
-            }
-        }
-    }
 }
 
 /// Service metadata for an installed formula, pinned to its receipt.
 ///
-/// [`fetch_installed_service`] only returns after the official payload has been
+/// The infrastructure layer's `fetch_installed_service` only returns after the official payload has been
 /// proven to describe exactly the installed artifact, so a preview can never
 /// render a declaration that belongs to another version or bottle.
 pub(crate) struct InstalledServiceMetadata {
@@ -370,33 +307,24 @@ pub(crate) struct InstalledServiceMetadata {
     pub service: serde_json::Value,
 }
 
-/// Fetch official metadata for `name` and require it to describe exactly the
-/// installed receipt.
+/// Require official metadata for `name` (already validated with
+/// [`validate_formula_name`]) to describe exactly the installed receipt.
 ///
-/// This is a read-only metadata query. It deliberately bypasses alias
-/// resolution and the catalog cache, so rendering a preview never populates or
-/// mutates a cache. The tap, stable version (including the `_<revision>`
-/// suffix), version scheme, and selected bottle digest must all equal the
-/// installed values. Bottle selection follows the planner: the host tag first,
-/// then Homebrew's platform-independent `all` bottle. A service declaration is
+/// This is a read-only check of a payload fetched without alias resolution or
+/// the catalog cache, so rendering a preview never populates or mutates a
+/// cache. The tap, stable version (including the `_<revision>` suffix),
+/// version scheme, and selected bottle digest must all equal the installed
+/// values. Bottle selection follows the planner: the host tag first, then
+/// Homebrew's platform-independent `all` bottle. A service declaration is
 /// returned only when the existing optional-macOS-service review accepts it.
-pub(crate) async fn fetch_installed_service(
-    config: &Config,
+pub(crate) fn verify_installed_service(
+    response: FormulaResponse,
     name: &str,
     tag: &str,
     installed_version: &str,
     installed_version_scheme: u32,
     installed_sha256: &str,
 ) -> Result<InstalledServiceMetadata> {
-    validate_tag(tag)?;
-    let name = validate_formula_name(name, "service formula name")?;
-    let http = HttpClient::new(config)?;
-    let url = format!("{API_BASE}/formula/{name}.json");
-    let response: FormulaResponse = http
-        .fetch_json(&url)
-        .await
-        .with_context(|| format!("failed to fetch formula '{name}' from {url}"))?;
-
     let canonical = validate_formula_name(&response.name, "formula name")?;
     if canonical != name {
         bail!(
@@ -477,8 +405,21 @@ pub(crate) async fn fetch_installed_service(
     })
 }
 
-/// Resolve the plan through an arbitrary [`FormulaSource`].
-async fn resolve_with<S: FormulaSource>(
+/// Build a native install plan for `targets` on host tag `tag`, reading
+/// formula metadata through `source`.
+///
+/// Targets are bare canonical formula names, or `homebrew/core/<name>`; any
+/// other tap is rejected. `tag` is a Homebrew bottle platform key such as
+/// `arm64_sequoia`, `x86_64_linux`, or `arm64_linux`. The returned vector is
+/// dependency-first, stable for the same inputs and API payload, and contains
+/// each canonical formula once.
+///
+/// # Errors
+///
+/// Returns an error for an unsafe target or tag, an unsupported tap, a missing
+/// formula, a disabled or source-only formula, a formula without a bottle for
+/// `tag`, malformed metadata, a dependency cycle, or an over-large graph.
+pub(crate) async fn resolve_with<S: FormulaSource>(
     source: &S,
     targets: &[String],
     tag: &str,
@@ -527,7 +468,7 @@ async fn resolve_with<S: FormulaSource>(
         let response = match source.fetch(&requested).await {
             Ok(response) => response,
             Err(error) => {
-                return Err(errors::from_fetch_error(
+                return Err(from_fetch_error(
                     error,
                     &requested,
                     target_taps.get(&requested).map(String::as_str),
@@ -915,7 +856,7 @@ pub(crate) fn parse_target(raw: &str) -> Result<&str> {
 }
 
 /// Validate a host tag: lowercase ASCII, digits and underscores only.
-fn validate_tag(tag: &str) -> Result<()> {
+pub(crate) fn validate_tag(tag: &str) -> Result<()> {
     if tag.is_empty() || tag.len() > MAX_TAG_LEN {
         bail!("host tag must be between 1 and {MAX_TAG_LEN} characters");
     }
@@ -933,7 +874,7 @@ fn validate_tag(tag: &str) -> Result<()> {
 }
 
 /// Validate a Homebrew formula identifier and return it unchanged.
-fn validate_formula_name<'a>(value: &'a str, what: &str) -> Result<&'a str> {
+pub(crate) fn validate_formula_name<'a>(value: &'a str, what: &str) -> Result<&'a str> {
     if value.is_empty() || value.len() > MAX_NAME_LEN {
         bail!("{what} '{value}' must be between 1 and {MAX_NAME_LEN} characters");
     }
@@ -1494,7 +1435,7 @@ pub(super) fn macos_version_for_tag(tag: &str) -> Option<MacosVersion> {
 
 /// The subset of the official formula payload used by the planner.
 #[derive(Clone, Debug, Deserialize)]
-struct FormulaResponse {
+pub(crate) struct FormulaResponse {
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -1572,31 +1513,7 @@ struct BottleFile {
     sha256: String,
 }
 
-pub(crate) fn default_target() -> Result<String> {
-    let arch = std::env::consts::ARCH;
-    match std::env::consts::OS {
-        "linux" if matches!(arch, "aarch64" | "x86_64") => Ok(if arch == "aarch64" {
-            "arm64_linux"
-        } else {
-            "x86_64_linux"
-        }
-        .into()),
-        "macos" => {
-            let version = std::process::Command::new("/usr/bin/sw_vers")
-                .arg("-productVersion")
-                .output()
-                .context("Could not detect macOS version; pass --target")?;
-            if !version.status.success() {
-                bail!("Could not detect macOS version; pass --target");
-            }
-            let version = std::str::from_utf8(&version.stdout).context("Invalid macOS version")?;
-            macos_tag(arch, version.trim())
-        }
-        _ => bail!("No default Homebrew bottle tag for this platform; pass --target"),
-    }
-}
-
-fn macos_tag(arch: &str, version: &str) -> Result<String> {
+pub(crate) fn macos_tag(arch: &str, version: &str) -> Result<String> {
     let release = match version.split('.').next() {
         Some("11") => "big_sur",
         Some("12") => "monterey",

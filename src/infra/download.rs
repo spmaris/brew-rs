@@ -24,6 +24,7 @@ use reqwest::{Client, Response, StatusCode};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::domain::validate::is_lower_hex_digest;
 
 /// Origin that hosts official Homebrew bottles.
 const GHCR_ORIGIN: &str = "https://ghcr.io";
@@ -169,14 +170,6 @@ fn parse_bottle_url(url: &str, sha256: &str) -> Result<BottleSource> {
         url: format!("{GHCR_ORIGIN}{BOTTLE_PATH_PREFIX}{repository_path}/blobs/sha256:{digest}"),
         digest,
     })
-}
-
-/// Whether `value` is exactly 64 lowercase hexadecimal characters.
-pub(crate) fn is_lower_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Whether `segment` is one safe, lowercase registry path component.

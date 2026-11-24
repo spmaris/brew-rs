@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::infra::api::catalog_cache;
 use crate::infra::api::http_client::{HttpClient, is_not_found};
+use crate::infra::platform::default_target;
 use crate::ui::DnfStyleFormatter;
 
 use super::install::prefix_path;
@@ -101,7 +102,7 @@ pub(crate) async fn deps(
 async fn forward_deps(config: &Config, package: &str, tree: bool) -> Result<()> {
     // Validate the caller's identifier before any network or platform probing.
     let target = plan::parse_target(package)?.to_string();
-    let tag = crate::domain::plan::default_target()?;
+    let tag = default_target()?;
     let source = HttpFormulaSource {
         http: HttpClient::new(config)?,
         config: config.clone(),

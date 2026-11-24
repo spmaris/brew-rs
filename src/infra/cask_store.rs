@@ -33,10 +33,11 @@ use sha2::{Digest, Sha256};
 use super::cask_extract::{StagedCaskLink, StagedCaskPayload};
 use super::store::{
     COUNTER, InstallLock, Receipt, Store, bin_dir, check_optional_directory, create_symlink,
-    ensure_directory, is_lower_hex_digest, meta_dir, monotonic_nonce, reject_protected_prefix,
-    stages_dir, state_dir, write_new_file_atomic,
+    ensure_directory, meta_dir, monotonic_nonce, reject_protected_prefix, stages_dir, state_dir,
+    write_new_file_atomic,
 };
 use crate::domain::cask_plan::validate_cask_identifier;
+use crate::domain::validate::is_lower_hex_digest;
 
 const CASKROOM: &str = "Caskroom";
 const APPLICATIONS: &str = "Applications";

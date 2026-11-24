@@ -2,7 +2,56 @@ use anyhow::Result;
 use std::io::{self, Write};
 
 use super::install;
-use crate::{config::Config, domain::plan, ui::DnfStyleFormatter};
+use crate::domain::plan::{self, Memoized, PackageSource, PlannedFormula};
+use crate::infra::api::catalog_cache;
+use crate::infra::formula_source::HttpFormulaSource;
+use crate::infra::hint_probe::SystemHintProbe;
+use crate::infra::platform::default_target;
+use crate::{config::Config, ui::DnfStyleFormatter, ui::errors};
+
+/// Build a native install plan for `targets` on host tag `tag` from the
+/// official formula API, with friendly hints on a not-found target.
+///
+/// See [`plan::resolve_with`] for the planner's contract.
+pub(crate) async fn resolve(
+    config: &Config,
+    targets: &[String],
+    tag: &str,
+) -> Result<Vec<PlannedFormula>> {
+    let source = HttpFormulaSource::new(config)?;
+    match plan::resolve_with(&source, targets, tag).await {
+        Ok(plan) => Ok(plan),
+        Err(error) => Err(add_hints_online(error, config).await),
+    }
+}
+
+/// [`errors::add_hints`] with the real macOS directories, cask API, and cached
+/// names.
+async fn add_hints_online(error: anyhow::Error, config: &Config) -> anyhow::Error {
+    let Ok(probe) = SystemHintProbe::new(config) else {
+        return error;
+    };
+    let names = catalog_cache::cached_formula_names(config);
+    errors::add_hints(error, &probe, names.as_deref()).await
+}
+
+/// A read-only audit reuses metadata across independently resolved formulae.
+/// The cache is scoped to one audit; readiness never writes a metadata cache.
+pub(crate) struct AuditPlanner {
+    source: Memoized<HttpFormulaSource>,
+}
+
+impl AuditPlanner {
+    pub(crate) fn new(config: &Config) -> Result<Self> {
+        Ok(Self {
+            source: Memoized::new(HttpFormulaSource::read_only(config)?),
+        })
+    }
+
+    pub(crate) async fn resolve(&self, name: &str, tag: &str) -> Result<Vec<PlannedFormula>> {
+        plan::resolve_with(&self.source, &[name.into()], tag).await
+    }
+}
 
 pub async fn run(
     config: &Config,
@@ -12,9 +61,9 @@ pub async fn run(
 ) -> Result<()> {
     let tag = match target {
         Some(tag) => tag.to_owned(),
-        None => plan::default_target()?,
+        None => default_target()?,
     };
-    let plan = plan::resolve(config, packages, &tag).await?;
+    let plan = resolve(config, packages, &tag).await?;
     let ui = DnfStyleFormatter::new(config);
     let rows: Vec<_> = plan
         .iter()
@@ -28,7 +77,7 @@ pub async fn run(
                     "dependency"
                 }
                 .into(),
-                if package.source == crate::infra::store::PackageSource::Upstream {
+                if package.source == PackageSource::Upstream {
                     "Upstream release"
                 } else if package.cellar == ":any_skip_relocation" {
                     "Portable"

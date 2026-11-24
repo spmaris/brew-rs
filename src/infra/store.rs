@@ -154,6 +154,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::plan::PackageSource;
+use crate::domain::validate::{is_lower_hex_digest, is_safe_version};
+
 /// Ownership marker; its exact content identifies a brewrs prefix.
 const MARKER_FILE: &str = ".brewrs-root";
 const MARKER_CONTENT: &str = "brewrs native store v1\n";
@@ -262,7 +265,6 @@ const STAGES: &str = "stages";
 const LOCK_FILE: &str = "install.lock";
 /// Longest accepted package name or version.
 const MAX_NAME_LEN: usize = 128;
-const MAX_VERSION_LEN: usize = 128;
 /// Receipts are tiny; anything larger is corrupt or foreign.
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
 
@@ -297,25 +299,6 @@ pub(crate) struct Dependency {
     pub name: String,
     pub version: String,
     pub sha256: String,
-}
-
-/// The source used for installation and retained for future upgrades.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageSource {
-    #[default]
-    Homebrew,
-    Upstream,
-}
-
-impl PackageSource {
-    /// Human-readable name used in user-facing messages.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Homebrew => "Homebrew",
-            Self::Upstream => "upstream",
-        }
-    }
 }
 
 /// The durable record of one installed package.
@@ -3192,15 +3175,6 @@ pub(super) fn is_safe_package_name(name: &str) -> bool {
         })
 }
 
-pub(crate) fn is_safe_version(version: &str) -> bool {
-    if version.is_empty() || version.len() > MAX_VERSION_LEN || version.contains("..") {
-        return false;
-    }
-    version
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
-}
-
 /// Bin members become single path components, so reject anything surprising.
 fn is_safe_bin_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 255 || name.contains("..") {
@@ -3211,13 +3185,6 @@ fn is_safe_bin_name(name: &str) -> bool {
         && bytes.iter().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'+' | b'-' | b'_' | b'.')
         })
-}
-
-pub(crate) fn is_lower_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_receipt(receipt: &Receipt) -> Result<()> {

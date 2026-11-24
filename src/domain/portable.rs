@@ -1,16 +1,13 @@
 //! Data-driven installs of reviewed, standalone macOS tar.gz releases.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use super::plan::{self, PlannedFormula};
-use crate::infra::store::{self, PackageSource};
-use crate::infra::{archive, cask_download, tap_artifact};
+use super::plan::{self, PackageSource, PlannedFormula};
+use super::validate::{is_lower_hex_digest, is_safe_version, validate_cask_url};
 
 const BUNDLED_TOML: &str = include_str!("portable.toml");
 
@@ -24,21 +21,21 @@ pub(crate) struct Catalog {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Package {
     pub name: String,
-    version: String,
+    pub version: String,
     #[serde(default)]
     aliases: Vec<String>,
-    executables: Vec<String>,
+    pub executables: Vec<String>,
     #[serde(default)]
-    required_files: Vec<String>,
+    pub required_files: Vec<String>,
     artifacts: BTreeMap<String, Artifact>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Artifact {
-    root: String,
-    url: String,
-    sha256: String,
+pub(crate) struct Artifact {
+    pub root: String,
+    pub url: String,
+    pub sha256: String,
 }
 
 pub(crate) fn catalog() -> Result<&'static Catalog> {
@@ -59,7 +56,7 @@ impl Catalog {
                     bail!("Invalid or duplicate portable package name or alias: {name:?}");
                 }
             }
-            if !store::is_safe_version(&package.version) {
+            if !is_safe_version(&package.version) {
                 bail!("Invalid version for portable package {}", package.name);
             }
             if package.artifacts.is_empty() || package.executables.is_empty() {
@@ -87,12 +84,12 @@ impl Catalog {
                 if !matches!(arch.as_str(), "arm64" | "x86_64")
                     || !safe_relative(&asset.root)
                     || asset.root.contains('/')
-                    || !store::is_lower_hex_digest(&asset.sha256)
+                    || !is_lower_hex_digest(&asset.sha256)
                     || !digests.insert(&asset.sha256)
                 {
                     bail!("Invalid {arch} portable artifact for {}", package.name);
                 }
-                cask_download::validate_cask_url(&asset.url)?;
+                validate_cask_url(&asset.url)?;
             }
         }
         Ok(catalog)
@@ -185,7 +182,8 @@ fn safe_relative(path: &str) -> bool {
     }) && path.len() <= 512
 }
 
-fn artifact_for(
+/// The catalog entry, host architecture and artifact a plan was built from.
+pub(crate) fn artifact_for(
     formula: &PlannedFormula,
 ) -> Result<(&'static Package, &'static str, &'static Artifact)> {
     let package = catalog()?
@@ -202,48 +200,6 @@ fn artifact_for(
                 .then_some((package, arch.as_str(), artifact))
         })
         .context("No reviewed upstream artifact matches this plan")
-}
-
-pub(crate) async fn fetch(
-    config: &crate::config::Config,
-    formula: &PlannedFormula,
-) -> Result<PathBuf> {
-    let (_, _, artifact) = artifact_for(formula)?;
-    cask_download::fetch(config, &artifact.url, &artifact.sha256).await
-}
-
-pub(crate) fn stage(formula: &PlannedFormula, tarball: &Path, out: &Path) -> Result<()> {
-    let (package, arch, artifact) = artifact_for(formula)?;
-    archive::unpack_release(tarball, out, &artifact.root, &artifact.sha256)?;
-    for relative in &package.required_files {
-        regular_member(out, relative)?;
-    }
-    for relative in &package.executables {
-        let path = regular_member(out, relative)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if fs::symlink_metadata(&path)?.permissions().mode() & 0o111 == 0 {
-                bail!("Portable archive member {relative:?} is not executable");
-            }
-        }
-        tap_artifact::validate_macho(&path, arch)?;
-    }
-    Ok(())
-}
-
-fn regular_member(out: &Path, relative: &str) -> Result<PathBuf> {
-    let path = out.join(relative);
-    // The private stage is canonicalized independently so callers may use a
-    // prefix behind macOS's /var or /tmp aliases, but members cannot be aliases.
-    if !fs::symlink_metadata(&path)?.is_file()
-        || path.canonicalize()? != out.canonicalize()?.join(relative)
-    {
-        bail!(
-            "Portable archive member {relative:?} must be a regular file with real directory ancestors"
-        );
-    }
-    Ok(path)
 }
 
 #[cfg(test)]

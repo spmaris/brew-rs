@@ -1,123 +1,18 @@
-//! Friendly errors for formula lookups against the official API.
+//! Hint text for friendly formula lookup errors.
 //!
-//! The planner maps raw API failures to [`PlanError`], whose `Display` is the
-//! whole user-facing message (no error chain). The raw chain, with URLs, is
-//! logged at debug level instead.
+//! The planner's typed [`PlanError`] carries the whole user-facing message in
+//! its `Display`; this module only fills in the hint lines of a not-found
+//! error.
 
-use std::fmt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use crate::domain::plan_error::{HintProbe, PlanError};
 
-use crate::config::Config;
-use crate::infra::api::http_client::{ApiFailure, HttpClient, classify};
-
-const MACOS_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 const MAX_SUGGESTIONS: usize = 3;
-
-#[derive(Debug)]
-pub(super) enum PlanError {
-    /// A user-requested formula does not exist. `tap` is set for a
-    /// tap-qualified target.
-    NotFound {
-        name: String,
-        tap: Option<String>,
-        hints: Vec<String>,
-    },
-    /// A formula's metadata lists a dependency the API does not know.
-    MissingDependency {
-        parent: String,
-        dependency: String,
-    },
-    Api(ApiFailure),
-}
-
-impl fmt::Display for PlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound {
-                name,
-                tap: Some(tap),
-                hints,
-            } => {
-                write!(f, "No formula named '{name}' in tap {tap}.")?;
-                hints.iter().try_for_each(|hint| write!(f, "\n  {hint}"))
-            }
-            Self::NotFound {
-                name,
-                tap: None,
-                hints,
-            } => {
-                write!(f, "No Homebrew formula named '{name}'.")?;
-                hints.iter().try_for_each(|hint| write!(f, "\n  {hint}"))
-            }
-            Self::MissingDependency { parent, dependency } => write!(
-                f,
-                "Homebrew metadata for '{parent}' lists dependency '{dependency}', which does not exist."
-            ),
-            Self::Api(failure) => failure.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for PlanError {}
-
-/// Convert a failed fetch of `name` into the friendly error. `parent` is the
-/// formula that listed `name` as a dependency, or `None` for a user target.
-/// Failures that are not not-found/network/5xx become a readable metadata
-/// error; the original chain is logged at debug level.
-pub(crate) fn from_fetch_error(
-    error: anyhow::Error,
-    name: &str,
-    tap: Option<&str>,
-    parent: Option<&str>,
-) -> anyhow::Error {
-    let Some(failure) = classify(&error) else {
-        log::debug!("formula lookup for '{name}' failed: {error:#}");
-        return anyhow::anyhow!(
-            "Could not read Homebrew metadata for '{name}'.\n  Run with BREW_RS_LOG=debug for details."
-        );
-    };
-    log::debug!("formula lookup for '{name}' failed: {error:#}");
-    anyhow::Error::new(match (failure, parent) {
-        (ApiFailure::NotFound, Some(parent)) => PlanError::MissingDependency {
-            parent: parent.into(),
-            dependency: name.into(),
-        },
-        (ApiFailure::NotFound, None) => PlanError::NotFound {
-            name: name.into(),
-            tap: tap.map(str::to_owned),
-            hints: Vec::new(),
-        },
-        (failure, _) => PlanError::Api(failure),
-    })
-}
-
-/// Whether a cask with this token exists. Failures count as "no".
-pub(super) trait CaskProbe {
-    async fn cask_exists(&self, token: &str) -> bool;
-}
-
-pub(super) struct HttpCaskProbe(HttpClient);
-
-impl HttpCaskProbe {
-    pub(super) fn new(config: &Config) -> anyhow::Result<Self> {
-        HttpClient::new(config).map(Self)
-    }
-}
-
-impl CaskProbe for HttpCaskProbe {
-    async fn cask_exists(&self, token: &str) -> bool {
-        let url = format!("{}/cask/{token}.json", crate::domain::plan::API_BASE);
-        self.0.fetch_json::<serde_json::Value>(&url).await.is_ok()
-    }
-}
 
 /// Fill in hints on a user-target [`PlanError::NotFound`]; any other error is
 /// returned unchanged.
-pub(super) async fn add_hints(
+pub(crate) async fn add_hints(
     error: anyhow::Error,
-    macos_dirs: &[&Path],
-    casks: &impl CaskProbe,
+    probe: &impl HintProbe,
     formula_names: Option<&[String]>,
 ) -> anyhow::Error {
     match error.downcast::<PlanError>() {
@@ -127,13 +22,13 @@ pub(super) async fn add_hints(
             hints: _,
         }) => {
             let mut hints = Vec::new();
-            if let Some(path) = macos_builtin(&name, macos_dirs) {
+            if let Some(path) = probe.macos_builtin(&name) {
                 hints.push(format!(
                     "'{name}' is already part of macOS: {}",
                     path.display()
                 ));
             }
-            if casks.cask_exists(&name).await {
+            if probe.cask_exists(&name).await {
                 hints.push(format!(
                     "A cask with that name exists: brewrs install --cask {name}"
                 ));
@@ -173,27 +68,6 @@ pub(super) async fn add_hints(
         Ok(other) => anyhow::Error::new(other),
         Err(error) => error,
     }
-}
-
-/// [`add_hints`] with the real macOS directories, cask API, and cached names.
-pub(crate) async fn add_hints_online(error: anyhow::Error, config: &Config) -> anyhow::Error {
-    let dirs: Vec<&Path> = MACOS_DIRS.iter().map(Path::new).collect();
-    let Ok(probe) = HttpCaskProbe::new(config) else {
-        return error;
-    };
-    let names = crate::infra::api::catalog_cache::cached_formula_names(config);
-    add_hints(error, &dirs, &probe, names.as_deref()).await
-}
-
-/// A regular, executable file named exactly `name` in one of `dirs`.
-fn macos_builtin(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        return None;
-    }
-    dirs.iter().map(|dir| dir.join(name)).find(|path| {
-        std::fs::metadata(path)
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-    })
 }
 
 /// A runnable suggestion hint: one install command for one match, an

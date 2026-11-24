@@ -9,11 +9,13 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::{config::Config, ui::DnfStyleFormatter};
 
+use super::casks::AuditCaskPlanner;
 use super::install::prefix_path;
-use crate::domain::cask_plan::{AuditCaskPlanner, PlannedCask};
-use crate::domain::migration_inventory::{self, Cask, Formula, Inventory};
-use crate::domain::plan::default_target;
-use crate::domain::plan::{AuditPlanner, PlannedFormula};
+use super::plan::AuditPlanner;
+use crate::domain::cask_plan::PlannedCask;
+use crate::domain::plan::PlannedFormula;
+use crate::infra::migration_inventory::{self, Cask, Formula, Inventory};
+use crate::infra::platform::default_target;
 use crate::infra::store;
 
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(90);

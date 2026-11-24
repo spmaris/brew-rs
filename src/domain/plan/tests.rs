@@ -48,9 +48,7 @@ impl FormulaSource for NotFoundSource {
         if self.0.docs.contains_key(name) {
             self.0.fetch(name).await
         } else {
-            Err(anyhow::Error::new(
-                crate::infra::api::http_client::ApiFailure::NotFound,
-            ))
+            Err(anyhow::Error::new(ApiFailure::NotFound))
         }
     }
 }

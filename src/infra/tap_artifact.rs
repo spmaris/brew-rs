@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::domain::tap_manifest::{MAX_ARTIFACT_BYTES, is_known_arch};
+use crate::domain::validate::is_lower_hex_digest;
 
 /// Size of the 64-bit Mach-O header prefix needed for validation.
 const MACH_HEADER_64_BYTES: usize = 32;
@@ -56,7 +57,7 @@ fn stage_verified_inner(
     expected_sha256: &str,
     expected_arch: &str,
 ) -> Result<u64> {
-    if !super::store::is_lower_hex_digest(expected_sha256) {
+    if !is_lower_hex_digest(expected_sha256) {
         bail!("refusing to stage a tap artifact without a lowercase SHA-256 digest");
     }
     if !is_known_arch(expected_arch) {
@@ -186,7 +187,7 @@ pub(crate) fn hash_regular_file(
     limit: u64,
     what: &str,
 ) -> Result<u64> {
-    if !super::store::is_lower_hex_digest(expected_sha256) {
+    if !is_lower_hex_digest(expected_sha256) {
         bail!("refusing to verify {what} without a lowercase SHA-256 digest");
     }
     let metadata = fs::symlink_metadata(path)

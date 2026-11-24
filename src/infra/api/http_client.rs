@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::config::Config;
+use crate::domain::plan_error::ApiFailure;
 
 // Includes the expanded public formula catalog. Count bytes after decoding so
 // compressed responses cannot bypass the bound.
@@ -80,32 +81,6 @@ pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
             == Some(reqwest::StatusCode::NOT_FOUND)
     })
 }
-
-/// How a Homebrew API request failed, for user-facing error messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApiFailure {
-    NotFound,
-    Unreachable,
-    Server(u16),
-}
-
-impl std::fmt::Display for ApiFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "formulae.brew.sh has no such entry (HTTP 404)"),
-            Self::Unreachable => write!(
-                f,
-                "Could not reach formulae.brew.sh. Check your network connection."
-            ),
-            Self::Server(code) => write!(
-                f,
-                "formulae.brew.sh returned an error (HTTP {code}). Try again later."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ApiFailure {}
 
 fn classify_parts(status: Option<u16>, transport_failure: bool) -> Option<ApiFailure> {
     match status {

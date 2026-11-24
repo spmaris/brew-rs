@@ -35,8 +35,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::infra::cask_download::validate_cask_url;
-use crate::infra::store::is_lower_hex_digest;
+use super::validate::{is_lower_hex_digest, validate_cask_url};
 
 /// Supported manifest and receipt schema.
 pub(super) const SCHEMA_VERSION: u32 = 1;

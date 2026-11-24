@@ -19,16 +19,44 @@ use crate::{
 };
 
 use super::install::{confirm, prefix_path};
+use crate::domain::cask_plan;
 use crate::domain::cask_plan::{
     CaskVersionOrder, PlannedCask, PlannedCaskArtifact, compare_cask_versions,
 };
-use crate::domain::{cask_plan, plan::default_target};
 use crate::infra::cask_download;
 use crate::infra::cask_extract::{self, StagedCaskPayload};
+use crate::infra::cask_source::HttpCaskSource;
 use crate::infra::cask_store::{
     self, CaskReceipt, InstalledApp, InstalledCaskLink, InstalledWrapper, PreparedCask,
 };
+use crate::infra::platform::default_target;
 use crate::infra::store::{Store, reject_protected_prefix};
+
+/// Resolve cask install plans for `targets` on host tag `tag` from the
+/// official cask API.
+async fn resolve(config: &Config, targets: &[String], tag: &str) -> Result<Vec<PlannedCask>> {
+    let source = HttpCaskSource::new(config)?;
+    cask_plan::resolve_with(&source, targets, tag).await
+}
+
+/// Read-only cask planner reused across `migrate --check`.
+pub(crate) struct AuditCaskPlanner {
+    source: HttpCaskSource,
+}
+
+impl AuditCaskPlanner {
+    pub(crate) fn new(config: &Config) -> Result<Self> {
+        Ok(Self {
+            source: HttpCaskSource::read_only(config)?,
+        })
+    }
+
+    pub(crate) async fn resolve_one(&self, token: &str, tag: &str) -> Result<PlannedCask> {
+        let mut plan = cask_plan::resolve_with(&self.source, &[token.to_string()], tag).await?;
+        plan.pop()
+            .context("cask planner returned an empty plan for one target")
+    }
+}
 
 pub(crate) async fn install(
     config: &Config,
@@ -48,7 +76,7 @@ pub(crate) async fn install(
     let tag = default_target()?;
     let existing_casks = cask_store::installed(&store)?;
     let existing_formulae = store.installed()?;
-    let plan = cask_plan::resolve(config, packages, &tag).await?;
+    let plan = resolve(config, packages, &tag).await?;
 
     let mut pending = Vec::new();
     let mut projected = existing_casks.clone();
@@ -558,7 +586,7 @@ async fn resolve_cask_changes(
     }
 
     let tokens: Vec<String> = to_check.iter().map(|r| r.token.clone()).collect();
-    let plans = cask_plan::resolve(config, &tokens, &tag).await?;
+    let plans = resolve(config, &tokens, &tag).await?;
     let existing_formulae = store.installed()?;
     let mut changes = Vec::new();
     let mut projected = installed.to_vec();
