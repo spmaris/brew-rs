@@ -110,3 +110,111 @@ fn io_errors_name_the_action_and_path() {
         "failed to read directory '/stage/lib': denied"
     );
 }
+
+fn small_limits() -> Limits {
+    Limits {
+        text: 64,
+        macho: 256,
+        chunk: 8,
+    }
+}
+
+fn big_file(dir: &Path, name: &str, len: usize, patch: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
+    let mut bytes = vec![b'a'; len];
+    patch(&mut bytes);
+    let path = dir.join(name);
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn too_large(result: Result<Loaded, RelocateError>) -> Option<u64> {
+    match result {
+        Err(RelocateError::FileTooLarge { limit }) => Some(limit),
+        _ => None,
+    }
+}
+
+#[test]
+fn oversized_text_without_markers_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = big_file(dir.path(), "big.dat", 1000, |_| {});
+    assert!(matches!(load(&path, small_limits()), Ok(Loaded::Skip)));
+    let small = big_file(dir.path(), "small.dat", 64, |_| {});
+    assert!(matches!(load(&small, small_limits()), Ok(Loaded::Text(b)) if b.len() == 64));
+}
+
+#[test]
+fn oversized_text_with_marker_anywhere_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = b"@@HOMEBREW_PREFIX@@";
+    // Offsets: start, straddling every chunk boundary phase, and the very end.
+    let mut offsets = vec![0, 1000 - marker.len()];
+    offsets.extend(8 - 5..8 + 1);
+    offsets.extend(500 - 7..500 + 1);
+    for (i, offset) in offsets.into_iter().enumerate() {
+        let path = big_file(dir.path(), &format!("m{i}"), 1000, |b| {
+            b[offset..offset + marker.len()].copy_from_slice(marker);
+        });
+        assert_eq!(
+            too_large(load(&path, small_limits())),
+            Some(64),
+            "offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn stream_scan_matches_in_memory_search() {
+    for chunk in 1..30 {
+        for offset in 0..40 {
+            let mut bytes = [b'x'; 60];
+            bytes[offset..offset + 11].copy_from_slice(b"@@HOMEBREW_");
+            assert!(text::stream_has_needle(&bytes[..], chunk).unwrap());
+            bytes[offset + 10] = b'!';
+            assert!(!text::stream_has_needle(&bytes[..], chunk).unwrap());
+        }
+    }
+}
+
+#[test]
+fn macho_is_detected_from_the_prefix_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let thin = |b: &mut Vec<u8>| b[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+    // Within the Mach-O cap but above the text cap: read in full, not skipped.
+    let path = big_file(dir.path(), "tool", 200, thin);
+    assert!(matches!(load(&path, small_limits()), Ok(Loaded::Macho(b)) if b.len() == 200));
+    // Above the Mach-O cap.
+    let path = big_file(dir.path(), "huge", 300, thin);
+    assert_eq!(too_large(load(&path, small_limits())), Some(256));
+    // A large Mach-O is rejected on size even when it has no marker.
+    let limits = Limits {
+        macho: 1 << 20,
+        ..small_limits()
+    };
+    let path = big_file(dir.path(), "mid", 5000, thin);
+    assert!(matches!(load(&path, limits), Ok(Loaded::Macho(_))));
+}
+
+#[test]
+fn large_fat_image_is_recognized_with_only_a_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fat = vec![0u8; 20_000];
+    fat[..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+    fat[4..8].copy_from_slice(&1u32.to_be_bytes());
+    fat[8..12].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+    fat[16..20].copy_from_slice(&16_384u32.to_be_bytes());
+    fat[20..24].copy_from_slice(&3_000u32.to_be_bytes());
+    fat[24..28].copy_from_slice(&14u32.to_be_bytes());
+    let path = dir.path().join("fat");
+    fs::write(&path, &fat).unwrap();
+    let limits = Limits {
+        macho: 10_000,
+        ..small_limits()
+    };
+    assert_eq!(too_large(load(&path, limits)), Some(10_000));
+    assert!(macho::is_macho(&fat));
+    // A slice running past the file end is not FAT, so it takes the text path.
+    fat[20..24].copy_from_slice(&30_000u32.to_be_bytes());
+    fs::write(&path, &fat).unwrap();
+    assert!(matches!(load(&path, limits), Ok(Loaded::Skip)));
+}

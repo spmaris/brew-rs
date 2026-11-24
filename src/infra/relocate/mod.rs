@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::infra::store::Prepared;
@@ -22,7 +22,77 @@ mod text;
 
 pub(crate) use error::RelocateError;
 
+/// Largest non-Mach-O file read into memory for a text rewrite.
 const MAX_RELOCATION_FILE_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest Mach-O image read into memory for relocation.
+const MAX_MACHO_RELOCATION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Chunk size for scanning oversized non-Mach-O files.
+const SCAN_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// A staged file after classification.
+enum Loaded {
+    Macho(Vec<u8>),
+    Text(Vec<u8>),
+    /// Oversized and free of relocation markers: nothing to rewrite.
+    Skip,
+}
+
+/// Size limits and scan chunk used by [`load`]; injectable for tests.
+#[derive(Clone, Copy)]
+struct Limits {
+    text: u64,
+    macho: u64,
+    chunk: usize,
+}
+
+const LIMITS: Limits = Limits {
+    text: MAX_RELOCATION_FILE_BYTES,
+    macho: MAX_MACHO_RELOCATION_BYTES,
+    chunk: SCAN_CHUNK_BYTES,
+};
+
+/// Classify `path` from a bounded prefix and its size, then read it as far as
+/// its class requires. Only Mach-O images may exceed the text limit.
+fn load(path: &Path, limits: Limits) -> Result<Loaded, RelocateError> {
+    let mut file = File::open(path).map_err(RelocateError::io("read", path))?;
+    let len = file
+        .metadata()
+        .map_err(RelocateError::io("inspect", path))?
+        .len();
+    let mut prefix = Vec::new();
+    (&mut file)
+        .take(macho::MACHO_PREFIX_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .map_err(RelocateError::io("read", path))?;
+    let is_macho = macho::is_macho_prefix(&prefix, len);
+    let limit = if is_macho { limits.macho } else { limits.text };
+    if len > limit {
+        if is_macho {
+            return Err(RelocateError::FileTooLarge { limit });
+        }
+        file.rewind().map_err(RelocateError::io("read", path))?;
+        let marked =
+            text::stream_has_needle(file, limits.chunk).map_err(RelocateError::io("read", path))?;
+        return if marked {
+            Err(RelocateError::FileTooLarge { limit })
+        } else {
+            Ok(Loaded::Skip)
+        };
+    }
+    file.rewind().map_err(RelocateError::io("read", path))?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(RelocateError::io("read", path))?;
+    if bytes.len() as u64 > limit {
+        return Err(RelocateError::FileTooLarge { limit });
+    }
+    Ok(if is_macho {
+        Loaded::Macho(bytes)
+    } else {
+        Loaded::Text(bytes)
+    })
+}
 
 pub(crate) struct Item<'a> {
     pub(crate) package: &'a Prepared,
@@ -125,21 +195,10 @@ fn rewrite_file(
     paths: &Paths<'_>,
     batch: &HashMap<(&str, &str), &Path>,
 ) -> Result<(), RelocateError> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take(MAX_RELOCATION_FILE_BYTES + 1)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(RelocateError::io("read", path))?;
-    if bytes.len() as u64 > MAX_RELOCATION_FILE_BYTES {
-        return Err(RelocateError::FileTooLarge {
-            limit: MAX_RELOCATION_FILE_BYTES,
-        });
-    }
+    let loaded = load(path, LIMITS)?;
     let relative = path.strip_prefix(stage)?;
-    if macho::is_macho(&bytes) {
-        macho::relocate(path, &bytes, |kind, old, rpaths| match kind {
+    if let Loaded::Macho(bytes) = &loaded {
+        macho::relocate(path, bytes, |kind, old, rpaths| match kind {
             PathKind::Rpath => match paths.rpath_path(old, relative)? {
                 RpathTarget::KegDir(mapped) => {
                     validate_target(prefix, Path::new(&mapped), batch, TargetKind::Dir)?;
@@ -179,7 +238,9 @@ fn rewrite_file(
                 Ok(mapped)
             }
         })?;
-    } else if let Some(rewritten) = text::rewrite(relative, &bytes, paths)? {
+    } else if let Loaded::Text(bytes) = &loaded
+        && let Some(rewritten) = text::rewrite(relative, bytes, paths)?
+    {
         fs::write(path, rewritten).map_err(RelocateError::io("write", path))?;
     }
     Ok(())

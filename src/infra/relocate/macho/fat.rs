@@ -38,7 +38,21 @@ pub(super) fn has_magic(magic: &[u8], expected: [u8; 4]) -> bool {
 /// its architecture table are plausible; a Java class file starts with the
 /// same bytes but does not carry a plausible FAT table, so it is not Mach-O.
 /// The caller decides how to report recognized-but-unsupported images.
+#[cfg(test)]
 pub(in crate::infra::relocate) fn is_macho(bytes: &[u8]) -> bool {
+    is_macho_prefix(bytes, bytes.len() as u64)
+}
+
+/// Longest prefix [`is_macho_prefix`] may need: the FAT header plus the
+/// largest plausible architecture table fits well within it.
+pub(in crate::infra::relocate) const MACHO_PREFIX_BYTES: usize = 4096;
+
+/// [`is_macho`] for a file whose first bytes are `prefix` and whose total size
+/// is `file_len`. `prefix` must be the whole file or at least
+/// [`MACHO_PREFIX_BYTES`] bytes; the answer is then identical to [`is_macho`]
+/// on the full contents.
+pub(in crate::infra::relocate) fn is_macho_prefix(prefix: &[u8], file_len: u64) -> bool {
+    let bytes = prefix;
     let Some(magic) = bytes.get(..4) else {
         return false;
     };
@@ -56,7 +70,7 @@ pub(in crate::infra::relocate) fn is_macho(bytes: &[u8]) -> bool {
     let Some(family) = FatFamily::from_magic(magic) else {
         return false;
     };
-    fat_is_plausible(bytes, family)
+    fat_is_plausible(bytes, file_len, family)
 }
 
 /// A byte-order/slice-width variant of the FAT container header.
@@ -101,7 +115,7 @@ impl FatFamily {
 }
 
 /// Validate enough of a FAT header to distinguish it from a Java class file.
-fn fat_is_plausible(bytes: &[u8], family: FatFamily) -> bool {
+fn fat_is_plausible(bytes: &[u8], file_len: u64, family: FatFamily) -> bool {
     let big_endian = family.is_big_endian();
     let Some(arch_count) = read_fat_u32(bytes, 4, big_endian) else {
         return false;
@@ -158,7 +172,7 @@ fn fat_is_plausible(bytes: &[u8], family: FatFamily) -> bool {
         let Some(end) = offset.checked_add(size) else {
             return false;
         };
-        if offset < table_end as u64 || end > bytes.len() as u64 {
+        if offset < table_end as u64 || end > file_len {
             return false;
         }
         if offset % (1u64 << align) != 0 {

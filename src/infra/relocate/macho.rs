@@ -48,7 +48,9 @@ use parse::{parse, validate_relocatable};
 use rewrite_plan::{check_marker_plan, plan, validate_targets};
 
 pub(super) use error::MachoError;
+#[cfg(test)]
 pub(super) use fat::is_macho;
+pub(super) use fat::{MACHO_PREFIX_BYTES, is_macho_prefix};
 pub(super) use model::PathKind;
 
 /// Rewrite the Homebrew placeholders in one staged thin 64-bit Mach-O image.

@@ -19,6 +19,7 @@
 //! pinned direct dependency receipt, with no `..` traversal and no residual
 //! markers. A file with no `@@HOMEBREW_` marker returns `Ok(None)`.
 
+use std::io::{self, Read};
 use std::path::Path;
 
 mod error;
@@ -42,6 +43,10 @@ const CELLAR_MARKER: &str = "@@HOMEBREW_CELLAR@@/";
 const OPT_MARKER: &str = "@@HOMEBREW_PREFIX@@/opt/";
 /// Fixed Cellar path used by upstream `pcre2-config` in non-macOS branches.
 const FIXED_CELLAR: &str = "/opt/homebrew/Cellar/";
+/// Every byte pattern whose presence makes [`rewrite`] act on a file. Both the
+/// in-memory rewrite and [`stream_has_needle`] use this list so they agree.
+/// The other path constants only matter in files that already carry [`MARKER`].
+const NEEDLES: &[&[u8]] = &[MARKER.as_bytes()];
 /// Largest text file this module will inspect.
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -95,7 +100,7 @@ pub(super) fn rewrite(
     bytes: &[u8],
     paths: &super::paths::Paths<'_>,
 ) -> Result<Option<Vec<u8>>, TextError> {
-    if !contains(bytes, MARKER.as_bytes()) {
+    if !has_needle(bytes) {
         return Ok(None);
     }
     if bytes.len() > MAX_TEXT_BYTES {
@@ -146,6 +151,33 @@ fn decode<'a>(
         });
     }
     Ok(text)
+}
+
+/// Whether `bytes` contains any pattern in [`NEEDLES`].
+fn has_needle(bytes: &[u8]) -> bool {
+    NEEDLES.iter().any(|needle| contains(bytes, needle))
+}
+
+/// Whether a stream contains any pattern in [`NEEDLES`], read `chunk` bytes at
+/// a time. Consecutive windows overlap by one byte less than the longest
+/// needle, so a pattern straddling a chunk boundary is still found.
+pub(super) fn stream_has_needle(mut reader: impl Read, chunk: usize) -> io::Result<bool> {
+    let keep = NEEDLES.iter().map(|n| n.len()).max().unwrap_or(1) - 1;
+    let mut window = Vec::with_capacity(chunk + keep);
+    loop {
+        let read = reader
+            .by_ref()
+            .take(chunk as u64)
+            .read_to_end(&mut window)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        if has_needle(&window) {
+            return Ok(true);
+        }
+        let excess = window.len().saturating_sub(keep);
+        window.drain(..excess);
+    }
 }
 
 /// Whether a byte slice contains `needle`.
