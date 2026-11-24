@@ -1,9 +1,8 @@
-use anyhow::Result;
-
 use crate::config::Config;
 
 use super::bottle_store::BottleStore;
 use super::cleanup::CleanupStats;
+use super::error::CacheError;
 
 /// Cache handle used by `brewrs clean`.
 ///
@@ -21,7 +20,7 @@ impl CacheManager {
     ///
     /// Fails when either bottles directory is a symlink, before the
     /// caller starts any cleanup.
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new(config: &Config) -> Result<Self, CacheError> {
         Ok(Self {
             retention_days: config.storage.cache_retention,
             bottle_store: BottleStore::new(&config.storage.cache_dir)?,
@@ -31,7 +30,7 @@ impl CacheManager {
     }
 
     /// Remove bottle and cask archives older than the configured retention.
-    pub async fn clean_expired(&self) -> Result<CleanupStats> {
+    pub async fn clean_expired(&self) -> Result<CleanupStats, CacheError> {
         let legacy = self.bottle_store.clean_expired(self.retention_days).await?;
         let native = self
             .native_bottle_store
@@ -45,7 +44,7 @@ impl CacheManager {
     }
 
     /// Remove all recognized bottle and cask archives.
-    pub async fn clean_all(&self) -> Result<CleanupStats> {
+    pub async fn clean_all(&self) -> Result<CleanupStats, CacheError> {
         let legacy = self.bottle_store.clean_all().await?;
         let native = self.native_bottle_store.clean_all().await?;
         let casks = self.native_cask_store.clean_all().await?;

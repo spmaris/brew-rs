@@ -103,7 +103,7 @@ pub(crate) fn remove(
             Ok(()) => step.done(&format!("Unlinked {count} {noun}")),
             Err(error) => {
                 step.fail();
-                return Err(error);
+                return Err(error.into());
             }
         }
     }

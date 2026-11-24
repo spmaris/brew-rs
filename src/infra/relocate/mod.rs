@@ -11,15 +11,16 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-
 use crate::infra::store::Prepared;
 use macho::PathKind;
 use paths::{Paths, RpathTarget};
 
+mod error;
 mod macho;
 mod paths;
 mod text;
+
+pub(crate) use error::RelocateError;
 
 const MAX_RELOCATION_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -28,28 +29,29 @@ pub(crate) struct Item<'a> {
     pub(crate) needs_relocation: bool,
 }
 
-pub(crate) fn preflight() -> Result<()> {
+pub(crate) fn preflight() -> Result<(), RelocateError> {
     if !cfg!(target_os = "macos") {
-        bail!("Bottle relocation requires macOS");
+        return Err(RelocateError::MacosRequired);
     }
     for tool in ["/usr/bin/install_name_tool", "/usr/bin/codesign"] {
         if !Path::new(tool).is_file() {
-            bail!(
-                "Bottle relocation requires {tool}; install the Apple Command Line Tools and retry"
-            );
+            return Err(RelocateError::ToolMissing { tool });
         }
     }
     Ok(())
 }
 
-pub(crate) fn staged<'a>(prefix: &Path, items: impl IntoIterator<Item = Item<'a>>) -> Result<()> {
+pub(crate) fn staged<'a>(
+    prefix: &Path,
+    items: impl IntoIterator<Item = Item<'a>>,
+) -> Result<(), RelocateError> {
     let items: Vec<_> = items.into_iter().collect();
     if !items.iter().any(|item| item.needs_relocation) {
         return Ok(());
     }
     let prefix = prefix
         .canonicalize()
-        .context("Could not resolve the relocation prefix")?;
+        .map_err(|source| RelocateError::PrefixResolve { source })?;
     let mut batch = HashMap::new();
     for item in &items {
         let pkg = item.package;
@@ -60,21 +62,21 @@ pub(crate) fn staged<'a>(prefix: &Path, items: impl IntoIterator<Item = Item<'a>
             )
             .is_some()
         {
-            bail!(
-                "Duplicate staged keg for {} {}",
-                pkg.receipt.name,
-                pkg.receipt.version
-            );
+            return Err(RelocateError::DuplicateStage {
+                name: pkg.receipt.name.clone(),
+                version: pkg.receipt.version.clone(),
+            });
         }
     }
     for item in items.iter().filter(|item| item.needs_relocation) {
         let pkg = item.package;
         let paths = Paths::new(&prefix, &pkg.receipt)?;
-        relocate_keg(pkg.stage.path(), &prefix, &paths, &batch).with_context(|| {
-            format!(
-                "Could not relocate {} {}",
-                pkg.receipt.name, pkg.receipt.version
-            )
+        relocate_keg(pkg.stage.path(), &prefix, &paths, &batch).map_err(|source| {
+            RelocateError::Keg {
+                name: pkg.receipt.name.clone(),
+                version: pkg.receipt.version.clone(),
+                source: Box::new(source),
+            }
         })?;
     }
     Ok(())
@@ -85,21 +87,27 @@ fn relocate_keg(
     prefix: &Path,
     paths: &Paths<'_>,
     batch: &HashMap<(&str, &str), &Path>,
-) -> Result<()> {
+) -> Result<(), RelocateError> {
     let mut pending = vec![stage.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let mut entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = fs::read_dir(&directory)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .map_err(RelocateError::Fs)?;
         entries.sort_unstable_by_key(|entry| entry.file_name());
         for entry in entries {
-            let kind = entry.file_type()?;
+            let kind = entry.file_type().map_err(RelocateError::Fs)?;
             let path = entry.path();
             if kind.is_dir() {
                 pending.push(path);
             } else if kind.is_file() {
-                rewrite_file(stage, &path, prefix, paths, batch)
-                    .with_context(|| format!("In staged file {}", path.display()))?;
+                rewrite_file(stage, &path, prefix, paths, batch).map_err(|source| {
+                    RelocateError::StagedFile {
+                        path: path.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
             } else if !kind.is_symlink() {
-                bail!("Unexpected entry in staged keg: {}", path.display());
+                return Err(RelocateError::UnexpectedEntry { path });
             }
             // The extractor has already checked keg symlinks. Never follow
             // them while walking or rewrite the same physical file twice.
@@ -114,13 +122,18 @@ fn rewrite_file(
     prefix: &Path,
     paths: &Paths<'_>,
     batch: &HashMap<(&str, &str), &Path>,
-) -> Result<()> {
+) -> Result<(), RelocateError> {
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_RELOCATION_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAX_RELOCATION_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(RelocateError::Fs)?;
     if bytes.len() as u64 > MAX_RELOCATION_FILE_BYTES {
-        bail!("File exceeds the relocation size limit ({MAX_RELOCATION_FILE_BYTES} bytes)");
+        return Err(RelocateError::FileTooLarge {
+            limit: MAX_RELOCATION_FILE_BYTES,
+        });
     }
     let relative = path.strip_prefix(stage)?;
     if macho::is_macho(&bytes) {
@@ -143,10 +156,10 @@ fn rewrite_file(
                         validate_target(prefix, &candidate, batch, TargetKind::File).is_ok()
                     });
                     if !resolves {
-                        bail!(
-                            "Mach-O @rpath dependency {old:?} in {} does not resolve inside a pinned keg LC_RPATH",
-                            relative.display()
-                        );
+                        return Err(RelocateError::RpathUnresolved {
+                            old: old.to_owned(),
+                            image: relative.to_path_buf(),
+                        });
                     }
                     return Ok(None);
                 }
@@ -165,7 +178,7 @@ fn rewrite_file(
             }
         })?;
     } else if let Some(rewritten) = text::rewrite(relative, &bytes, paths)? {
-        fs::write(path, rewritten)?;
+        fs::write(path, rewritten).map_err(RelocateError::Fs)?;
     }
     Ok(())
 }
@@ -181,7 +194,7 @@ fn validate_target(
     target: &Path,
     batch: &HashMap<(&str, &str), &Path>,
     kind: TargetKind,
-) -> Result<()> {
+) -> Result<(), RelocateError> {
     let (name, version, member) = target
         .strip_prefix(prefix.join("Cellar"))?
         .to_str()
@@ -195,9 +208,9 @@ fn validate_target(
                 None => Some((name, tail, None)),
             }
         })
-        .context("A relocated Mach-O reference must name a pinned keg target")?;
+        .ok_or(RelocateError::NotPinnedKeg)?;
     if matches!(kind, TargetKind::File) && member.is_none_or(str::is_empty) {
-        bail!("A relocated Mach-O reference must name a file within a pinned keg");
+        return Err(RelocateError::NotFileInKeg);
     }
     let installed_keg: PathBuf;
     let root = match batch.get(&(name, version)) {
@@ -207,37 +220,42 @@ fn validate_target(
             let package = cellar.join(name);
             installed_keg = package.join(version);
             for path in [&cellar, &package, &installed_keg] {
-                if !fs::symlink_metadata(path)?.is_dir() {
-                    bail!(
-                        "Relocated library target is not inside a real managed keg: {}",
-                        target.display()
-                    );
+                if !fs::symlink_metadata(path)
+                    .map_err(RelocateError::Fs)?
+                    .is_dir()
+                {
+                    return Err(RelocateError::TargetNotManagedKeg {
+                        target: target.to_path_buf(),
+                    });
                 }
             }
             &installed_keg
         }
     };
-    let root = root.canonicalize()?;
+    let root = root.canonicalize().map_err(RelocateError::Fs)?;
     let candidate = match member {
         Some(member) if !member.is_empty() => root.join(member),
         _ => root.clone(),
     };
     let real = candidate
         .canonicalize()
-        .with_context(|| format!("Missing relocated library target {}", target.display()))?;
+        .map_err(|source| RelocateError::TargetMissing {
+            target: target.to_path_buf(),
+            source,
+        })?;
     let type_ok = match kind {
         TargetKind::File => real.is_file(),
         TargetKind::Dir => real.is_dir(),
     };
     if !real.starts_with(&root) || !type_ok {
-        let kind_label = match kind {
+        let kind = match kind {
             TargetKind::File => "regular file",
             TargetKind::Dir => "directory",
         };
-        bail!(
-            "Relocated library target is not a {kind_label} inside its pinned keg: {}",
-            target.display()
-        );
+        return Err(RelocateError::TargetWrongKind {
+            kind,
+            target: target.to_path_buf(),
+        });
     }
     Ok(())
 }

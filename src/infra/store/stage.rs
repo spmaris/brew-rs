@@ -5,7 +5,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
+use super::error::{Action, DirFault};
 
 use super::links::{existing_link_directories, staged_links};
 use super::paths::{cellar_dir, opt_dir, receipts_dir, stages_dir};
@@ -20,17 +21,17 @@ use super::{Pending, Promotion, Store};
 
 impl Store {
     /// Create a private staging directory below this store.
-    pub(crate) fn stage(&self) -> Result<tempfile::TempDir> {
+    pub(crate) fn stage(&self) -> Result<tempfile::TempDir, StoreError> {
         self.ensure_owned()?;
         let stages = stages_dir(&self.prefix);
         tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(&stages)
-            .with_context(|| format!("failed to create a stage below '{}'", stages.display()))
+            .map_err(StoreError::io("failed to create a stage below", &stages))
     }
 
     /// Check the whole batch against existing state before writing anything.
-    pub(super) fn prepare(&self, packages: Vec<Prepared>) -> Result<Vec<Pending>> {
+    pub(super) fn prepare(&self, packages: Vec<Prepared>) -> Result<Vec<Pending>, StoreError> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
         let opt = opt_dir(&self.prefix);
@@ -52,10 +53,10 @@ impl Store {
         for Prepared { receipt, stage } in packages {
             validate_receipt(&receipt)?;
             if !names.insert(receipt.name.clone()) {
-                bail!(
-                    "package '{}' appears more than once in one commit",
-                    receipt.name
-                );
+                return Err(StoreError::DuplicatePackage {
+                    action: Action::Install,
+                    name: receipt.name.to_string(),
+                });
             }
             self.validate_stage(stage.path())?;
             let links = if receipt.keg_only {
@@ -67,19 +68,17 @@ impl Store {
             let receipt_path = receipts.join(format!("{}.json", receipt.name));
             if let Some(existing) = existing_receipt(&receipt_path)? {
                 if existing.version == receipt.version {
-                    bail!(
-                        "'{} {}' is already installed in '{}'; the caller must skip it",
-                        receipt.name,
-                        receipt.version,
-                        self.prefix.display()
-                    );
+                    return Err(StoreError::AlreadyInstalled {
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        prefix: self.prefix.to_path_buf(),
+                    });
                 }
-                bail!(
-                    "'{}' is already installed at version {}; refusing to replace it with {}",
-                    receipt.name,
-                    existing.version,
-                    receipt.version
-                );
+                return Err(StoreError::AlreadyInstalledOtherVersion {
+                    name: receipt.name.to_string(),
+                    installed: existing.version.to_string(),
+                    requested: receipt.version.to_string(),
+                });
             }
 
             let installed_dir = cellar.join(&receipt.name);
@@ -91,50 +90,46 @@ impl Store {
                 )?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to inspect '{}'", installed_dir.display())
-                    });
+                    return Err(StoreError::io("failed to inspect", &installed_dir)(error));
                 }
             }
 
             if has_opt {
                 let existing_opt = opt.join(&receipt.name);
                 match fs::symlink_metadata(&existing_opt) {
-                    Ok(_) => bail!(
-                        "refusing to install '{}': '{}' already exists; links are never overwritten",
-                        receipt.name,
-                        existing_opt.display()
-                    ),
+                    Ok(_) => {
+                        return Err(StoreError::LinkExists {
+                            name: receipt.name.to_string(),
+                            path: existing_opt.to_path_buf(),
+                        });
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("failed to inspect '{}'", existing_opt.display())
-                        });
+                        return Err(StoreError::io("failed to inspect", &existing_opt)(error));
                     }
                 }
             }
 
             for link in &links {
                 if !link_names.insert(link.clone()) {
-                    bail!(
-                        "more than one package in this commit provides '{}/{}'",
-                        link.subdir,
-                        link.name
-                    );
+                    return Err(StoreError::LinkClash {
+                        action: Action::Install,
+                        subdir: link.subdir,
+                        name: link.name.to_string(),
+                    });
                 }
                 if let Some(directory) = link_dirs.get(link.subdir) {
                     let existing = directory.join(&link.name);
                     match fs::symlink_metadata(&existing) {
-                        Ok(_) => bail!(
-                            "refusing to install '{}': '{}' already exists; links are never overwritten",
-                            receipt.name,
-                            existing.display()
-                        ),
+                        Ok(_) => {
+                            return Err(StoreError::LinkExists {
+                                name: receipt.name.to_string(),
+                                path: existing.to_path_buf(),
+                            });
+                        }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("failed to inspect '{}'", existing.display())
-                            });
+                            return Err(StoreError::io("failed to inspect", &existing)(error));
                         }
                     }
                 }
@@ -177,61 +172,56 @@ impl Store {
         directory: &Path,
         receipt: &Receipt,
         retained: Option<&HashMap<&str, &Receipt>>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         let metadata = fs::symlink_metadata(directory)
-            .with_context(|| format!("failed to inspect '{}'", directory.display()))?;
+            .map_err(StoreError::io("failed to inspect", &directory))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!(
-                "refusing to install '{}': '{}' already exists without a receipt; remove it or use a clean prefix",
-                receipt.name,
-                directory.display()
-            );
+            return Err(StoreError::UnreceiptedPackageDirectory {
+                name: receipt.name.to_string(),
+                path: directory.to_path_buf(),
+            });
         }
-        for entry in fs::read_dir(directory)
-            .with_context(|| format!("failed to read '{}'", directory.display()))?
+        for entry in
+            fs::read_dir(directory).map_err(StoreError::io("failed to read", &directory))?
         {
-            let entry = entry
-                .with_context(|| format!("failed to read an entry in '{}'", directory.display()))?;
+            let entry = entry.map_err(StoreError::io("failed to read an entry in", &directory))?;
             let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
-                bail!(
-                    "refusing to install '{}': '{}' contains a foreign entry; remove it or use a clean prefix",
-                    receipt.name,
-                    directory.display()
-                );
+                return Err(StoreError::ForeignCellarEntry {
+                    name: receipt.name.to_string(),
+                    path: directory.to_path_buf(),
+                });
             };
             if version == receipt.version {
-                bail!(
-                    "refusing to install '{} {}': '{}' is retained by surviving receipts; install a different version or clean up the retained keg manually",
-                    receipt.name,
-                    receipt.version,
-                    entry.path().display()
-                );
+                return Err(StoreError::VersionRetained {
+                    name: receipt.name.to_string(),
+                    version: receipt.version.to_string(),
+                    path: entry.path().to_path_buf(),
+                });
             }
             let Some(record) = retained.and_then(|versions| versions.get(version.as_str())) else {
-                bail!(
-                    "refusing to install '{}': '{}' contains '{}', which has no retained receipt; remove foreign entries first",
-                    receipt.name,
-                    directory.display(),
-                    version
-                );
+                return Err(StoreError::UnrecordedCellarEntry {
+                    name: receipt.name.to_string(),
+                    directory: directory.to_path_buf(),
+                    entry: version.to_string(),
+                });
             };
             if record.name != receipt.name || record.version != version {
-                bail!(
-                    "refusing to install '{}': the retained record for '{}' names '{} {}'; remove it manually",
-                    receipt.name,
-                    version,
-                    record.name,
-                    record.version
-                );
+                return Err(StoreError::RetainedRecordMismatch {
+                    action: Action::Install,
+                    name: receipt.name.to_string(),
+                    version: version.to_string(),
+                    record_name: record.name.to_string(),
+                    record_version: record.version.to_string(),
+                });
             }
             let metadata = fs::symlink_metadata(entry.path())
-                .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
+                .map_err(StoreError::io("failed to inspect", &entry.path()))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!(
-                    "refusing to install '{}': retained keg '{}' is not a real directory",
-                    receipt.name,
-                    entry.path().display()
-                );
+                return Err(StoreError::RetainedKegNotDirectory {
+                    action: Action::Install,
+                    name: receipt.name.to_string(),
+                    path: entry.path().to_path_buf(),
+                });
             }
         }
         Ok(())
@@ -246,7 +236,7 @@ impl Store {
         &self,
         expected: &[Receipt],
         pending_names: &HashSet<&str>,
-    ) -> Result<Vec<Promotion>> {
+    ) -> Result<Vec<Promotion>, StoreError> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
         let mut names = HashSet::new();
@@ -255,43 +245,40 @@ impl Store {
         for receipt in expected {
             validate_receipt(receipt)?;
             if !names.insert(receipt.name.clone()) {
-                bail!(
-                    "package '{}' appears more than once in one promotion",
-                    receipt.name
-                );
+                return Err(StoreError::DuplicatePackage {
+                    action: Action::Promote,
+                    name: receipt.name.to_string(),
+                });
             }
             if pending_names.contains(receipt.name.as_str()) {
-                bail!(
-                    "refusing to install and promote '{}' in the same call",
-                    receipt.name
-                );
+                return Err(StoreError::InstallAndPromote {
+                    name: receipt.name.to_string(),
+                });
             }
             if receipt.requested {
-                bail!(
-                    "refusing to promote '{} {}': the observed receipt is already requested",
-                    receipt.name,
-                    receipt.version
-                );
+                return Err(StoreError::AlreadyRequested {
+                    name: receipt.name.to_string(),
+                    version: receipt.version.to_string(),
+                });
             }
 
             let path = receipts.join(format!("{}.json", receipt.name));
-            let (current, original) = read_receipt_with_bytes(&path).with_context(|| {
-                format!(
-                    "refusing to promote '{} {}': its receipt '{}' could not be re-read",
-                    receipt.name,
-                    receipt.version,
-                    path.display()
-                )
+            let (current, original) = read_receipt_with_bytes(&path).map_err(|source| {
+                StoreError::PromotionReceiptUnreadable {
+                    name: receipt.name.clone(),
+                    version: receipt.version.clone(),
+                    path: path.clone(),
+                    source: Box::new(source),
+                }
             })?;
             if current != *receipt {
-                bail!(
-                    "refusing to promote '{} {}': the installed receipt now records {} {} with requested={}; re-read the installed packages and try again",
-                    receipt.name,
-                    receipt.version,
-                    current.name,
-                    current.version,
-                    current.requested
-                );
+                return Err(StoreError::PromotionReceiptChanged {
+                    name: receipt.name.to_string(),
+                    version: receipt.version.to_string(),
+                    current_name: current.name.to_string(),
+                    current_version: current.version.to_string(),
+                    requested: current.requested,
+                });
             }
             validate_promotion_keg(&receipt.name, &receipt.version, &cellar)?;
 
@@ -309,28 +296,26 @@ impl Store {
     }
 
     /// A stage must be a real directory directly inside this store's stages.
-    pub(super) fn validate_stage(&self, stage: &Path) -> Result<()> {
+    pub(super) fn validate_stage(&self, stage: &Path) -> Result<(), StoreError> {
         let stages = stages_dir(&self.prefix);
         let expected = stages
             .canonicalize()
-            .with_context(|| format!("failed to resolve '{}'", stages.display()))?;
+            .map_err(StoreError::io("failed to resolve", &stages))?;
         let metadata = fs::symlink_metadata(stage)
-            .with_context(|| format!("failed to inspect stage '{}'", stage.display()))?;
+            .map_err(StoreError::io("failed to inspect stage", &stage))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!(
-                "refusing stage '{}': it is not a real directory",
-                stage.display()
-            );
+            return Err(StoreError::StageNotDirectory {
+                stage: stage.to_path_buf(),
+            });
         }
         let actual = stage
             .canonicalize()
-            .with_context(|| format!("failed to resolve stage '{}'", stage.display()))?;
+            .map_err(StoreError::io("failed to resolve stage", &stage))?;
         if actual.parent() != Some(expected.as_path()) {
-            bail!(
-                "refusing stage '{}': it is not owned by '{}'",
-                stage.display(),
-                stages.display()
-            );
+            return Err(StoreError::StageNotOwned {
+                stage: stage.to_path_buf(),
+                stages: stages.to_path_buf(),
+            });
         }
         Ok(())
     }
@@ -338,43 +323,66 @@ impl Store {
 
 /// A promotion changes only a receipt, so the package must still own its real
 /// keg: a symlinked package directory or keg is a foreign path and is refused.
-fn validate_promotion_keg(name: &str, version: &str, cellar: &Path) -> Result<()> {
+fn validate_promotion_keg(name: &str, version: &str, cellar: &Path) -> Result<(), StoreError> {
     let package = cellar.join(name);
     match fs::symlink_metadata(&package) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing to promote '{name} {version}': '{}' is a symlink",
-            package.display()
-        ),
-        Ok(metadata) if !metadata.is_dir() => bail!(
-            "refusing to promote '{name} {version}': '{}' is not a directory",
-            package.display()
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StoreError::PackageDirectory {
+                action: Action::Promote,
+                name: name.to_string(),
+                version: version.to_string(),
+                path: package.to_path_buf(),
+                fault: DirFault::Symlink,
+            });
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(StoreError::PackageDirectory {
+                action: Action::Promote,
+                name: name.to_string(),
+                version: version.to_string(),
+                path: package.to_path_buf(),
+                fault: DirFault::NotDirectory,
+            });
+        }
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-            "refusing to promote '{name} {version}': '{}' is missing; remove it manually",
-            package.display()
-        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(StoreError::PackageDirectory {
+                action: Action::Promote,
+                name: name.to_string(),
+                version: version.to_string(),
+                path: package.to_path_buf(),
+                fault: DirFault::Missing,
+            });
+        }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect '{}'", package.display()));
+            return Err(StoreError::io("failed to inspect", &package)(error));
         }
     }
 
     let keg = package.join(version);
     match fs::symlink_metadata(&keg) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing to promote '{name} {version}': its keg '{}' is a symlink",
-            keg.display()
-        ),
-        Ok(metadata) if !metadata.is_dir() => bail!(
-            "refusing to promote '{name} {version}': its keg '{}' is not a directory",
-            keg.display()
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StoreError::Keg {
+            action: Action::Promote,
+            name: name.to_string(),
+            version: version.to_string(),
+            path: keg.to_path_buf(),
+            fault: DirFault::Symlink,
+        }),
+        Ok(metadata) if !metadata.is_dir() => Err(StoreError::Keg {
+            action: Action::Promote,
+            name: name.to_string(),
+            version: version.to_string(),
+            path: keg.to_path_buf(),
+            fault: DirFault::NotDirectory,
+        }),
         Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-            "refusing to promote '{name} {version}': its keg '{}' is missing; remove it manually",
-            keg.display()
-        ),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect '{}'", keg.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::Keg {
+            action: Action::Promote,
+            name: name.to_string(),
+            version: version.to_string(),
+            path: keg.to_path_buf(),
+            fault: DirFault::Missing,
+        }),
+        Err(error) => Err(StoreError::io("failed to inspect", &keg)(error)),
     }
 }

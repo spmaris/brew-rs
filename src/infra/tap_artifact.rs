@@ -10,11 +10,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::domain::tap_manifest::{MAX_ARTIFACT_BYTES, is_known_arch};
 use crate::domain::validate::is_lower_hex_digest;
+
+mod error;
+
+pub(crate) use error::TapArtifactError;
 
 /// Size of the 64-bit Mach-O header prefix needed for validation.
 const MACH_HEADER_64_BYTES: usize = 32;
@@ -47,7 +50,7 @@ pub(crate) fn stage_verified(
     destination: &Path,
     expected_sha256: &str,
     expected_arch: &str,
-) -> Result<u64> {
+) -> Result<u64, TapArtifactError> {
     stage_verified_inner(source, destination, expected_sha256, expected_arch)
 }
 
@@ -56,99 +59,108 @@ fn stage_verified_inner(
     destination: &Path,
     expected_sha256: &str,
     expected_arch: &str,
-) -> Result<u64> {
+) -> Result<u64, TapArtifactError> {
     if !is_lower_hex_digest(expected_sha256) {
-        bail!("refusing to stage a tap artifact without a lowercase SHA-256 digest");
+        return Err(TapArtifactError::StageWithoutDigest);
     }
     if !is_known_arch(expected_arch) {
-        bail!("refusing to stage a tap artifact for unsupported architecture '{expected_arch}'");
+        return Err(TapArtifactError::StageUnsupportedArch {
+            arch: expected_arch.to_owned(),
+        });
     }
 
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect cached artifact '{}'", source.display()))?;
+    let source_io = |action: &'static str| {
+        move |error: std::io::Error| TapArtifactError::Io {
+            action,
+            what: "cached artifact",
+            path: source.to_path_buf(),
+            source: error,
+        }
+    };
+    let metadata = fs::symlink_metadata(source).map_err(source_io("inspect"))?;
     if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing to stage '{}': the cached artifact is a symlink",
-            source.display()
-        );
+        return Err(TapArtifactError::StageSymlink {
+            path: source.to_path_buf(),
+        });
     }
     if !metadata.is_file() {
-        bail!(
-            "refusing to stage '{}': the cached artifact is not a regular file",
-            source.display()
-        );
+        return Err(TapArtifactError::StageNotRegular {
+            path: source.to_path_buf(),
+        });
     }
     if metadata.len() == 0 || metadata.len() > MAX_ARTIFACT_BYTES {
-        bail!(
-            "refusing to stage '{}': size {} is outside the supported range",
-            source.display(),
-            metadata.len()
-        );
+        return Err(TapArtifactError::StageSizeOutOfRange {
+            path: source.to_path_buf(),
+            size: metadata.len(),
+        });
     }
 
-    let mut input = File::open(source)
-        .with_context(|| format!("failed to open cached artifact '{}'", source.display()))?;
-    let input_metadata = input
-        .metadata()
-        .with_context(|| format!("failed to inspect cached artifact '{}'", source.display()))?;
+    let mut input = File::open(source).map_err(source_io("open"))?;
+    let input_metadata = input.metadata().map_err(source_io("inspect"))?;
     if !input_metadata.is_file() || input_metadata.len() > MAX_ARTIFACT_BYTES {
-        bail!(
-            "refusing to stage '{}': the cached artifact changed while it was opened",
-            source.display()
-        );
+        return Err(TapArtifactError::StageChangedWhileOpened {
+            path: source.to_path_buf(),
+        });
     }
 
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)
-        .with_context(|| {
-            format!(
-                "failed to create staged artifact '{}'",
-                destination.display()
-            )
+        .map_err(|error| TapArtifactError::Io {
+            action: "create",
+            what: "staged artifact",
+            path: destination.to_path_buf(),
+            source: error,
         })?;
 
     // From this point on the destination is known to have been created by this
     // invocation. Errors before `create_new` (including an existing
     // destination) must leave a pre-existing file untouched.
-    let written = (|| -> Result<u64> {
+    let written = (|| -> Result<u64, TapArtifactError> {
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
         let mut total = 0_u64;
         loop {
-            let read = input.read(&mut buffer).with_context(|| {
-                format!("failed to read cached artifact '{}'", source.display())
-            })?;
+            let read = input.read(&mut buffer).map_err(source_io("read"))?;
             if read == 0 {
                 break;
             }
             total = total
                 .checked_add(read as u64)
-                .context("tap artifact size overflowed")?;
+                .ok_or(TapArtifactError::SizeOverflow)?;
             if total > MAX_ARTIFACT_BYTES {
-                bail!(
-                    "refusing to stage '{}': artifact exceeds the {MAX_ARTIFACT_BYTES} byte limit",
-                    source.display()
-                );
+                return Err(TapArtifactError::StageTooLarge {
+                    path: source.to_path_buf(),
+                    limit: MAX_ARTIFACT_BYTES,
+                });
             }
             hasher.update(&buffer[..read]);
             output
                 .write_all(&buffer[..read])
-                .with_context(|| format!("failed to write '{}'", destination.display()))?;
+                .map_err(|error| TapArtifactError::IoPath {
+                    action: "write",
+                    path: destination.to_path_buf(),
+                    source: error,
+                })?;
         }
 
         let actual = hex::encode(hasher.finalize());
         if actual != expected_sha256 {
-            bail!(
-                "SHA-256 mismatch for '{}': expected {expected_sha256}, got {actual}",
-                source.display()
-            );
+            return Err(TapArtifactError::StageDigestMismatch {
+                path: source.to_path_buf(),
+                expected: expected_sha256.to_owned(),
+                actual,
+            });
         }
 
         output
             .sync_all()
-            .with_context(|| format!("failed to flush '{}'", destination.display()))?;
+            .map_err(|error| TapArtifactError::IoPath {
+                action: "flush",
+                path: destination.to_path_buf(),
+                source: error,
+            })?;
         Ok(total)
     })();
     drop(output);
@@ -169,7 +181,7 @@ pub(crate) fn verify_artifact(
     path: &Path,
     expected_sha256: &str,
     expected_arch: &str,
-) -> Result<u64> {
+) -> Result<u64, TapArtifactError> {
     let total = hash_regular_file(
         path,
         expected_sha256,
@@ -185,141 +197,157 @@ pub(crate) fn hash_regular_file(
     path: &Path,
     expected_sha256: &str,
     limit: u64,
-    what: &str,
-) -> Result<u64> {
+    what: &'static str,
+) -> Result<u64, TapArtifactError> {
     if !is_lower_hex_digest(expected_sha256) {
-        bail!("refusing to verify {what} without a lowercase SHA-256 digest");
+        return Err(TapArtifactError::VerifyWithoutDigest { what });
     }
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {what} '{}'", path.display()))?;
+    let io_error = |action: &'static str| {
+        move |source: std::io::Error| TapArtifactError::Io {
+            action,
+            what,
+            path: path.to_path_buf(),
+            source,
+        }
+    };
+    let metadata = fs::symlink_metadata(path).map_err(io_error("inspect"))?;
     if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing to verify {what} '{}': it is a symlink",
-            path.display()
-        );
+        return Err(TapArtifactError::VerifySymlink {
+            what,
+            path: path.to_path_buf(),
+        });
     }
     if !metadata.is_file() {
-        bail!(
-            "refusing to verify {what} '{}': it is not a regular file",
-            path.display()
-        );
+        return Err(TapArtifactError::VerifyNotRegular {
+            what,
+            path: path.to_path_buf(),
+        });
     }
     if metadata.len() > limit {
-        bail!(
-            "refusing to verify {what} '{}': {} bytes exceeds the {limit} byte limit",
-            path.display(),
-            metadata.len()
-        );
+        return Err(TapArtifactError::VerifySizeExceeded {
+            what,
+            path: path.to_path_buf(),
+            size: metadata.len(),
+            limit,
+        });
     }
 
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {what} '{}'", path.display()))?;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("failed to inspect {what} '{}'", path.display()))?;
+    let mut file = File::open(path).map_err(io_error("open"))?;
+    let opened = file.metadata().map_err(io_error("inspect"))?;
     if !opened.is_file() {
-        bail!(
-            "refusing to verify {what} '{}': not a regular file",
-            path.display()
-        );
+        return Err(TapArtifactError::VerifyOpenedNotRegular {
+            what,
+            path: path.to_path_buf(),
+        });
     }
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
     let mut total = 0_u64;
     loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {what} '{}'", path.display()))?;
+        let read = file.read(&mut buffer).map_err(io_error("read"))?;
         if read == 0 {
             break;
         }
         total = total
             .checked_add(read as u64)
-            .context("tap artifact size overflowed")?;
+            .ok_or(TapArtifactError::SizeOverflow)?;
         if total > limit {
-            bail!(
-                "refusing to verify {what} '{}': it exceeds the {limit} byte limit",
-                path.display()
-            );
+            return Err(TapArtifactError::VerifyStreamExceeded {
+                what,
+                path: path.to_path_buf(),
+                limit,
+            });
         }
         hasher.update(&buffer[..read]);
     }
     let actual = hex::encode(hasher.finalize());
     if actual != expected_sha256 {
-        bail!(
-            "SHA-256 mismatch for {what} '{}': expected {expected_sha256}, got {actual}",
-            path.display()
-        );
+        return Err(TapArtifactError::VerifyDigestMismatch {
+            what,
+            path: path.to_path_buf(),
+            expected: expected_sha256.to_owned(),
+            actual,
+        });
     }
     Ok(total)
 }
 
-fn read_header_word(header: &[u8], offset: usize) -> Result<u32> {
+fn read_header_word(header: &[u8], offset: usize) -> Result<u32, TapArtifactError> {
     let bytes: [u8; 4] = header
         .get(offset..offset + 4)
         .and_then(|word| word.try_into().ok())
-        .with_context(|| format!("Mach-O header is too short to read offset {offset}"))?;
+        .ok_or(TapArtifactError::HeaderTooShort { offset })?;
     Ok(u32::from_le_bytes(bytes))
 }
 
 /// Validate that `path` is a thin 64-bit Mach-O executable for `expected_arch`.
-pub(crate) fn validate_macho(path: &Path, expected_arch: &str) -> Result<()> {
+pub(crate) fn validate_macho(path: &Path, expected_arch: &str) -> Result<(), TapArtifactError> {
     let expected_cpu = match expected_arch {
         "arm64" => CPU_TYPE_ARM64,
         "x86_64" => CPU_TYPE_X86_64,
-        other => bail!("unsupported tap artifact architecture '{other}'"),
+        other => {
+            return Err(TapArtifactError::UnsupportedArch {
+                arch: other.to_owned(),
+            });
+        }
     };
 
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open tap artifact '{}'", path.display()))?;
-    let mut header = [0_u8; MACH_HEADER_64_BYTES];
-    file.read_exact(&mut header).with_context(|| {
-        format!(
-            "tap artifact '{}' is too short to be a Mach-O executable",
-            path.display()
-        )
+    let mut file = File::open(path).map_err(|source| TapArtifactError::Io {
+        action: "open",
+        what: "tap artifact",
+        path: path.to_path_buf(),
+        source,
     })?;
+    let mut header = [0_u8; MACH_HEADER_64_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|source| TapArtifactError::TooShort {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     if FAT_MAGICS.iter().any(|magic| header.starts_with(magic)) {
-        bail!(
-            "refusing '{}': universal (fat) Mach-O artifacts are unsupported; provide one naked executable per architecture",
-            path.display()
-        );
+        return Err(TapArtifactError::FatMacho {
+            path: path.to_path_buf(),
+        });
     }
     let magic = read_header_word(&header, 0)?;
     if magic != MH_MAGIC_64 {
-        bail!(
-            "refusing '{}': expected a thin 64-bit little-endian Mach-O executable",
-            path.display()
-        );
+        return Err(TapArtifactError::NotThin64 {
+            path: path.to_path_buf(),
+        });
     }
     let cpu_type = read_header_word(&header, 4)?;
     let file_type = read_header_word(&header, 12)?;
     if cpu_type != expected_cpu {
-        bail!(
-            "refusing '{}': Mach-O CPU type 0x{cpu_type:08x} does not match the selected {expected_arch} artifact",
-            path.display()
-        );
+        return Err(TapArtifactError::CpuMismatch {
+            path: path.to_path_buf(),
+            cpu_type,
+            arch: expected_arch.to_owned(),
+        });
     }
     if file_type != MH_EXECUTE {
-        bail!(
-            "refusing '{}': Mach-O file type 0x{file_type:08x} is not a standalone executable",
-            path.display()
-        );
+        return Err(TapArtifactError::NotExecutableType {
+            path: path.to_path_buf(),
+            file_type,
+        });
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<()> {
+fn set_executable(path: &Path) -> Result<(), TapArtifactError> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("failed to make '{}' executable", path.display()))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|source| {
+        TapArtifactError::MakeExecutable {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<()> {
+fn set_executable(_path: &Path) -> Result<(), TapArtifactError> {
     Ok(())
 }
 

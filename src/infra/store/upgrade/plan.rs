@@ -5,7 +5,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use super::super::StoreError;
+use super::super::error::{Action, DirFault};
 
 use super::super::links::{
     LINK_DIRECTORIES, collect_owned_links, existing_link_directories, opt_link_target, staged_links,
@@ -22,7 +23,10 @@ use super::super::{OwnedLink, Pending, Removal, Store, Upgrade};
 impl Store {
     /// Check every old receipt, keg, and owned link and every replacement
     /// before moving anything.
-    pub(super) fn plan_upgrade(&self, packages: Vec<(Receipt, Prepared)>) -> Result<Vec<Upgrade>> {
+    pub(super) fn plan_upgrade(
+        &self,
+        packages: Vec<(Receipt, Prepared)>,
+    ) -> Result<Vec<Upgrade>, StoreError> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
         let opt = opt_dir(&self.prefix);
@@ -46,31 +50,28 @@ impl Store {
             validate_receipt(&old)?;
             validate_receipt(&receipt)?;
             if old.name != receipt.name {
-                bail!(
-                    "refusing to upgrade '{}': the staged package is '{}'",
-                    old.name,
-                    receipt.name
-                );
+                return Err(StoreError::StagedNameMismatch {
+                    name: old.name.to_string(),
+                    staged: receipt.name.to_string(),
+                });
             }
             if !names.insert(old.name.clone()) {
-                bail!(
-                    "package '{}' appears more than once in one upgrade",
-                    old.name
-                );
+                return Err(StoreError::DuplicatePackage {
+                    action: Action::Upgrade,
+                    name: old.name.to_string(),
+                });
             }
             if old.requested != receipt.requested {
-                bail!(
-                    "refusing to upgrade '{} {}': the replacement would change its requested status",
-                    old.name,
-                    old.version
-                );
+                return Err(StoreError::RequestedChanged {
+                    name: old.name.to_string(),
+                    version: old.version.to_string(),
+                });
             }
             if old.version == receipt.version && old.version_scheme == receipt.version_scheme {
-                bail!(
-                    "refusing to upgrade '{}': version {} is already installed; the caller must skip it",
-                    old.name,
-                    old.version
-                );
+                return Err(StoreError::UpgradeSameVersion {
+                    name: old.name.to_string(),
+                    version: old.version.to_string(),
+                });
             }
             self.validate_stage(stage.path())?;
             let links = if receipt.keg_only {
@@ -80,73 +81,90 @@ impl Store {
             };
 
             let receipt_path = receipts.join(format!("{}.json", old.name));
-            let current = existing_receipt(&receipt_path)?.with_context(|| {
-                format!(
-                    "refusing to upgrade '{} {}': its receipt '{}' no longer exists",
-                    old.name,
-                    old.version,
-                    receipt_path.display()
-                )
-            })?;
+            let current =
+                existing_receipt(&receipt_path)?.ok_or_else(|| StoreError::ReceiptGone {
+                    action: Action::Upgrade,
+                    name: old.name.clone(),
+                    version: old.version.clone(),
+                    path: receipt_path.clone(),
+                })?;
             if current != old {
-                bail!(
-                    "refusing to upgrade '{} {}': the installed receipt now records {} {}; re-read the installed packages and try again",
-                    old.name,
-                    old.version,
-                    current.name,
-                    current.version
-                );
+                return Err(StoreError::ReceiptChanged {
+                    action: Action::Upgrade,
+                    name: old.name.to_string(),
+                    version: old.version.to_string(),
+                    current_name: current.name.to_string(),
+                    current_version: current.version.to_string(),
+                });
             }
 
             let package = cellar.join(&old.name);
             match fs::symlink_metadata(&package) {
-                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                    "refusing to upgrade '{}': '{}' is a symlink",
-                    old.name,
-                    package.display()
-                ),
-                Ok(metadata) if !metadata.is_dir() => bail!(
-                    "refusing to upgrade '{}': '{}' is not a directory",
-                    old.name,
-                    package.display()
-                ),
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::Symlink,
+                    });
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::NotDirectory,
+                    });
+                }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                    "refusing to upgrade '{} {}': '{}' is missing; remove it manually",
-                    old.name,
-                    old.version,
-                    package.display()
-                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::Missing,
+                    });
+                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", package.display()));
+                    return Err(StoreError::io("failed to inspect", &package)(error));
                 }
             }
 
             let keg = package.join(&old.version);
             match fs::symlink_metadata(&keg) {
-                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                    "refusing to upgrade '{} {}': '{}' is a symlink",
-                    old.name,
-                    old.version,
-                    keg.display()
-                ),
-                Ok(metadata) if !metadata.is_dir() => bail!(
-                    "refusing to upgrade '{} {}': '{}' is not a directory",
-                    old.name,
-                    old.version,
-                    keg.display()
-                ),
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(StoreError::Keg {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::Symlink,
+                    });
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(StoreError::Keg {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::NotDirectory,
+                    });
+                }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                    "refusing to upgrade '{} {}': its keg '{}' is missing; remove it manually",
-                    old.name,
-                    old.version,
-                    keg.display()
-                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(StoreError::Keg {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: old.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::Missing,
+                    });
+                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", keg.display()));
+                    return Err(StoreError::io("failed to inspect", &keg)(error));
                 }
             }
 
@@ -158,58 +176,54 @@ impl Store {
             if let Some(versions) = retained_by_name.get(old.name.as_str())
                 && versions.contains_key(old.version.as_str())
             {
-                bail!(
-                    "refusing to upgrade '{}': the active version {} also has a retained record; remove the stale retained record manually",
-                    old.name,
-                    old.version
-                );
+                return Err(StoreError::ActiveAlsoRetained {
+                    name: old.name.to_string(),
+                    version: old.version.to_string(),
+                });
             }
-            for entry in fs::read_dir(&package)
-                .with_context(|| format!("failed to read '{}'", package.display()))?
+            for entry in
+                fs::read_dir(&package).map_err(StoreError::io("failed to read", &package))?
             {
-                let entry = entry.with_context(|| {
-                    format!("failed to read an entry in '{}'", package.display())
-                })?;
+                let entry =
+                    entry.map_err(StoreError::io("failed to read an entry in", &package))?;
                 let file_name = entry.file_name();
                 if file_name.as_os_str() == OsStr::new(&old.version) {
                     continue;
                 }
                 let Some(version) = file_name.to_str() else {
-                    bail!(
-                        "refusing to upgrade '{}': '{}' contains a foreign entry; remove it first",
-                        old.name,
-                        package.display()
-                    );
+                    return Err(StoreError::UpgradeForeignEntry {
+                        name: old.name.to_string(),
+                        path: package.to_path_buf(),
+                    });
                 };
                 let Some(record) = retained_by_name
                     .get(old.name.as_str())
                     .and_then(|versions| versions.get(version))
                 else {
-                    bail!(
-                        "refusing to upgrade '{}': '{}' contains '{}', which is not the installed version {} and has no retained record; remove foreign entries first",
-                        old.name,
-                        package.display(),
-                        file_name.to_string_lossy(),
-                        old.version
-                    );
+                    return Err(StoreError::UpgradeUnrecordedEntry {
+                        name: old.name.to_string(),
+                        directory: package.to_path_buf(),
+                        entry: file_name.to_string_lossy().to_string(),
+                        version: old.version.to_string(),
+                    });
                 };
                 if record.name != old.name || record.version != version {
-                    bail!(
-                        "refusing to upgrade '{}': the retained record for '{}' names '{} {}'; remove it manually",
-                        old.name,
-                        version,
-                        record.name,
-                        record.version
-                    );
+                    return Err(StoreError::RetainedRecordMismatch {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        version: version.to_string(),
+                        record_name: record.name.to_string(),
+                        record_version: record.version.to_string(),
+                    });
                 }
                 let metadata = fs::symlink_metadata(entry.path())
-                    .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
+                    .map_err(StoreError::io("failed to inspect", &entry.path()))?;
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    bail!(
-                        "refusing to upgrade '{}': retained keg '{}' is not a real directory",
-                        old.name,
-                        entry.path().display()
-                    );
+                    return Err(StoreError::RetainedKegNotDirectory {
+                        action: Action::Upgrade,
+                        name: old.name.to_string(),
+                        path: entry.path().to_path_buf(),
+                    });
                 }
             }
 
@@ -230,9 +244,8 @@ impl Store {
                 match fs::symlink_metadata(&opt_path) {
                     Ok(metadata) => {
                         let owned = if metadata.file_type().is_symlink() {
-                            let actual = fs::read_link(&opt_path).with_context(|| {
-                                format!("failed to read link '{}'", opt_path.display())
-                            })?;
+                            let actual = fs::read_link(&opt_path)
+                                .map_err(StoreError::io("failed to read link", &opt_path))?;
                             actual.as_os_str() == opt_target.as_os_str()
                         } else {
                             false
@@ -243,20 +256,16 @@ impl Store {
                                 target: opt_target,
                             });
                         } else {
-                            bail!(
-                                "refusing to upgrade '{}': '{}' already exists and is not a link owned by {} {}; refusing to overwrite it",
-                                old.name,
-                                opt_path.display(),
-                                old.name,
-                                old.version
-                            );
+                            return Err(StoreError::LinkNotOwned {
+                                name: old.name.to_string(),
+                                version: old.version.to_string(),
+                                path: opt_path.to_path_buf(),
+                            });
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("failed to inspect '{}'", opt_path.display())
-                        });
+                        return Err(StoreError::io("failed to inspect", &opt_path)(error));
                     }
                 }
             }
@@ -268,31 +277,27 @@ impl Store {
             // `link_names`.
             for link in &links {
                 if !link_names.insert(link.clone()) {
-                    bail!(
-                        "more than one package in this upgrade provides '{}/{}'",
-                        link.subdir,
-                        link.name
-                    );
+                    return Err(StoreError::LinkClash {
+                        action: Action::Upgrade,
+                        subdir: link.subdir,
+                        name: link.name.to_string(),
+                    });
                 }
                 if let Some(directory) = link_dirs.get(link.subdir) {
                     let existing = directory.join(&link.name);
                     match fs::symlink_metadata(&existing) {
                         Ok(_) => {
                             if !owned_links.iter().any(|owned| owned.path == existing) {
-                                bail!(
-                                    "refusing to upgrade '{}': '{}' already exists and is not a link owned by {} {}; refusing to overwrite it",
-                                    old.name,
-                                    existing.display(),
-                                    old.name,
-                                    old.version
-                                );
+                                return Err(StoreError::LinkNotOwned {
+                                    name: old.name.to_string(),
+                                    version: old.version.to_string(),
+                                    path: existing.to_path_buf(),
+                                });
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("failed to inspect '{}'", existing.display())
-                            });
+                            return Err(StoreError::io("failed to inspect", &existing)(error));
                         }
                     }
                 }

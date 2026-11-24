@@ -14,17 +14,17 @@
 
 mod cache;
 mod consts;
+mod error;
 mod request;
 mod stage;
 mod url;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-
 use crate::config::Config;
 
 pub(super) use cache::{ensure_isolated_cache_dir, reuse_cached_bottle, verify_file_digest};
+pub(crate) use error::DownloadError;
 pub(super) use request::{build_verified_client, request_timeout};
 pub(super) use stage::stage_bottle;
 
@@ -45,7 +45,7 @@ use url::parse_bottle_url;
 /// URL with no credentials, port, query, fragment, percent-encoding, or path
 /// traversal segments, and `sha256` must be exactly 64 lowercase hexadecimal
 /// characters equal to the digest embedded in `url`.
-pub async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf> {
+pub async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf, DownloadError> {
     let source = parse_bottle_url(url, sha256)?;
     let directory = bottle_cache_dir(config)?;
     let destination = directory.join(format!("{}{BOTTLE_SUFFIX}", source.digest));

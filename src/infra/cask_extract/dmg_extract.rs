@@ -5,8 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
-
+use super::error::CaskExtractError;
 use super::tree::validate_archive_entry_path;
 use crate::domain::cask_plan::{CaskSourcePath, PlannedCask, PlannedCaskArtifact};
 
@@ -17,12 +16,15 @@ pub(super) fn extract_dmg(
     stage_dir: &Path,
     unpack_dir: &Path,
     planned: &PlannedCask,
-) -> Result<()> {
+) -> Result<(), CaskExtractError> {
     let sources = collect_dmg_sources(planned)?;
     let mount_parent = tempfile::Builder::new()
         .prefix("dmg-mount-")
         .tempdir_in(stage_dir)
-        .context("failed to create DMG mount parent directory")?;
+        .map_err(|source| CaskExtractError::Stream {
+            action: "create DMG mount parent directory",
+            source,
+        })?;
     let mounted = MountedDmg::attach(dmg_path, mount_parent.path())?;
 
     for rel_source in sources {
@@ -33,7 +35,7 @@ pub(super) fn extract_dmg(
     Ok(())
 }
 
-fn collect_dmg_sources(planned: &PlannedCask) -> Result<Vec<String>> {
+fn collect_dmg_sources(planned: &PlannedCask) -> Result<Vec<String>, CaskExtractError> {
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
     for artifact in &planned.artifacts {
@@ -74,41 +76,43 @@ fn collect_dmg_sources(planned: &PlannedCask) -> Result<Vec<String>> {
         }
     }
     if sources.is_empty() {
-        bail!(
-            "cask '{}' has no extractable DMG source artifacts",
-            planned.token
-        );
+        return Err(CaskExtractError::NoDmgSources {
+            token: planned.token.clone(),
+        });
     }
     Ok(sources)
 }
 
-fn copy_from_dmg(mount_point: &Path, unpack_dir: &Path, rel_source: &str) -> Result<()> {
+fn copy_from_dmg(
+    mount_point: &Path,
+    unpack_dir: &Path,
+    rel_source: &str,
+) -> Result<(), CaskExtractError> {
     validate_archive_entry_path(rel_source, false)?;
     // Verify no path component inside the DMG up to and including `rel_source`
     // is a symlink (e.g. a DMG `/Applications` drop symlink).
     let mut current = mount_point.to_path_buf();
     for segment in rel_source.split('/') {
         current.push(segment);
-        let meta = fs::symlink_metadata(&current).with_context(|| {
-            format!(
-                "DMG artifact '{}' is missing at '{}'",
-                rel_source,
-                current.display()
-            )
+        let meta = fs::symlink_metadata(&current).map_err(|source| {
+            CaskExtractError::DmgArtifactMissing {
+                artifact: rel_source.to_owned(),
+                path: current.clone(),
+                source,
+            }
         })?;
         if meta.file_type().is_symlink() {
-            bail!(
-                "refusing DMG artifact '{}': path component '{}' is a symlink",
-                rel_source,
-                current.display()
-            );
+            return Err(CaskExtractError::DmgArtifactSymlink {
+                artifact: rel_source.to_owned(),
+                component: current,
+            });
         }
     }
 
     let src_path = mount_point.join(rel_source);
     let dst_path = unpack_dir.join(rel_source);
     if let Some(parent) = dst_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
     }
 
     let status = Command::new("/usr/bin/ditto")
@@ -116,12 +120,15 @@ fn copy_from_dmg(mount_point: &Path, unpack_dir: &Path, rel_source: &str) -> Res
         .arg(&dst_path)
         .stdin(Stdio::null())
         .status()
-        .context("failed to execute /usr/bin/ditto for DMG copy")?;
+        .map_err(|source| CaskExtractError::Stream {
+            action: "execute /usr/bin/ditto for DMG copy",
+            source,
+        })?;
     if !status.success() {
-        bail!(
-            "/usr/bin/ditto failed to copy DMG artifact '{}' ({status})",
-            rel_source
-        );
+        return Err(CaskExtractError::DittoCopyFailed {
+            artifact: rel_source.to_owned(),
+            status,
+        });
     }
     Ok(())
 }
@@ -132,7 +139,7 @@ struct MountedDmg {
 }
 
 impl MountedDmg {
-    fn attach(dmg_path: &Path, mount_parent: &Path) -> Result<Self> {
+    fn attach(dmg_path: &Path, mount_parent: &Path) -> Result<Self, CaskExtractError> {
         let output = Command::new("/usr/bin/hdiutil")
             .args([
                 "attach",
@@ -146,44 +153,48 @@ impl MountedDmg {
             .arg(dmg_path)
             .stdin(Stdio::null())
             .output()
-            .context("failed to execute /usr/bin/hdiutil attach")?;
+            .map_err(|source| CaskExtractError::Stream {
+                action: "execute /usr/bin/hdiutil attach",
+                source,
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "/usr/bin/hdiutil attach failed for '{}' ({}): {}",
-                dmg_path.display(),
-                output.status,
-                stderr.trim()
-            );
+            return Err(CaskExtractError::HdiutilAttachFailed {
+                path: dmg_path.to_path_buf(),
+                status: output.status,
+                stderr: stderr.trim().to_owned(),
+            });
         }
         let plist = std::str::from_utf8(&output.stdout)
-            .context("hdiutil attach -plist returned non-UTF-8 output")?;
+            .map_err(|source| CaskExtractError::HdiutilOutputNotUtf8 { source })?;
         let mount_point = parse_hdiutil_mount_point(plist)?;
 
         let canonical_parent =
-            fs::canonicalize(mount_parent).context("failed to canonicalize DMG mount parent")?;
-        let canonical_mount = fs::canonicalize(&mount_point).with_context(|| {
-            format!(
-                "failed to canonicalize DMG mount '{}'",
-                mount_point.display()
-            )
-        })?;
-        let meta = fs::symlink_metadata(&canonical_mount).with_context(|| {
-            format!(
-                "failed to inspect DMG mount '{}'",
-                canonical_mount.display()
-            )
-        })?;
+            fs::canonicalize(mount_parent).map_err(|source| CaskExtractError::Stream {
+                action: "canonicalize DMG mount parent",
+                source,
+            })?;
+        let canonical_mount =
+            fs::canonicalize(&mount_point).map_err(|source| CaskExtractError::Io {
+                action: "canonicalize DMG mount",
+                path: mount_point.clone(),
+                source,
+            })?;
+        let meta =
+            fs::symlink_metadata(&canonical_mount).map_err(|source| CaskExtractError::Io {
+                action: "inspect DMG mount",
+                path: canonical_mount.clone(),
+                source,
+            })?;
         if !meta.is_dir()
             || !canonical_mount.starts_with(&canonical_parent)
             || canonical_mount == canonical_parent
         {
             let _ = detach_mount(&mount_point);
-            bail!(
-                "refusing DMG mount point '{}' outside '{}'",
-                mount_point.display(),
-                canonical_parent.display()
-            );
+            return Err(CaskExtractError::MountOutsideParent {
+                mount_point,
+                parent: canonical_parent,
+            });
         }
 
         Ok(Self {
@@ -196,7 +207,7 @@ impl MountedDmg {
         &self.mount_point
     }
 
-    fn detach(mut self) -> Result<()> {
+    fn detach(mut self) -> Result<(), CaskExtractError> {
         self.detached = true;
         detach_mount(&self.mount_point)
     }
@@ -210,7 +221,7 @@ impl Drop for MountedDmg {
     }
 }
 
-fn detach_mount(mount_point: &Path) -> Result<()> {
+fn detach_mount(mount_point: &Path) -> Result<(), CaskExtractError> {
     let status = Command::new("/usr/bin/hdiutil")
         .args(["detach", "-quiet"])
         .arg(mount_point)
@@ -224,11 +235,16 @@ fn detach_mount(mount_point: &Path) -> Result<()> {
                 .arg(mount_point)
                 .stdin(Stdio::null())
                 .status()
-                .context("failed to run /usr/bin/hdiutil detach -force")?;
+                .map_err(|source| CaskExtractError::Stream {
+                    action: "run /usr/bin/hdiutil detach -force",
+                    source,
+                })?;
             if force_status.success() {
                 Ok(())
             } else {
-                bail!("failed to detach DMG at '{}'", mount_point.display())
+                Err(CaskExtractError::DetachFailed {
+                    mount_point: mount_point.to_path_buf(),
+                })
             }
         }
     }
@@ -236,7 +252,7 @@ fn detach_mount(mount_point: &Path) -> Result<()> {
 
 /// Extract the `<key>mount-point</key><string>...</string>` path from
 /// `hdiutil attach -plist` XML output.
-pub(super) fn parse_hdiutil_mount_point(plist: &str) -> Result<PathBuf> {
+pub(super) fn parse_hdiutil_mount_point(plist: &str) -> Result<PathBuf, CaskExtractError> {
     let key = "<key>mount-point</key>";
     let mut search_from = 0;
     while let Some(idx) = plist[search_from..].find(key) {
@@ -250,21 +266,21 @@ pub(super) fn parse_hdiutil_mount_point(plist: &str) -> Result<PathBuf> {
             if path.is_absolute() && !decoded.contains('\0') {
                 return Ok(path);
             }
-            bail!("invalid mount-point path in hdiutil plist: '{decoded}'");
+            return Err(CaskExtractError::InvalidMountPoint { value: decoded });
         }
         search_from += idx + key.len();
     }
-    bail!("hdiutil attach output did not include a <key>mount-point</key>")
+    Err(CaskExtractError::MissingMountPoint)
 }
 
-fn decode_xml_entities(input: &str) -> Result<String> {
+fn decode_xml_entities(input: &str) -> Result<String, CaskExtractError> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let after = &rest[amp + 1..];
         let Some(semi) = after.find(';') else {
-            bail!("unterminated XML entity in hdiutil plist");
+            return Err(CaskExtractError::UnterminatedXmlEntity);
         };
         let entity = &after[..semi];
         match entity {
@@ -275,18 +291,22 @@ fn decode_xml_entities(input: &str) -> Result<String> {
             "quot" => out.push('"'),
             hex if hex.starts_with("#x") || hex.starts_with("#X") => {
                 let code = u32::from_str_radix(&hex[2..], 16)
-                    .context("invalid hex XML entity in hdiutil plist")?;
-                let ch = char::from_u32(code).context("invalid Unicode scalar in XML entity")?;
+                    .map_err(|source| CaskExtractError::InvalidHexEntity { source })?;
+                let ch = char::from_u32(code).ok_or(CaskExtractError::InvalidUnicodeScalar)?;
                 out.push(ch);
             }
             dec if dec.starts_with('#') => {
                 let code: u32 = dec[1..]
                     .parse()
-                    .context("invalid decimal XML entity in hdiutil plist")?;
-                let ch = char::from_u32(code).context("invalid Unicode scalar in XML entity")?;
+                    .map_err(|source| CaskExtractError::InvalidDecimalEntity { source })?;
+                let ch = char::from_u32(code).ok_or(CaskExtractError::InvalidUnicodeScalar)?;
                 out.push(ch);
             }
-            other => bail!("unsupported XML entity '&{other};' in hdiutil plist"),
+            other => {
+                return Err(CaskExtractError::UnsupportedXmlEntity {
+                    entity: other.to_owned(),
+                });
+            }
         }
         rest = &after[semi + 1..];
     }

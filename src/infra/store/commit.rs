@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
+use super::error::error_chain;
 
 use super::links::{create_symlink, keg_link_target, link_directory, opt_link_target};
 use super::lock::InstallLock;
@@ -25,7 +26,7 @@ impl Store {
     /// the projected receipt graph is validated first, so every direct
     /// dependency of every receipt this commit would leave behind must exist at
     /// its exact name, version, and digest.
-    pub(crate) fn commit(&self, packages: Vec<Prepared>) -> Result<()> {
+    pub(crate) fn commit(&self, packages: Vec<Prepared>) -> Result<(), StoreError> {
         self.commit_inner(packages, None)
     }
 
@@ -33,7 +34,7 @@ impl Store {
         &self,
         packages: Vec<Prepared>,
         fail_after: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         self.ensure_owned()?;
         if packages.is_empty() {
             return Ok(());
@@ -45,14 +46,7 @@ impl Store {
         let mut applied = Vec::new();
         match self.apply(pending, fail_after, &mut applied) {
             Ok(()) => Ok(()),
-            Err(error) => {
-                let issues = rollback(&applied);
-                if issues.is_empty() {
-                    Err(error)
-                } else {
-                    Err(error.context(format!("rollback was incomplete: {}", issues.join("; "))))
-                }
-            }
+            Err(error) => finish_commit(error, rollback(&applied)),
         }
     }
 
@@ -78,7 +72,7 @@ impl Store {
         &self,
         packages: Vec<Prepared>,
         expected: &[Receipt],
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         if expected.is_empty() {
             return self.commit(packages);
         }
@@ -96,7 +90,7 @@ impl Store {
         expected: &[Receipt],
         fail_install_after: Option<usize>,
         fail_promotion_after: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         self.ensure_owned()?;
         // The lock covers promotion planning, install preflight, application,
         // and rollback, so no concurrent brewrs writer can change a receipt,
@@ -159,7 +153,7 @@ impl Store {
         pending: Vec<Pending>,
         fail_after: Option<usize>,
         applied: &mut Vec<Applied>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         self.apply_inner(pending, fail_after, applied, false)
     }
 
@@ -171,7 +165,7 @@ impl Store {
         fail_after: Option<usize>,
         applied: &mut Vec<Applied>,
         reuse_cellar: bool,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         let cellar = cellar_dir(&self.prefix);
         let sbin = sbin_dir(&self.prefix);
         let opt = opt_dir(&self.prefix);
@@ -181,7 +175,11 @@ impl Store {
 
         for (index, package) in pending.into_iter().enumerate() {
             if fail_after == Some(index) {
-                bail!("injected commit failure before package {index}");
+                return Err(StoreError::InjectedFailure {
+                    what: "commit",
+                    unit: "package",
+                    index,
+                });
             }
             let Pending {
                 receipt,
@@ -201,27 +199,22 @@ impl Store {
                 match fs::create_dir(&package_cellar) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let metadata =
-                            fs::symlink_metadata(&package_cellar).with_context(|| {
-                                format!("failed to inspect '{}'", package_cellar.display())
-                            })?;
+                        let metadata = fs::symlink_metadata(&package_cellar)
+                            .map_err(StoreError::io("failed to inspect", &package_cellar))?;
                         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                            bail!(
-                                "refusing to install '{}': '{}' is no longer a real directory",
-                                name,
-                                package_cellar.display()
-                            );
+                            return Err(StoreError::CellarChanged {
+                                name: name.to_string(),
+                                path: package_cellar.to_path_buf(),
+                            });
                         }
                         cellar_created = false;
                     }
                     Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "failed to create '{}' for {} {}",
-                                package_cellar.display(),
-                                name,
-                                version
-                            )
+                        return Err(StoreError::CreateCellar {
+                            path: package_cellar.clone(),
+                            name: name.clone(),
+                            version: version.clone(),
+                            source: error,
                         });
                     }
                 }
@@ -237,27 +230,21 @@ impl Store {
                 receipt: receipts.join(format!("{name}.json")),
             });
 
-            fs::rename(stage.path(), &keg).with_context(|| {
-                format!(
-                    "failed to move the staged {} {} into '{}'",
-                    name,
-                    version,
-                    keg.display()
-                )
+            fs::rename(stage.path(), &keg).map_err(|source| StoreError::MoveStage {
+                name: name.clone(),
+                version: version.clone(),
+                path: keg.clone(),
+                source,
             })?;
 
-            let record = applied
-                .last_mut()
-                .context("internal error: applied record missing after push")?;
+            let record = applied.last_mut().ok_or(StoreError::AppliedRecordMissing)?;
             record.keg_created = true;
             let opt_link_path = opt.join(&name);
             let opt_target = opt_link_target(&name, &version);
-            create_symlink(&opt_target, &opt_link_path).with_context(|| {
-                format!(
-                    "failed to create the opt link '{}'",
-                    opt_link_path.display()
-                )
-            })?;
+            create_symlink(&opt_target, &opt_link_path).map_err(StoreError::io(
+                "failed to create the opt link",
+                &opt_link_path,
+            ))?;
             record.links.push(opt_link_path);
             for link in links {
                 let Some(link_dir) = link_directory(
@@ -266,19 +253,16 @@ impl Store {
                     Some(&mut record.link_dirs_created),
                 )?
                 else {
-                    bail!(
-                        "failed to create the link directory '{}'",
-                        self.prefix.join(link.subdir).display()
-                    );
+                    return Err(StoreError::LinkDirectoryUnavailable {
+                        path: self.prefix.join(link.subdir).to_path_buf(),
+                    });
                 };
                 let link_path = link_dir.join(&link.name);
                 let target = keg_link_target(&name, &version, link.subdir, &link.name);
-                create_symlink(&target, &link_path).with_context(|| {
-                    format!(
-                        "failed to create the managed link '{}'",
-                        link_path.display()
-                    )
-                })?;
+                create_symlink(&target, &link_path).map_err(StoreError::io(
+                    "failed to create the managed link",
+                    &link_path,
+                ))?;
                 record.links.push(link_path);
             }
 
@@ -379,11 +363,14 @@ pub(super) fn rollback(applied: &[Applied]) -> Vec<String> {
 }
 
 /// Report a failed transaction, annotating it when rollback was incomplete.
-fn finish_commit(error: anyhow::Error, issues: Vec<String>) -> Result<()> {
+fn finish_commit(error: StoreError, issues: Vec<String>) -> Result<(), StoreError> {
     if issues.is_empty() {
         Err(error)
     } else {
-        Err(error.context(format!("rollback was incomplete: {}", issues.join("; "))))
+        Err(StoreError::CommitRollbackIncomplete {
+            issues,
+            source: Box::new(error),
+        })
     }
 }
 
@@ -392,31 +379,33 @@ fn apply_promotions(
     promotions: Vec<Promotion>,
     fail_after: Option<usize>,
     applied: &mut Vec<Promotion>,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     for (index, promotion) in promotions.into_iter().enumerate() {
         if fail_after == Some(index) {
-            bail!("injected promotion failure before promotion {index}");
+            return Err(StoreError::InjectedFailure {
+                what: "promotion",
+                unit: "promotion",
+                index,
+            });
         }
-        let current = fs::read(&promotion.path).with_context(|| {
-            format!(
-                "failed to re-read '{}' before promoting '{} {}'",
-                promotion.path.display(),
-                promotion.promoted.name,
-                promotion.promoted.version
-            )
+        let current = fs::read(&promotion.path).map_err(|source| StoreError::PromotionReread {
+            path: promotion.path.clone(),
+            name: promotion.promoted.name.clone(),
+            version: promotion.promoted.version.clone(),
+            source,
         })?;
         if current != promotion.original {
-            bail!(
-                "refusing to promote '{} {}': its receipt changed after preflight",
-                promotion.promoted.name,
-                promotion.promoted.version
-            );
+            return Err(StoreError::PromotionRaced {
+                name: promotion.promoted.name.to_string(),
+                version: promotion.promoted.version.to_string(),
+            });
         }
-        replace_receipt(&promotion.path, &promotion.bytes).with_context(|| {
-            format!(
-                "failed to mark '{} {}' as requested",
-                promotion.promoted.name, promotion.promoted.version
-            )
+        replace_receipt(&promotion.path, &promotion.bytes).map_err(|source| {
+            StoreError::PromotionWrite {
+                name: promotion.promoted.name.clone(),
+                version: promotion.promoted.version.clone(),
+                source: Box::new(source),
+            }
         })?;
         applied.push(promotion);
     }
@@ -474,8 +463,9 @@ fn restore_promotions(applied: &[Promotion]) -> Vec<String> {
         }
         if let Err(error) = replace_receipt(&promotion.path, &promotion.original) {
             issues.push(format!(
-                "failed to restore '{}': {error:#}",
-                promotion.path.display()
+                "failed to restore '{}': {}",
+                promotion.path.display(),
+                error_chain(&error)
             ));
         }
     }

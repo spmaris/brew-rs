@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use super::CaskStoreError;
 
 use super::support::{
     ensure_absent, ensure_prefix_dest_absent, install_app_dir, safe_prefix_join_and_mkdirs,
@@ -25,7 +25,7 @@ pub(super) fn prepare_commit(
     packages: Vec<PreparedCask>,
     existing_casks: &[CaskReceipt],
     existing_formulae: &[Receipt],
-) -> Result<Vec<PendingCask>> {
+) -> Result<Vec<PendingCask>, CaskStoreError> {
     let prefix = store.prefix();
     let existing_tokens: HashSet<&str> = existing_casks.iter().map(|c| c.token.as_str()).collect();
     let mut batch_tokens = HashSet::new();
@@ -48,13 +48,14 @@ pub(super) fn prepare_commit(
         validate_cask_receipt(&receipt)?;
         validate_stage_ownership(prefix, stage.path())?;
         if !batch_tokens.insert(receipt.token.clone()) {
-            bail!(
-                "cask '{}' appears more than once in one commit",
-                receipt.token
-            );
+            return Err(CaskStoreError::DuplicateInCommit {
+                token: receipt.token.to_string(),
+            });
         }
         if existing_tokens.contains(receipt.token.as_str()) {
-            bail!("cask '{}' is already installed", receipt.token);
+            return Err(CaskStoreError::AlreadyInstalled {
+                token: receipt.token.to_string(),
+            });
         }
 
         // Check appdir validity when receipt specifies one.
@@ -79,10 +80,9 @@ pub(super) fn prepare_commit(
         // Ensure every `.app` destination is absent and uncolliding.
         for app in &receipt.apps {
             if !batch_apps.insert(app.path.clone()) {
-                bail!(
-                    "duplicate .app destination '{}' in one commit",
-                    app.path.display()
-                );
+                return Err(CaskStoreError::DuplicateAppDestination {
+                    path: app.path.to_path_buf(),
+                });
             }
             ensure_absent(&app.path)?;
         }
@@ -90,16 +90,17 @@ pub(super) fn prepare_commit(
         // Ensure every prefix symlink & wrapper destination is absent and safe.
         for link in &receipt.links {
             if !batch_dests.insert(link.dest.clone()) {
-                bail!("duplicate cask destination '{}' in one commit", link.dest);
+                return Err(CaskStoreError::DuplicateDestination {
+                    dest: link.dest.to_string(),
+                });
             }
             ensure_prefix_dest_absent(prefix, &link.dest)?;
         }
         for wrapper in &receipt.wrappers {
             if !batch_dests.insert(wrapper.dest.clone()) {
-                bail!(
-                    "duplicate cask destination '{}' in one commit",
-                    wrapper.dest
-                );
+                return Err(CaskStoreError::DuplicateDestination {
+                    dest: wrapper.dest.to_string(),
+                });
             }
             ensure_prefix_dest_absent(prefix, &wrapper.dest)?;
         }
@@ -121,7 +122,7 @@ pub(super) fn apply_commit(
     pending: Vec<PendingCask>,
     applied: &mut Vec<AppliedCask>,
     allow_existing_caskroom_pkg: bool,
-) -> Result<()> {
+) -> Result<(), CaskStoreError> {
     let prefix = store.prefix();
     let state_dir_path = casks_state_dir(prefix);
     let caskroom = caskroom_dir(prefix);
@@ -141,25 +142,21 @@ pub(super) fn apply_commit(
                         || meta.file_type().is_symlink()
                         || !meta.is_dir()
                     {
-                        bail!(
-                            "unexpected existing Caskroom directory '{}'",
-                            pkg_dir.display()
-                        );
+                        return Err(CaskStoreError::UnexpectedCaskroomDirectory {
+                            path: pkg_dir.to_path_buf(),
+                        });
                     }
                     false
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir(&pkg_dir).with_context(|| {
-                        format!(
-                            "failed to create Caskroom directory '{}'",
-                            pkg_dir.display()
-                        )
-                    })?;
+                    fs::create_dir(&pkg_dir).map_err(CaskStoreError::io(
+                        "failed to create Caskroom directory",
+                        &pkg_dir,
+                    ))?;
                     true
                 }
                 Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("failed to inspect '{}'", pkg_dir.display()));
+                    return Err(CaskStoreError::io("failed to inspect", &pkg_dir)(e));
                 }
             }
         } else {
@@ -176,17 +173,15 @@ pub(super) fn apply_commit(
         });
         let record = applied
             .last_mut()
-            .context("internal error: applied cask record missing after push")?;
+            .ok_or(CaskStoreError::AppliedRecordMissing)?;
 
         if item.staged.has_caskroom_files {
             let staged_caskroom = item.stage.path().join("caskroom");
             let ver_dir = pkg_dir.join(&version);
-            fs::rename(&staged_caskroom, &ver_dir).with_context(|| {
-                format!(
-                    "failed to move staged Caskroom files into '{}'",
-                    ver_dir.display()
-                )
-            })?;
+            fs::rename(&staged_caskroom, &ver_dir).map_err(CaskStoreError::io(
+                "failed to move staged Caskroom files into",
+                &ver_dir,
+            ))?;
             record.caskroom_ver = Some(ver_dir);
         }
 
@@ -197,7 +192,7 @@ pub(super) fn apply_commit(
                 .apps
                 .iter()
                 .find(|a| a.bundle_name == staged_app.bundle_name)
-                .context("staged app bundle missing from cask receipt")?
+                .ok_or(CaskStoreError::StagedAppNotInReceipt)?
                 .path
                 .clone();
             if dest_app.parent() == Some(default_apps.as_path()) {
@@ -214,18 +209,16 @@ pub(super) fn apply_commit(
         {
             let link_path = safe_prefix_join_and_mkdirs(prefix, relative_dest)?;
             create_symlink(Path::new(target), &link_path)
-                .with_context(|| format!("failed to create cask link '{}'", link_path.display()))?;
+                .map_err(CaskStoreError::io("failed to create cask link", &link_path))?;
             record.links.push(link_path);
         }
 
         for wrapper in &item.staged.wrappers {
             let dest_path = safe_prefix_join_and_mkdirs(prefix, &wrapper.relative_dest)?;
-            fs::rename(&wrapper.staged_file, &dest_path).with_context(|| {
-                format!(
-                    "failed to install command wrapper '{}'",
-                    dest_path.display()
-                )
-            })?;
+            fs::rename(&wrapper.staged_file, &dest_path).map_err(CaskStoreError::io(
+                "failed to install command wrapper",
+                &dest_path,
+            ))?;
             record.links.push(dest_path);
         }
 
@@ -305,31 +298,34 @@ pub(super) fn rollback_applied(applied: &[AppliedCask]) -> Vec<String> {
     issues
 }
 
-pub(super) fn finish_commit(error: anyhow::Error, issues: Vec<String>) -> Result<()> {
+pub(super) fn finish_commit(
+    error: CaskStoreError,
+    issues: Vec<String>,
+) -> Result<(), CaskStoreError> {
     if issues.is_empty() {
         Err(error)
     } else {
-        Err(error.context(format!(
-            "cask rollback was incomplete: {}",
-            issues.join("; ")
-        )))
+        Err(CaskStoreError::CommitRollbackIncomplete {
+            issues,
+            source: Box::new(error),
+        })
     }
 }
 
 pub(super) fn finish_upgrade_err(
     quarantine: tempfile::TempDir,
     issues: Vec<String>,
-    error: anyhow::Error,
-) -> Result<()> {
+    error: CaskStoreError,
+) -> Result<(), CaskStoreError> {
     if issues.is_empty() {
         drop(quarantine);
         Err(error)
     } else {
         let kept = quarantine.keep();
-        Err(error.context(format!(
-            "cask upgrade rollback was incomplete: {}; quarantine kept at '{}'",
-            issues.join("; "),
-            kept.display()
-        )))
+        Err(CaskStoreError::UpgradeRollbackIncomplete {
+            issues,
+            kept,
+            source: Box::new(error),
+        })
     }
 }

@@ -1,41 +1,48 @@
 //! Mapping of placeholders onto the managed prefix and keg roots.
 
-use anyhow::{Context, Result, bail};
-
 use super::super::paths::Paths;
+use super::error::TextError;
 use super::{CELLAR_MARKER, FIXED_CELLAR, OPT_MARKER};
 
 /// Reject whitespace or quotes in a marker value before mapping it.
-pub(super) fn checked_literal<'a>(value: &'a str, context: &str) -> Result<&'a str> {
+pub(super) fn checked_literal<'a>(
+    value: &'a str,
+    context: &'static str,
+) -> Result<&'a str, TextError> {
     if value.is_empty()
         || value.chars().any(char::is_whitespace)
         || value
             .bytes()
             .any(|byte| matches!(byte, b'"' | b'\'' | b'`' | b'\\' | b'$' | b'#'))
     {
-        bail!("Unsupported literal path {value:?} in {context}");
+        return Err(TextError::UnsupportedLiteral {
+            value: value.to_owned(),
+            context,
+        });
     }
     Ok(value)
 }
 
 /// Map a placeholder path through the pinned transaction.
-pub(super) fn map_keg(paths: &Paths<'_>, placeholder: &str) -> Result<String> {
+pub(super) fn map_keg(paths: &Paths<'_>, placeholder: &str) -> Result<String, TextError> {
     match paths.keg_path(placeholder)? {
         Some(mapped) => {
             validate_mapped(&mapped)?;
             Ok(mapped)
         }
-        None => bail!("Unsupported Homebrew placeholder path {placeholder:?}"),
+        None => Err(TextError::UnsupportedPlaceholderPath {
+            placeholder: placeholder.to_owned(),
+        }),
     }
 }
 
 /// Map a complete `Cellar/<name>/<version>` or `opt/<name>` keg root.
-pub(super) fn map_complete_keg_root(paths: &Paths<'_>, value: &str) -> Result<String> {
+pub(super) fn map_complete_keg_root(paths: &Paths<'_>, value: &str) -> Result<String, TextError> {
     let value = checked_literal(value, "pcre2-config prefix assignment")?;
     if !is_complete_keg_root(value) {
-        bail!(
-            "Unsupported pcre2-config prefix placeholder {value:?}: expected a complete pinned keg"
-        );
+        return Err(TextError::UnsupportedPrefixPlaceholder {
+            value: value.to_owned(),
+        });
     }
     map_keg(paths, value)
 }
@@ -57,37 +64,43 @@ fn is_complete_keg_root(value: &str) -> bool {
 }
 
 /// Map one fixed `/opt/homebrew/Cellar/...` path through the same pins.
-pub(super) fn map_fixed_cellar(paths: &Paths<'_>, value: &str) -> Result<String> {
+pub(super) fn map_fixed_cellar(paths: &Paths<'_>, value: &str) -> Result<String, TextError> {
     let value = checked_literal(value, "pcre2-config libR assignment")?;
     let rest = value
         .strip_prefix(FIXED_CELLAR)
-        .with_context(|| format!("Unsupported fixed Homebrew path {value:?}"))?;
+        .ok_or_else(|| TextError::UnsupportedFixedPath {
+            value: value.to_owned(),
+        })?;
     if rest.is_empty() {
-        bail!("Unsupported fixed Homebrew path {value:?}");
+        return Err(TextError::UnsupportedFixedPath {
+            value: value.to_owned(),
+        });
     }
     map_keg(paths, &format!("{CELLAR_MARKER}{rest}"))
 }
 
 /// A mapped path must be an absolute, single-line path.
-pub(super) fn validate_mapped(value: &str) -> Result<()> {
+pub(super) fn validate_mapped(value: &str) -> Result<(), TextError> {
     if value.is_empty()
         || !value.starts_with('/')
         || value.bytes().any(|byte| {
             byte < 0x20 || byte == 0x7f || matches!(byte, b'"' | b'\'' | b'`' | b'\\' | b'$')
         })
     {
-        bail!("Unsupported mapped path {value:?}");
+        return Err(TextError::UnsupportedMappedPath {
+            value: value.to_owned(),
+        });
     }
     Ok(())
 }
 
 /// Quote one shell word with single quotes.
-pub(super) fn shell_quote(value: &str) -> Result<String> {
+pub(super) fn shell_quote(value: &str) -> Result<String, TextError> {
     if value
         .bytes()
         .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'\n')
     {
-        bail!("Cannot quote a shell value containing control bytes");
+        return Err(TextError::UnquotableShellValue);
     }
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');

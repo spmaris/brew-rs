@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
 
 use super::paths::{meta_dir, receipts_dir, retained_dir, state_dir};
 use super::prefix::check_optional_directory;
@@ -13,7 +13,7 @@ use crate::domain::validate::is_safe_version;
 
 impl Store {
     /// Read every receipt, sorted by package name.
-    pub(crate) fn installed(&self) -> Result<Vec<Receipt>> {
+    pub(crate) fn installed(&self) -> Result<Vec<Receipt>, StoreError> {
         if self.state != RootState::Owned {
             return Ok(Vec::new());
         }
@@ -24,28 +24,28 @@ impl Store {
         }
         let directory = receipts_dir(&self.prefix);
         match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "refusing to read '{}': the receipts directory is a symlink",
-                directory.display()
-            ),
-            Ok(metadata) if !metadata.is_dir() => bail!(
-                "refusing to read '{}': the receipts path is not a directory",
-                directory.display()
-            ),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::ReceiptsDirectorySymlink {
+                    path: directory.to_path_buf(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(StoreError::ReceiptsPathNotDirectory {
+                    path: directory.to_path_buf(),
+                });
+            }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+                return Err(StoreError::io("failed to inspect", &directory)(error));
             }
         }
 
         let mut receipts = Vec::new();
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("failed to read '{}'", directory.display()))?
+        for entry in
+            fs::read_dir(&directory).map_err(StoreError::io("failed to read", &directory))?
         {
-            let entry = entry
-                .with_context(|| format!("failed to read an entry in '{}'", directory.display()))?;
+            let entry = entry.map_err(StoreError::io("failed to read an entry in", &directory))?;
             let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -54,12 +54,11 @@ impl Store {
             };
             let receipt = read_receipt(&entry.path())?;
             if receipt.name != stem {
-                bail!(
-                    "receipt '{}' names '{}', not '{}'",
-                    entry.path().display(),
-                    receipt.name,
-                    stem
-                );
+                return Err(StoreError::ReceiptNameMismatch {
+                    path: entry.path().to_path_buf(),
+                    actual: receipt.name.to_string(),
+                    expected: stem.to_string(),
+                });
             }
             receipts.push(receipt);
         }
@@ -82,7 +81,7 @@ impl Store {
     /// bounded JSON receipt naming exactly its directory and version stem.
     /// Unrelated entries that do not end in `.json` are ignored rather than
     /// misrepresented as pins.
-    pub(crate) fn retained(&self) -> Result<Vec<Receipt>> {
+    pub(crate) fn retained(&self) -> Result<Vec<Receipt>, StoreError> {
         if self.state != RootState::Owned {
             return Ok(Vec::new());
         }
@@ -92,79 +91,77 @@ impl Store {
         for ancestor in [meta_dir(&self.prefix), state_dir(&self.prefix)] {
             match fs::symlink_metadata(&ancestor) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    bail!("refusing to read '{}': it is a symlink", ancestor.display())
+                    return Err(StoreError::ReadSymlink {
+                        path: ancestor.to_path_buf(),
+                    });
                 }
-                Ok(metadata) if !metadata.is_dir() => bail!(
-                    "refusing to read '{}': it is not a directory",
-                    ancestor.display()
-                ),
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(StoreError::ReadNotDirectory {
+                        path: ancestor.to_path_buf(),
+                    });
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", ancestor.display()));
+                    return Err(StoreError::io("failed to inspect", &ancestor)(error));
                 }
             }
         }
         let directory = retained_dir(&self.prefix);
         match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "refusing to read '{}': the retained directory is a symlink",
-                directory.display()
-            ),
-            Ok(metadata) if !metadata.is_dir() => bail!(
-                "refusing to read '{}': the retained path is not a directory",
-                directory.display()
-            ),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::RetainedDirectorySymlink {
+                    path: directory.to_path_buf(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(StoreError::RetainedPathNotDirectory {
+                    path: directory.to_path_buf(),
+                });
+            }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+                return Err(StoreError::io("failed to inspect", &directory)(error));
             }
         }
 
         let mut records = Vec::new();
-        for package in fs::read_dir(&directory)
-            .with_context(|| format!("failed to read '{}'", directory.display()))?
+        for package in
+            fs::read_dir(&directory).map_err(StoreError::io("failed to read", &directory))?
         {
-            let package = package
-                .with_context(|| format!("failed to read an entry in '{}'", directory.display()))?;
+            let package =
+                package.map_err(StoreError::io("failed to read an entry in", &directory))?;
             let metadata = fs::symlink_metadata(package.path())
-                .with_context(|| format!("failed to inspect '{}'", package.path().display()))?;
+                .map_err(StoreError::io("failed to inspect", &package.path()))?;
             if metadata.file_type().is_symlink() {
-                bail!(
-                    "refusing to read '{}': the retained package directory is a symlink",
-                    package.path().display()
-                );
+                return Err(StoreError::RetainedPackageSymlink {
+                    path: package.path().to_path_buf(),
+                });
             }
             if !metadata.is_dir() {
-                bail!(
-                    "refusing to read '{}': '{}' is not a retained package directory",
-                    directory.display(),
-                    package.path().display()
-                );
+                return Err(StoreError::NotRetainedPackageDirectory {
+                    directory: directory.to_path_buf(),
+                    path: package.path().to_path_buf(),
+                });
             }
             let Some(name) = package.file_name().to_str().map(str::to_owned) else {
-                bail!(
-                    "refusing to read '{}': a retained package directory has a non-UTF-8 name",
-                    directory.display()
-                );
+                return Err(StoreError::RetainedPackageNonUtf8 {
+                    directory: directory.to_path_buf(),
+                });
             };
             if !is_safe_package_name(&name) {
-                bail!(
-                    "refusing to read '{}': '{}' is not a valid retained package name",
-                    directory.display(),
-                    name
-                );
+                return Err(StoreError::InvalidRetainedPackageName {
+                    directory: directory.to_path_buf(),
+                    name: name.to_string(),
+                });
             }
             let package_dir = package.path();
             for record in fs::read_dir(&package_dir)
-                .with_context(|| format!("failed to read '{}'", package_dir.display()))?
+                .map_err(StoreError::io("failed to read", &package_dir))?
             {
-                let record = record.with_context(|| {
-                    format!("failed to read an entry in '{}'", package_dir.display())
-                })?;
+                let record =
+                    record.map_err(StoreError::io("failed to read an entry in", &package_dir))?;
                 let Some(file_name) = record.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
@@ -172,28 +169,25 @@ impl Store {
                     continue;
                 };
                 if !is_safe_version(version) {
-                    bail!(
-                        "refusing to read '{}': '{}' is not a valid retained version",
-                        record.path().display(),
-                        version
-                    );
+                    return Err(StoreError::InvalidRetainedVersion {
+                        path: record.path().to_path_buf(),
+                        version: version.to_string(),
+                    });
                 }
                 let receipt = read_receipt(&record.path())?;
                 if receipt.name != name {
-                    bail!(
-                        "retained record '{}' names '{}', not '{}'",
-                        record.path().display(),
-                        receipt.name,
-                        name
-                    );
+                    return Err(StoreError::RetainedRecordNameMismatch {
+                        path: record.path().to_path_buf(),
+                        actual: receipt.name.to_string(),
+                        expected: name.to_string(),
+                    });
                 }
                 if receipt.version != version {
-                    bail!(
-                        "retained record '{}' records version '{}', not '{}'",
-                        record.path().display(),
-                        receipt.version,
-                        version
-                    );
+                    return Err(StoreError::RetainedRecordVersionMismatch {
+                        path: record.path().to_path_buf(),
+                        actual: receipt.version.to_string(),
+                        expected: version.to_string(),
+                    });
                 }
                 records.push(receipt);
             }

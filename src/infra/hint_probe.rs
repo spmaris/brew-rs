@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::domain::plan_error::HintProbe;
-use crate::infra::api::API_BASE;
 use crate::infra::api::http_client::HttpClient;
+use crate::infra::api::{API_BASE, ApiError};
 
 const MACOS_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
@@ -14,7 +14,7 @@ const MACOS_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 pub(crate) struct SystemHintProbe(HttpClient);
 
 impl SystemHintProbe {
-    pub(crate) fn new(config: &Config) -> anyhow::Result<Self> {
+    pub(crate) fn new(config: &Config) -> Result<Self, ApiError> {
         HttpClient::new(config).map(Self)
     }
 }
@@ -27,7 +27,7 @@ impl HintProbe for SystemHintProbe {
 
     async fn cask_exists(&self, token: &str) -> bool {
         let url = format!("{API_BASE}/cask/{token}.json");
-        self.0.fetch_json::<serde_json::Value>(&url).await.is_ok()
+        self.0.get_json::<serde_json::Value>(&url).await.is_ok()
     }
 }
 

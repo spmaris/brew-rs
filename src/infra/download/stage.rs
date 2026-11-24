@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
 use reqwest::Response;
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
 use super::consts::MAX_BOTTLE_BYTES;
+use super::error::DownloadError;
 use super::request::chunk_timeout;
 
 /// Stream the response into a staging file, hashing and verifying as it goes.
@@ -20,11 +20,11 @@ pub(crate) async fn stage_bottle(
     digest: &str,
     response: Response,
     config: &Config,
-) -> Result<()> {
+) -> Result<(), DownloadError> {
     if let Some(length) = response.content_length()
         && length > MAX_BOTTLE_BYTES
     {
-        bail!("refusing to download a bottle larger than the {MAX_BOTTLE_BYTES} byte limit");
+        return Err(DownloadError::BottleTooLarge);
     }
     ensure_destination_is_not_symlink(destination)?;
 
@@ -36,29 +36,32 @@ pub(crate) async fn stage_bottle(
     loop {
         let chunk = tokio::time::timeout(chunk_timeout(config), response.chunk())
             .await
-            .context("timed out while streaming the bottle")?
-            .context("failed while streaming the bottle")?;
+            .map_err(DownloadError::StreamTimedOut)?
+            .map_err(DownloadError::Stream)?;
         let Some(chunk) = chunk else {
             break;
         };
         total = total
             .checked_add(chunk.len() as u64)
-            .context("bottle size overflowed")?;
+            .ok_or(DownloadError::SizeOverflow)?;
         if total > MAX_BOTTLE_BYTES {
-            bail!("bottle download exceeded the {MAX_BOTTLE_BYTES} byte limit");
+            return Err(DownloadError::SizeLimitExceeded);
         }
         hasher.update(&chunk);
         staged
             .write_all(&chunk)
-            .context("failed to write the staged bottle")?;
+            .map_err(DownloadError::WriteStaged)?;
     }
 
     if total == 0 {
-        bail!("bottle download produced an empty file");
+        return Err(DownloadError::EmptyDownload);
     }
     let actual = hex::encode(hasher.finalize());
     if actual != digest {
-        bail!("SHA-256 mismatch for the downloaded bottle: expected {digest}, got {actual}");
+        return Err(DownloadError::ChecksumMismatch {
+            expected: digest.to_owned(),
+            actual,
+        });
     }
 
     staged.commit(destination)?;
@@ -75,7 +78,7 @@ pub(super) struct StagedBottle {
 
 impl StagedBottle {
     /// Create a new private staging file in `directory`.
-    pub(super) fn create(directory: &Path, digest: &str) -> Result<Self> {
+    pub(super) fn create(directory: &Path, digest: &str) -> Result<Self, DownloadError> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         for _ in 0..16 {
@@ -106,18 +109,18 @@ impl StagedBottle {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to create a staging file in {}", directory.display())
+                Err(source) => {
+                    return Err(DownloadError::CreateStagingFile {
+                        directory: directory.to_path_buf(),
+                        source,
                     });
                 }
             }
         }
 
-        bail!(
-            "failed to create a unique staging file in {}",
-            directory.display()
-        )
+        Err(DownloadError::StagingFileExhausted {
+            directory: directory.to_path_buf(),
+        })
     }
 
     /// Append streamed bytes to the staging file.
@@ -129,15 +132,18 @@ impl StagedBottle {
     }
 
     /// Flush the staging file and atomically publish it at `destination`.
-    pub(super) fn commit(mut self, destination: &Path) -> Result<()> {
+    pub(super) fn commit(mut self, destination: &Path) -> Result<(), DownloadError> {
         if let Some(file) = self.file.take() {
-            file.sync_all().with_context(|| {
-                format!("failed to flush the staged bottle: {}", self.path.display())
-            })?;
+            file.sync_all()
+                .map_err(|source| DownloadError::FlushStaged {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         ensure_destination_is_not_symlink(destination)?;
-        fs::rename(&self.path, destination).with_context(|| {
-            format!("failed to publish the bottle to {}", destination.display())
+        fs::rename(&self.path, destination).map_err(|source| DownloadError::Publish {
+            destination: destination.to_path_buf(),
+            source,
         })?;
         // The rename consumed the staging path; the drop guard must not unlink
         // the published file.
@@ -166,15 +172,19 @@ impl Drop for StagedBottle {
 }
 
 /// Refuse to overwrite a symlink at a cache destination.
-pub(super) fn ensure_destination_is_not_symlink(path: &Path) -> Result<()> {
+pub(super) fn ensure_destination_is_not_symlink(path: &Path) -> Result<(), DownloadError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing to replace '{}': the destination is a symlink",
-            path.display()
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(DownloadError::DestinationSymlink {
+                path: path.to_path_buf(),
+            })
+        }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect '{}'", path.display())),
+        Err(source) => Err(DownloadError::InspectDestination {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

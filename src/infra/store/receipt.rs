@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
 use serde::{Deserialize, Serialize};
 
 use super::paths::{monotonic_nonce, sync_directory};
@@ -55,15 +55,20 @@ pub(crate) struct Prepared {
 }
 
 /// Atomically publish a new file inside `directory` without overwriting `target`.
-pub(crate) fn write_new_file_atomic(directory: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new_file_atomic(
+    directory: &Path,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
     match fs::symlink_metadata(target) {
-        Ok(_) => bail!(
-            "refusing to overwrite the existing receipt '{}'",
-            target.display()
-        ),
+        Ok(_) => {
+            return Err(StoreError::ReceiptExists {
+                path: target.to_path_buf(),
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect '{}'", target.display()));
+            return Err(StoreError::io("failed to inspect", &target)(error));
         }
     }
 
@@ -74,15 +79,15 @@ pub(crate) fn write_new_file_atomic(directory: &Path, target: &Path, bytes: &[u8
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<(), StoreError> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .with_context(|| format!("failed to create '{}'", temporary.display()))?;
+            .map_err(StoreError::io("failed to create", &temporary))?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
-            .with_context(|| format!("failed to write '{}'", temporary.display()))?;
+            .map_err(StoreError::io("failed to write", &temporary))?;
         Ok(())
     })();
     if let Err(error) = written {
@@ -91,23 +96,25 @@ pub(crate) fn write_new_file_atomic(directory: &Path, target: &Path, bytes: &[u8
     }
     if let Err(error) = fs::rename(&temporary, target) {
         let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("failed to publish '{}'", target.display()));
+        return Err(StoreError::io("failed to publish", &target)(error));
     }
     sync_directory(directory);
     Ok(())
 }
 
 /// Atomically publish a receipt; never replace an existing one.
-pub(super) fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
+pub(super) fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<(), StoreError> {
     let target = directory.join(format!("{}.json", receipt.name));
     let bytes = encode_receipt(receipt)?;
     write_new_file_atomic(directory, &target, &bytes)
 }
 
 /// Encode a receipt exactly as it is stored on disk.
-pub(super) fn encode_receipt(receipt: &Receipt) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(receipt)
-        .with_context(|| format!("failed to encode the receipt for '{}'", receipt.name))?;
+pub(super) fn encode_receipt(receipt: &Receipt) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = serde_json::to_vec(receipt).map_err(|source| StoreError::ReceiptEncode {
+        name: receipt.name.clone(),
+        source,
+    })?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -116,20 +123,16 @@ pub(super) fn encode_receipt(receipt: &Receipt) -> Result<Vec<u8>> {
 ///
 /// The replacement is published from a temporary file in the same directory, so
 /// a reader sees either the old bytes or the new bytes, never a partial receipt.
-pub(super) fn replace_receipt(path: &Path, bytes: &[u8]) -> Result<()> {
-    let directory = path.parent().with_context(|| {
-        format!(
-            "refusing to replace '{}': it has no parent directory",
-            path.display()
-        )
+pub(super) fn replace_receipt(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let directory = path.parent().ok_or_else(|| StoreError::ReceiptNoParent {
+        path: path.to_path_buf(),
     })?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect '{}'", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(StoreError::io("failed to inspect", &path))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "refusing to replace '{}': a receipt must be a regular file",
-            path.display()
-        );
+        return Err(StoreError::ReplaceNotRegular {
+            path: path.to_path_buf(),
+        });
     }
     let temporary = directory.join(format!(
         ".tmp-{}-{}-{}",
@@ -138,18 +141,19 @@ pub(super) fn replace_receipt(path: &Path, bytes: &[u8]) -> Result<()> {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<(), StoreError> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .with_context(|| format!("failed to create '{}'", temporary.display()))?;
+            .map_err(StoreError::io("failed to create", &temporary))?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
-            .with_context(|| format!("failed to write '{}'", temporary.display()))?;
-        fs::set_permissions(&temporary, metadata.permissions()).with_context(|| {
-            format!("failed to preserve the permissions of '{}'", path.display())
-        })?;
+            .map_err(StoreError::io("failed to write", &temporary))?;
+        fs::set_permissions(&temporary, metadata.permissions()).map_err(StoreError::io(
+            "failed to preserve the permissions of",
+            &path,
+        ))?;
         Ok(())
     })();
     if let Err(error) = written {
@@ -158,43 +162,47 @@ pub(super) fn replace_receipt(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("failed to publish '{}'", path.display()));
+        return Err(StoreError::io("failed to publish", &path)(error));
     }
     sync_directory(directory);
     Ok(())
 }
 
 /// Read and validate one receipt file without following symlinks.
-pub(super) fn read_receipt(path: &Path) -> Result<Receipt> {
+pub(super) fn read_receipt(path: &Path) -> Result<Receipt, StoreError> {
     read_receipt_with_bytes(path).map(|(receipt, _)| receipt)
 }
 
 /// Read one receipt together with its exact bytes, which a promotion restores on
 /// rollback.
-pub(super) fn read_receipt_with_bytes(path: &Path) -> Result<(Receipt, Vec<u8>)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect '{}'", path.display()))?;
+pub(super) fn read_receipt_with_bytes(path: &Path) -> Result<(Receipt, Vec<u8>), StoreError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(StoreError::io("failed to inspect", &path))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "refusing '{}': a receipt must be a regular file",
-            path.display()
-        );
+        return Err(StoreError::ReceiptNotRegular {
+            path: path.to_path_buf(),
+        });
     }
     if metadata.len() > MAX_RECEIPT_BYTES {
-        bail!("refusing '{}': the receipt is too large", path.display());
+        return Err(StoreError::ReceiptTooLarge {
+            path: path.to_path_buf(),
+        });
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read '{}'", path.display()))?;
-    let receipt: Receipt = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to decode the receipt '{}'", path.display()))?;
+    let bytes = fs::read(path).map_err(StoreError::io("failed to read", &path))?;
+    let receipt: Receipt =
+        serde_json::from_slice(&bytes).map_err(|source| StoreError::ReceiptDecode {
+            path: path.to_path_buf(),
+            source,
+        })?;
     validate_receipt(&receipt)?;
     Ok((receipt, bytes))
 }
 
-pub(super) fn existing_receipt(path: &Path) -> Result<Option<Receipt>> {
+pub(super) fn existing_receipt(path: &Path) -> Result<Option<Receipt>, StoreError> {
     match fs::symlink_metadata(path) {
         Ok(_) => read_receipt(path).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect '{}'", path.display())),
+        Err(error) => Err(StoreError::io("failed to inspect", &path)(error)),
     }
 }
 
@@ -224,86 +232,81 @@ pub(super) fn is_safe_bin_name(name: &str) -> bool {
         })
 }
 
-pub(super) fn validate_receipt(receipt: &Receipt) -> Result<()> {
+pub(super) fn validate_receipt(receipt: &Receipt) -> Result<(), StoreError> {
     if !is_safe_package_name(&receipt.name) {
-        bail!("refusing invalid package name '{}'", receipt.name);
+        return Err(StoreError::InvalidPackageName {
+            name: receipt.name.to_string(),
+        });
     }
     if !is_safe_version(&receipt.version) {
-        bail!(
-            "refusing invalid version '{}' for '{}'",
-            receipt.version,
-            receipt.name
-        );
+        return Err(StoreError::InvalidVersion {
+            name: receipt.name.to_string(),
+            version: receipt.version.to_string(),
+        });
     }
     if !is_lower_hex_digest(&receipt.sha256) {
-        bail!(
-            "refusing invalid sha256 for '{}': expected 64 lowercase hexadecimal characters",
-            receipt.name
-        );
+        return Err(StoreError::InvalidSha256 {
+            name: receipt.name.to_string(),
+        });
     }
     let mut names = HashSet::new();
     for dependency in &receipt.dependencies {
         validate_dependency(&receipt.name, dependency)?;
         if dependency.name == receipt.name {
-            bail!(
-                "refusing '{}': it lists itself as a dependency",
-                receipt.name
-            );
+            return Err(StoreError::SelfDependency {
+                name: receipt.name.to_string(),
+            });
         }
         if !names.insert(dependency.name.as_str()) {
-            bail!(
-                "refusing '{}': dependency '{}' is listed more than once",
-                receipt.name,
-                dependency.name
-            );
+            return Err(StoreError::DuplicateDependency {
+                name: receipt.name.to_string(),
+                dependency: dependency.name.to_string(),
+            });
         }
     }
     let mut conflicts = HashSet::new();
     for conflict in &receipt.conflicts_with {
         if !is_safe_package_name(conflict) {
-            bail!(
-                "refusing invalid conflict name '{}' recorded by '{}'",
-                conflict,
-                receipt.name
-            );
+            return Err(StoreError::InvalidConflictName {
+                owner: receipt.name.to_string(),
+                conflict: conflict.to_string(),
+            });
         }
         if conflict == &receipt.name {
-            bail!("refusing '{}': it lists itself as a conflict", receipt.name);
+            return Err(StoreError::SelfConflict {
+                name: receipt.name.to_string(),
+            });
         }
         if !conflicts.insert(conflict.as_str()) {
-            bail!(
-                "refusing '{}': conflict '{}' is listed more than once",
-                receipt.name,
-                conflict
-            );
+            return Err(StoreError::DuplicateConflict {
+                name: receipt.name.to_string(),
+                conflict: conflict.to_string(),
+            });
         }
     }
     Ok(())
 }
 
 /// Validate one dependency pin recorded by `owner`.
-fn validate_dependency(owner: &str, dependency: &Dependency) -> Result<()> {
+fn validate_dependency(owner: &str, dependency: &Dependency) -> Result<(), StoreError> {
     if !is_safe_package_name(&dependency.name) {
-        bail!(
-            "refusing invalid dependency name '{}' recorded by '{}'",
-            dependency.name,
-            owner
-        );
+        return Err(StoreError::InvalidDependencyName {
+            owner: owner.to_string(),
+            name: dependency.name.to_string(),
+        });
     }
     if !is_safe_version(&dependency.version) {
-        bail!(
-            "refusing invalid dependency version '{}' for '{}' recorded by '{}'",
-            dependency.version,
-            dependency.name,
-            owner
-        );
+        return Err(StoreError::InvalidDependencyVersion {
+            owner: owner.to_string(),
+            name: dependency.name.to_string(),
+            version: dependency.version.to_string(),
+        });
     }
     if !is_lower_hex_digest(&dependency.sha256) {
-        bail!(
-            "refusing invalid sha256 for dependency '{}' recorded by '{}': expected 64 lowercase hexadecimal characters",
-            dependency.name,
-            owner
-        );
+        return Err(StoreError::InvalidDependencySha256 {
+            owner: owner.to_string(),
+            name: dependency.name.to_string(),
+        });
     }
     Ok(())
 }

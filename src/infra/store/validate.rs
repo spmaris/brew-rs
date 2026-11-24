@@ -5,9 +5,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
 
-use super::receipt::{Receipt, validate_receipt};
+use super::receipt::{Dependency, Receipt, validate_receipt};
 
 /// Validate a projected receipt graph as a whole.
 ///
@@ -21,39 +21,39 @@ use super::receipt::{Receipt, validate_receipt};
 /// Production code uses [`validate_dependencies_with_retained`]; this strict
 /// active-only form remains for tests of the pure graph rules.
 #[cfg(test)]
-pub(crate) fn validate_dependencies(receipts: &[Receipt]) -> Result<()> {
+pub(crate) fn validate_dependencies(receipts: &[Receipt]) -> Result<(), StoreError> {
     let mut installed: HashMap<&str, &Receipt> = HashMap::with_capacity(receipts.len());
     for receipt in receipts {
         validate_receipt(receipt)?;
         if installed.insert(receipt.name.as_str(), receipt).is_some() {
-            bail!(
-                "package '{}' appears more than once in the projected receipt graph",
-                receipt.name
-            );
+            return Err(StoreError::DuplicateInGraph {
+                name: receipt.name.to_string(),
+            });
         }
     }
     for receipt in receipts {
         for dependency in &receipt.dependencies {
             let Some(actual) = installed.get(dependency.name.as_str()) else {
-                bail!(
-                    "'{}' depends on '{} {}' (sha256 {}), which the projected receipt graph does not contain; the dependency must be installed at that exact version and digest, or removed together with its dependent",
-                    receipt.name,
-                    dependency.name,
-                    dependency.version,
-                    dependency.sha256
-                );
+                return Err(StoreError::DependencyMissing {
+                    owner: receipt.name.to_string(),
+                    pin: Box::new(Dependency {
+                        name: dependency.name.to_string(),
+                        version: dependency.version.to_string(),
+                        sha256: dependency.sha256.to_string(),
+                    }),
+                });
             };
             if actual.version != dependency.version || actual.sha256 != dependency.sha256 {
-                bail!(
-                    "'{}' depends on '{} {}' (sha256 {}), but the projected receipt graph records '{}' as {} (sha256 {}); the dependency must match exactly",
-                    receipt.name,
-                    dependency.name,
-                    dependency.version,
-                    dependency.sha256,
-                    actual.name,
-                    actual.version,
-                    actual.sha256
-                );
+                return Err(StoreError::DependencyMismatch {
+                    owner: receipt.name.to_string(),
+                    pin: Box::new(Dependency {
+                        name: dependency.name.to_string(),
+                        version: dependency.version.to_string(),
+                        sha256: dependency.sha256.to_string(),
+                    }),
+                    actual_version: actual.version.to_string(),
+                    actual_sha256: actual.sha256.to_string(),
+                });
             }
         }
     }
@@ -73,7 +73,7 @@ pub(crate) fn validate_retained_pin_closure(
     retained: &[Receipt],
     active: &[Receipt],
     retained_set: &[Receipt],
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let active_by_name: HashMap<&str, &Receipt> = HashMap::from_iter(
         active
             .iter()
@@ -103,14 +103,15 @@ pub(crate) fn validate_retained_pin_closure(
                     versions.contains(&(pin.version.as_str(), pin.sha256.as_str()))
                 });
             if !retained_match {
-                bail!(
-                    "the retained record for '{} {}' pins '{} {}' (sha256 {}), which this operation would strand; remove the retained record manually first",
-                    record.name,
-                    record.version,
-                    pin.name,
-                    pin.version,
-                    pin.sha256
-                );
+                return Err(StoreError::RetainedPinStranded {
+                    record_name: record.name.to_string(),
+                    record_version: record.version.to_string(),
+                    pin: Box::new(Dependency {
+                        name: pin.name.to_string(),
+                        version: pin.version.to_string(),
+                        sha256: pin.sha256.to_string(),
+                    }),
+                });
             }
         }
     }
@@ -137,16 +138,15 @@ pub(crate) fn validate_dependencies_with_retained(
     receipts: &[Receipt],
     new_receipts: &[Receipt],
     retained: &[Receipt],
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let mut active: HashMap<&str, &Receipt> =
         HashMap::with_capacity(receipts.len() + new_receipts.len());
     for receipt in receipts.iter().chain(new_receipts) {
         validate_receipt(receipt)?;
         if active.insert(receipt.name.as_str(), receipt).is_some() {
-            bail!(
-                "package '{}' appears more than once in the projected receipt graph",
-                receipt.name
-            );
+            return Err(StoreError::DuplicateInGraph {
+                name: receipt.name.to_string(),
+            });
         }
     }
     let newcomers: HashSet<&str> = new_receipts
@@ -161,12 +161,11 @@ pub(crate) fn validate_dependencies_with_retained(
             .or_default()
             .insert((record.version.as_str(), record.sha256.as_str()))
         {
-            bail!(
-                "retained record '{} {}' (sha256 {}) appears more than once",
-                record.name,
-                record.version,
-                record.sha256
-            );
+            return Err(StoreError::DuplicateRetainedRecord {
+                name: record.name.to_string(),
+                version: record.version.to_string(),
+                sha256: record.sha256.to_string(),
+            });
         }
     }
 
@@ -187,30 +186,33 @@ pub(crate) fn validate_dependencies_with_retained(
                     });
             if newcomers.contains(receipt.name.as_str()) {
                 if retained_match {
-                    bail!(
-                        "'{}' depends on '{} {}' (sha256 {}), which only a retained keg provides; a new receipt must pin the installed version",
-                        receipt.name,
-                        dependency.name,
-                        dependency.version,
-                        dependency.sha256
-                    );
+                    return Err(StoreError::DependencyOnlyRetained {
+                        owner: receipt.name.to_string(),
+                        pin: Box::new(Dependency {
+                            name: dependency.name.to_string(),
+                            version: dependency.version.to_string(),
+                            sha256: dependency.sha256.to_string(),
+                        }),
+                    });
                 }
-                bail!(
-                    "'{}' depends on '{} {}' (sha256 {}), which the projected receipt graph does not contain; the dependency must be installed at that exact version and digest, or removed together with its dependent",
-                    receipt.name,
-                    dependency.name,
-                    dependency.version,
-                    dependency.sha256
-                );
+                return Err(StoreError::DependencyMissing {
+                    owner: receipt.name.to_string(),
+                    pin: Box::new(Dependency {
+                        name: dependency.name.to_string(),
+                        version: dependency.version.to_string(),
+                        sha256: dependency.sha256.to_string(),
+                    }),
+                });
             }
             if !retained_match {
-                bail!(
-                    "'{}' depends on '{} {}' (sha256 {}), which neither the projected receipt graph nor the retained records contain; the dependency must match an installed or retained version exactly",
-                    receipt.name,
-                    dependency.name,
-                    dependency.version,
-                    dependency.sha256
-                );
+                return Err(StoreError::DependencyNotProvided {
+                    owner: receipt.name.to_string(),
+                    pin: Box::new(Dependency {
+                        name: dependency.name.to_string(),
+                        version: dependency.version.to_string(),
+                        sha256: dependency.sha256.to_string(),
+                    }),
+                });
             }
         }
     }
@@ -230,7 +232,7 @@ pub(super) fn verify_retained_pin_kegs(
     active: &[Receipt],
     retained: &[Receipt],
     cellar: &Path,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let active_by_name: HashMap<&str, &Receipt> = HashMap::from_iter(
         active
             .iter()
@@ -258,34 +260,36 @@ pub(super) fn verify_retained_pin_kegs(
                     versions.contains(&(pin.version.as_str(), pin.sha256.as_str()))
                 });
             if !retained_match {
-                bail!(
-                    "'{}' depends on '{} {}' (sha256 {}), which neither the projected receipt graph nor the retained records contain",
-                    receipt.name,
-                    pin.name,
-                    pin.version,
-                    pin.sha256
-                );
+                return Err(StoreError::DependencyUnresolved {
+                    owner: receipt.name.to_string(),
+                    pin: Box::new(Dependency {
+                        name: pin.name.to_string(),
+                        version: pin.version.to_string(),
+                        sha256: pin.sha256.to_string(),
+                    }),
+                });
             }
             let keg = cellar.join(&pin.name).join(&pin.version);
             match fs::symlink_metadata(&keg) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => bail!(
-                    "'{}' depends on '{} {}', but the retained keg '{}' is not a real directory",
-                    receipt.name,
-                    pin.name,
-                    pin.version,
-                    keg.display()
-                ),
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(StoreError::RetainedPinKegNotDirectory {
+                        owner: receipt.name.to_string(),
+                        name: pin.name.to_string(),
+                        version: pin.version.to_string(),
+                        keg: keg.to_path_buf(),
+                    });
+                }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                    "'{}' depends on '{} {}', but the retained keg '{}' is missing; restore the keg or remove the retained record manually",
-                    receipt.name,
-                    pin.name,
-                    pin.version,
-                    keg.display()
-                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(StoreError::RetainedPinKegMissing {
+                        owner: receipt.name.to_string(),
+                        name: pin.name.to_string(),
+                        version: pin.version.to_string(),
+                        keg: keg.to_path_buf(),
+                    });
+                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", keg.display()));
+                    return Err(StoreError::io("failed to inspect", &keg)(error));
                 }
             }
         }
@@ -297,7 +301,7 @@ pub(super) fn verify_retained_pin_kegs(
 /// present package. Checks both directions symmetrically so neither installing
 /// a conflicting formula nor keeping an older one with a declared conflict can
 /// succeed.
-pub(crate) fn validate_conflicts(receipts: &[Receipt]) -> Result<()> {
+pub(crate) fn validate_conflicts(receipts: &[Receipt]) -> Result<(), StoreError> {
     let installed: HashSet<&str> = receipts
         .iter()
         .map(|receipt| receipt.name.as_str())
@@ -305,13 +309,10 @@ pub(crate) fn validate_conflicts(receipts: &[Receipt]) -> Result<()> {
     for receipt in receipts {
         for conflict in &receipt.conflicts_with {
             if installed.contains(conflict.as_str()) {
-                bail!(
-                    "'{}' conflicts with '{}'; remove '{}' before installing '{}'",
-                    receipt.name,
-                    conflict,
-                    conflict,
-                    receipt.name
-                );
+                return Err(StoreError::PackageConflict {
+                    name: receipt.name.to_string(),
+                    conflict: conflict.to_string(),
+                });
             }
         }
     }

@@ -264,7 +264,7 @@ pub(crate) async fn install(
             Ok(()) => step.done(&format!("Relocated {relocate_count} {noun}")),
             Err(error) => {
                 step.fail();
-                return Err(error);
+                return Err(error.into());
             }
         }
     } else {
@@ -287,7 +287,7 @@ pub(crate) async fn install(
             )),
             Err(error) => {
                 step.fail();
-                return Err(error);
+                return Err(error.into());
             }
         }
     } else if promotions.is_empty() {

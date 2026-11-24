@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cleanup::CleanupStats;
+use super::error::CacheError;
 
 /// The legacy download cache kept under `cache_dir/bottles`.
 ///
@@ -24,19 +24,19 @@ impl BottleStore {
     /// A symlinked bottle directory is rejected here, before the caller has
     /// cleaned anything else, because `read_dir` would otherwise follow the
     /// link and delete files outside the cache.
-    pub fn new(cache_dir: &Path) -> Result<Self> {
+    pub fn new(cache_dir: &Path) -> Result<Self, CacheError> {
         Self::bind(cache_dir.join("bottles"), None)
     }
 
-    pub fn native(cache_dir: &Path) -> Result<Self> {
+    pub fn native(cache_dir: &Path) -> Result<Self, CacheError> {
         Self::bind(cache_dir.join(super::NATIVE_BOTTLE_DIR), Some(".tar.gz"))
     }
 
-    pub fn native_casks(cache_dir: &Path) -> Result<Self> {
+    pub fn native_casks(cache_dir: &Path) -> Result<Self, CacheError> {
         Self::bind(cache_dir.join(super::NATIVE_CASK_DIR), Some(".download"))
     }
 
-    fn bind(bottles_dir: PathBuf, digest_suffix: Option<&'static str>) -> Result<Self> {
+    fn bind(bottles_dir: PathBuf, digest_suffix: Option<&'static str>) -> Result<Self, CacheError> {
         ensure_not_symlink(&bottles_dir)?;
         Ok(Self {
             bottles_dir,
@@ -48,7 +48,7 @@ impl BottleStore {
     ///
     /// A retention of `0` means "keep forever", matching the configuration
     /// documentation, so nothing is removed.
-    pub async fn clean_expired(&self, retention_days: u32) -> Result<CleanupStats> {
+    pub async fn clean_expired(&self, retention_days: u32) -> Result<CleanupStats, CacheError> {
         if retention_days == 0 {
             return Ok(CleanupStats::default());
         }
@@ -58,11 +58,11 @@ impl BottleStore {
     }
 
     /// Remove every regular file in the legacy bottle directory.
-    pub async fn clean_all(&self) -> Result<CleanupStats> {
+    pub async fn clean_all(&self) -> Result<CleanupStats, CacheError> {
         self.clean_matching(None)
     }
 
-    fn clean_matching(&self, cutoff: Option<u64>) -> Result<CleanupStats> {
+    fn clean_matching(&self, cutoff: Option<u64>) -> Result<CleanupStats, CacheError> {
         // Re-check on every cleanup so a link swapped in after construction is
         // still refused.
         ensure_not_symlink(&self.bottles_dir)?;
@@ -72,23 +72,26 @@ impl BottleStore {
         };
 
         let mut stats = CleanupStats::default();
-        let entries = fs::read_dir(&directory)
-            .with_context(|| format!("Failed to read cache directory: {}", directory.display()))?;
+        let entries = fs::read_dir(&directory).map_err(|source| CacheError::ReadDir {
+            path: directory.clone(),
+            source,
+        })?;
 
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!(
-                    "Failed to read an entry in cache directory: {}",
-                    directory.display()
-                )
+            let entry = entry.map_err(|source| CacheError::ReadEntry {
+                path: directory.clone(),
+                source,
             })?;
 
             // `DirEntry::file_type` and `DirEntry::metadata` do not follow
             // symlinks, so linked files are skipped rather than unlinked or
             // measured through their target.
-            let file_type = entry.file_type().with_context(|| {
-                format!("Failed to inspect cache entry: {}", entry.path().display())
-            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|source| CacheError::InspectEntry {
+                    path: entry.path(),
+                    source,
+                })?;
             if !file_type.is_file()
                 || self
                     .digest_suffix
@@ -97,9 +100,12 @@ impl BottleStore {
                 continue;
             }
 
-            let metadata = entry.metadata().with_context(|| {
-                format!("Failed to inspect cache entry: {}", entry.path().display())
-            })?;
+            let metadata = entry
+                .metadata()
+                .map_err(|source| CacheError::InspectEntry {
+                    path: entry.path(),
+                    source,
+                })?;
 
             if let Some(cutoff) = cutoff {
                 let Some(modified) = modified_timestamp(&metadata) else {
@@ -118,29 +124,23 @@ impl BottleStore {
                 }
                 // Another process may have removed it already.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Failed to remove cache file: {}", path.display())
-                    });
-                }
+                Err(source) => return Err(CacheError::RemoveFile { path, source }),
             }
         }
 
         Ok(stats)
     }
 
-    fn existing_directory(&self) -> Result<Option<PathBuf>> {
+    fn existing_directory(&self) -> Result<Option<PathBuf>, CacheError> {
         match fs::metadata(&self.bottles_dir) {
             Ok(metadata) if metadata.is_dir() => Ok(Some(self.bottles_dir.clone())),
             // A regular file at this path is not a bottle store; there is
             // nothing safe to clean.
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "Failed to inspect cache directory: {}",
-                    self.bottles_dir.display()
-                )
+            Err(source) => Err(CacheError::InspectDir {
+                path: self.bottles_dir.clone(),
+                source,
             }),
         }
     }
@@ -157,18 +157,17 @@ fn is_digest_archive(name: &std::ffi::OsStr, suffix: &str) -> bool {
         })
 }
 
-fn ensure_not_symlink(path: &Path) -> Result<()> {
+fn ensure_not_symlink(path: &Path) -> Result<(), CacheError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "Refusing to clean '{}': the bottles directory is a symlink. \
-             Remove the link or point storage.cache_dir at a real directory.",
-            path.display()
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CacheError::SymlinkedDir {
+            path: path.to_path_buf(),
+        }),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("Failed to inspect cache path: {}", path.display()))
-        }
+        Err(source) => Err(CacheError::InspectPath {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

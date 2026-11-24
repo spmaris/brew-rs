@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-
+use super::error::ArchiveError;
 use super::extract::{PendingSymlink, Seen};
 use super::limits::{
     MAX_COMPONENT_BYTES, MAX_DEPTH, MAX_LINK_COMPONENTS, MAX_LINK_TARGET_BYTES, MAX_SYMLINK_HOPS,
@@ -18,75 +17,63 @@ use super::paths::create_directories;
 /// appear before any normal component, so a target can never rely on a
 /// directory that a later `..` cancels. Chain, cycle, and existence checks run
 /// separately in [`validate_symlink_chain`] once all archive symlinks are known.
-pub(super) fn parse_symlink_target(link: &Path, bytes: &[u8]) -> Result<PathBuf> {
+pub(super) fn parse_symlink_target(link: &Path, bytes: &[u8]) -> Result<PathBuf, ArchiveError> {
     if bytes.is_empty() {
-        bail!(
-            "bottle archive symlink '{}' has an empty target",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkEmptyTarget {
+            link: link.to_path_buf(),
+        });
     }
     if bytes.len() > MAX_LINK_TARGET_BYTES {
-        bail!(
-            "bottle archive symlink '{}' has a target longer than {MAX_LINK_TARGET_BYTES} bytes",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkTargetTooLong {
+            path: link.to_path_buf(),
+            limit: MAX_LINK_TARGET_BYTES,
+        });
     }
     if bytes
         .iter()
         .any(|byte| *byte == b'\\' || *byte == 0 || byte.is_ascii_control())
     {
-        bail!(
-            "bottle archive symlink '{}' has a target containing a backslash, NUL, or control byte",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkTargetControlBytes {
+            link: link.to_path_buf(),
+        });
     }
-    let target = std::str::from_utf8(bytes).ok().with_context(|| {
-        format!(
-            "bottle archive symlink '{}' has a target that is not valid UTF-8",
-            link.display()
-        )
+    let target = std::str::from_utf8(bytes).map_err(|_| ArchiveError::SymlinkTargetNotUtf8 {
+        link: link.to_path_buf(),
     })?;
     if target.starts_with('/') {
-        bail!(
-            "bottle archive symlink '{}' has an absolute target",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkAbsoluteTarget {
+            link: link.to_path_buf(),
+        });
     }
     #[cfg(windows)]
     if target.starts_with('\\') || target.contains(':') {
-        bail!(
-            "bottle archive symlink '{}' has a Windows absolute or drive target",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkWindowsTarget {
+            link: link.to_path_buf(),
+        });
     }
     let components: Vec<&str> = target.split('/').collect();
     if components.len() > MAX_LINK_COMPONENTS {
-        bail!(
-            "bottle archive symlink '{}' has a target with too many components",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkTooManyComponents {
+            link: link.to_path_buf(),
+        });
     }
     if components.iter().any(|component| component.is_empty()) {
-        bail!(
-            "bottle archive symlink '{}' has a target with an empty component",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkEmptyComponent {
+            link: link.to_path_buf(),
+        });
     }
     if components
         .iter()
         .any(|component| component.len() > MAX_COMPONENT_BYTES)
     {
-        bail!(
-            "bottle archive symlink '{}' has a target with an overlong component",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkOverlongComponent {
+            link: link.to_path_buf(),
+        });
     }
 
     // The link name is a validated, normalized UTF-8 path, so its components
     // are safe to use as the lexical starting point.
-    let link_name = link
-        .to_str()
-        .context("bottle archive symlink path is not valid UTF-8")?;
+    let link_name = link.to_str().ok_or(ArchiveError::SymlinkPathNotUtf8)?;
     let link_components: Vec<&str> = link_name
         .split('/')
         .filter(|component| !component.is_empty())
@@ -102,35 +89,32 @@ pub(super) fn parse_symlink_target(link: &Path, bytes: &[u8]) -> Result<PathBuf>
             "." => {}
             ".." => {
                 if normal_component {
-                    bail!(
-                        "bottle archive symlink '{}' has a target that uses '..' after a normal component",
-                        link.display()
-                    );
+                    return Err(ArchiveError::SymlinkParentAfterNormal {
+                        link: link.to_path_buf(),
+                    });
                 }
                 if resolved.pop().is_none() {
-                    bail!(
-                        "bottle archive symlink '{}' escapes the keg root",
-                        link.display()
-                    );
+                    return Err(ArchiveError::SymlinkEscapesRoot {
+                        link: link.to_path_buf(),
+                    });
                 }
             }
             other => {
                 normal_component = true;
                 if resolved.len() >= MAX_DEPTH {
-                    bail!(
-                        "bottle archive symlink '{}' has a target that exceeds the depth limit of {MAX_DEPTH}",
-                        link.display()
-                    );
+                    return Err(ArchiveError::SymlinkTargetTooDeep {
+                        link: link.to_path_buf(),
+                        limit: MAX_DEPTH,
+                    });
                 }
                 resolved.push(other);
             }
         }
     }
     if resolved.is_empty() {
-        bail!(
-            "bottle archive symlink '{}' resolves to the keg root",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkResolvesToRoot {
+            link: link.to_path_buf(),
+        });
     }
 
     let mut immediate = PathBuf::new();
@@ -149,7 +133,7 @@ pub(super) fn validate_symlink_chain(
     seen: &HashMap<PathBuf, Seen>,
     directories: &HashSet<PathBuf>,
     raw_targets: &HashMap<PathBuf, PathBuf>,
-) -> Result<()> {
+) -> Result<(), ArchiveError> {
     let mut current = immediate.to_path_buf();
     let mut hops = 0usize;
     let mut visited = HashSet::new();
@@ -166,54 +150,52 @@ pub(super) fn validate_symlink_chain(
             let is_leaf = index + 1 == components.len();
             match seen.get(&prefix) {
                 Some(Seen::File) if is_leaf => return Ok(()),
-                Some(Seen::File) => bail!(
-                    "bottle archive symlink '{}' targets a path through a regular file",
-                    link.display()
-                ),
+                Some(Seen::File) => {
+                    return Err(ArchiveError::SymlinkThroughFile {
+                        link: link.to_path_buf(),
+                    });
+                }
                 Some(Seen::Dir) => {
                     if is_leaf {
                         // A directory link to one of its own ancestors can be
                         // followed forever (for example `lib/sub/link -> ..`),
                         // so it is not a simple link.
                         if link.starts_with(&prefix) {
-                            bail!(
-                                "bottle archive symlink '{}' targets an ancestor directory, which would form a cycle",
-                                link.display()
-                            );
+                            return Err(ArchiveError::SymlinkAncestorCycle {
+                                link: link.to_path_buf(),
+                            });
                         }
                         return Ok(());
                     }
                 }
                 Some(Seen::Symlink) => {
                     if !visited.insert(prefix.clone()) {
-                        bail!(
-                            "bottle archive symlink '{}' forms a symlink cycle",
-                            link.display()
-                        );
+                        return Err(ArchiveError::SymlinkCycle {
+                            link: link.to_path_buf(),
+                        });
                     }
                     hops += 1;
                     if hops > MAX_SYMLINK_HOPS {
-                        bail!(
-                            "bottle archive symlink '{}' exceeds the symlink resolution depth limit of {MAX_SYMLINK_HOPS}",
-                            link.display()
-                        );
+                        return Err(ArchiveError::SymlinkHopLimit {
+                            link: link.to_path_buf(),
+                            limit: MAX_SYMLINK_HOPS,
+                        });
                     }
-                    let expanded_base = raw_targets.get(&prefix).with_context(|| {
-                        format!(
-                            "bottle archive symlink '{}' references unresolved symlink '{}'",
-                            link.display(),
-                            prefix.display()
-                        )
+                    let expanded_base = raw_targets.get(&prefix).ok_or_else(|| {
+                        ArchiveError::SymlinkUnresolved {
+                            link: link.to_path_buf(),
+                            target: prefix.clone(),
+                        }
                     })?;
                     let mut expanded = expanded_base.clone();
                     for tail in &components[index + 1..] {
                         expanded.push(tail);
                     }
                     if expanded.components().count() > MAX_DEPTH {
-                        bail!(
-                            "bottle archive symlink '{}' has a target that exceeds the depth limit of {MAX_DEPTH}",
-                            link.display()
-                        );
+                        return Err(ArchiveError::SymlinkTargetTooDeep {
+                            link: link.to_path_buf(),
+                            limit: MAX_DEPTH,
+                        });
                     }
                     current = expanded;
                     continue 'walk;
@@ -221,30 +203,32 @@ pub(super) fn validate_symlink_chain(
                 None if directories.contains(&prefix) => {
                     if is_leaf {
                         if link.starts_with(&prefix) {
-                            bail!(
-                                "bottle archive symlink '{}' targets an ancestor directory, which would form a cycle",
-                                link.display()
-                            );
+                            return Err(ArchiveError::SymlinkAncestorCycle {
+                                link: link.to_path_buf(),
+                            });
                         }
                         return Ok(());
                     }
                 }
-                None => bail!(
-                    "bottle archive symlink '{}' targets '{}', which is not staged in the archive",
-                    link.display(),
-                    prefix.display()
-                ),
+                None => {
+                    return Err(ArchiveError::SymlinkNotStaged {
+                        link: link.to_path_buf(),
+                        target: prefix,
+                    });
+                }
             }
         }
-        bail!(
-            "bottle archive symlink '{}' resolves to an empty path",
-            link.display()
-        );
+        return Err(ArchiveError::SymlinkEmptyPath {
+            link: link.to_path_buf(),
+        });
     }
 }
 
 /// Create the deferred symlinks after all regular entries are in place.
-pub(super) fn materialize_symlinks(out: &Path, symlinks: &[PendingSymlink]) -> Result<()> {
+pub(super) fn materialize_symlinks(
+    out: &Path,
+    symlinks: &[PendingSymlink],
+) -> Result<(), ArchiveError> {
     for link in symlinks {
         if let Some(parent) = link.path.parent()
             && !parent.as_os_str().is_empty()
@@ -253,29 +237,24 @@ pub(super) fn materialize_symlinks(out: &Path, symlinks: &[PendingSymlink]) -> R
         }
         let destination = out.join(&link.path);
         if fs::symlink_metadata(&destination).is_ok() {
-            bail!(
-                "extraction path {} already exists; refusing to replace it with a symlink",
-                destination.display()
-            );
+            return Err(ArchiveError::SymlinkDestinationExists { path: destination });
         }
         let target = relative_link_target(&link.path, &link.target);
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            symlink(&target, &destination).with_context(|| {
-                format!(
-                    "failed to create extracted symlink {}",
-                    destination.display()
-                )
+            symlink(&target, &destination).map_err(|source| ArchiveError::Io {
+                action: "create extracted symlink",
+                path: destination,
+                source,
             })?;
         }
         #[cfg(not(unix))]
         {
             let _ = (&target, &destination);
-            bail!(
-                "bottle archive symlink '{}' cannot be created on this platform",
-                link.path.display()
-            );
+            return Err(ArchiveError::SymlinkUnsupportedPlatform {
+                link: link.path.clone(),
+            });
         }
     }
     Ok(())

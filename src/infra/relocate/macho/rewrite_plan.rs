@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use anyhow::{Context, Result, bail};
-
+use super::super::error::RelocateError;
 use super::constants::{MARKER, MARKER_TEXT};
+use super::error::MachoError;
 use super::model::{Kind, Parsed, PathKind};
 use super::parse::validate_name;
 
@@ -53,8 +53,8 @@ impl Plan {
 /// Call the mapper for every path-bearing command and build the edit plan.
 pub(super) fn plan(
     parsed: &Parsed,
-    map: &mut impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>>,
-) -> Result<Plan> {
+    map: &mut impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>, RelocateError>,
+) -> Result<Plan, MachoError> {
     let rpaths: Vec<&str> = parsed
         .commands
         .iter()
@@ -72,29 +72,34 @@ pub(super) fn plan(
         let old = command
             .name
             .as_deref()
-            .with_context(|| format!("Load command {index} is missing its path"))?;
+            .ok_or(MachoError::CommandMissingPath { index })?;
         let path_kind = kind.path_kind();
-        let mapped_value = map(path_kind, old, &rpaths)
-            .with_context(|| format!("Could not map {} path {old:?}", kind.label()))?;
+        let mapped_value = map(path_kind, old, &rpaths).map_err(|source| MachoError::MapPath {
+            label: kind.label(),
+            old: old.to_owned(),
+            source: Box::new(source),
+        })?;
         if let Some(new) = &mapped_value {
             validate_name(new, kind, true)?;
         }
         let key = (path_kind, old.to_owned());
         if let Some(previous) = mapped.get(&key) {
             if previous != &mapped_value {
-                bail!(
-                    "Path mapper returned inconsistent results for {old:?}: {previous:?} and {mapped_value:?}"
-                );
+                return Err(MachoError::InconsistentMapper {
+                    old: old.to_owned(),
+                    previous: previous.clone(),
+                    mapped: mapped_value,
+                });
             }
         } else {
             mapped.insert(key, mapped_value.clone());
         }
         let target = mapped_value.unwrap_or_else(|| old.to_owned());
         if target.contains(MARKER_TEXT) {
-            bail!(
-                "{} path {target:?} still contains a Homebrew placeholder; the mapper must resolve it",
-                kind.label()
-            );
+            return Err(MachoError::UnresolvedPlaceholder {
+                label: kind.label(),
+                target,
+            });
         }
         if target != old {
             changes.push(Change {
@@ -110,7 +115,10 @@ pub(super) fn plan(
 }
 
 /// Reject plans that collapse distinct commands onto one path.
-pub(super) fn validate_targets(parsed: &Parsed, expected: &[Option<String>]) -> Result<()> {
+pub(super) fn validate_targets(
+    parsed: &Parsed,
+    expected: &[Option<String>],
+) -> Result<(), MachoError> {
     let mut dylibs: HashMap<&str, usize> = HashMap::new();
     let mut rpaths: HashMap<&str, usize> = HashMap::new();
     for (index, command) in parsed.commands.iter().enumerate() {
@@ -120,7 +128,7 @@ pub(super) fn validate_targets(parsed: &Parsed, expected: &[Option<String>]) -> 
         let target = expected
             .get(index)
             .and_then(Option::as_deref)
-            .with_context(|| format!("No relocation target planned for load command {index}"))?;
+            .ok_or(MachoError::NoTargetPlanned { index })?;
         let table = if kind.is_rpath() {
             &mut rpaths
         } else if kind == Kind::IdDylib {
@@ -129,9 +137,11 @@ pub(super) fn validate_targets(parsed: &Parsed, expected: &[Option<String>]) -> 
             &mut dylibs
         };
         if let Some(previous) = table.insert(target, index) {
-            bail!(
-                "Relocation would make load commands {previous} and {index} share the path {target:?}"
-            );
+            return Err(MachoError::SharedPath {
+                previous,
+                index,
+                target: target.to_owned(),
+            });
         }
     }
     Ok(())
@@ -143,7 +153,7 @@ pub(super) fn check_marker_plan(
     bytes: &[u8],
     parsed: &Parsed,
     expected: &[Option<String>],
-) -> Result<()> {
+) -> Result<(), MachoError> {
     let mut ranges: Vec<Range<usize>> = parsed
         .commands
         .iter()
@@ -160,9 +170,7 @@ pub(super) fn check_marker_plan(
             && ranges[range_index].start <= offset
             && offset + MARKER.len() <= ranges[range_index].end;
         if !contained {
-            bail!(
-                "Raw Homebrew placeholder at file offset {offset} is outside a supported Mach-O load command; refusing to guess at its meaning"
-            );
+            return Err(MachoError::PlaceholderOutsideCommand { offset });
         }
         Ok(())
     })?;
@@ -171,22 +179,28 @@ pub(super) fn check_marker_plan(
         if let Some(target) = target
             && target.contains(MARKER_TEXT)
         {
-            bail!("Homebrew placeholder in load command {index} was not resolved ({target:?})");
+            return Err(MachoError::PlaceholderNotResolved {
+                index,
+                target: target.clone(),
+            });
         }
     }
     Ok(())
 }
 
 /// Fail if any raw marker remains anywhere in `bytes`.
-pub(super) fn reject_any_marker(bytes: &[u8]) -> Result<()> {
+pub(super) fn reject_any_marker(bytes: &[u8]) -> Result<(), MachoError> {
     scan_markers(bytes, |offset| {
-        bail!("Rewritten image still contains a raw Homebrew placeholder at file offset {offset}")
+        Err(MachoError::PlaceholderRemains { offset })
     })
 }
 
 /// Visit the offset of every non-overlapping-width occurrence of [`MARKER`],
 /// scanning the image once.
-pub(super) fn scan_markers(bytes: &[u8], mut visit: impl FnMut(usize) -> Result<()>) -> Result<()> {
+pub(super) fn scan_markers(
+    bytes: &[u8],
+    mut visit: impl FnMut(usize) -> Result<(), MachoError>,
+) -> Result<(), MachoError> {
     let mut search_from = 0usize;
     while let Some(tail) = bytes.get(search_from..) {
         let Some(relative) = tail

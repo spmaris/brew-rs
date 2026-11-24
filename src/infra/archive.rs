@@ -34,9 +34,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use flate2::bufread::GzDecoder;
 
+mod error;
 mod extract;
 mod limited_reader;
 mod limits;
@@ -45,6 +45,7 @@ mod snapshot;
 mod symlinks;
 mod validate;
 
+pub(crate) use error::ArchiveError;
 use extract::extract;
 use limited_reader::LimitedReader;
 use limits::{IO_BUFFER_BYTES, MAX_DECOMPRESSED_BYTES};
@@ -65,7 +66,7 @@ pub(crate) fn unpack(
     name: &str,
     version: &str,
     sha256: &str,
-) -> Result<()> {
+) -> Result<(), ArchiveError> {
     validate_digest(sha256)?;
     validate_name(name)?;
     validate_version(version)?;
@@ -73,7 +74,12 @@ pub(crate) fn unpack(
 }
 
 /// Extract a verified standalone release rooted at one exact directory.
-pub(crate) fn unpack_release(archive: &Path, out: &Path, root: &str, sha256: &str) -> Result<()> {
+pub(crate) fn unpack_release(
+    archive: &Path,
+    out: &Path,
+    root: &str,
+    sha256: &str,
+) -> Result<(), ArchiveError> {
     validate_digest(sha256)?;
     validate_name(root)?;
     unpack_layout(archive, out, root, None, sha256)
@@ -85,19 +91,25 @@ fn unpack_layout(
     name: &str,
     version: Option<&str>,
     sha256: &str,
-) -> Result<()> {
-    let out_metadata = fs::symlink_metadata(out)
-        .with_context(|| format!("failed to inspect staging directory {}", out.display()))?;
+) -> Result<(), ArchiveError> {
+    let io_error = |action: &'static str| {
+        move |source: std::io::Error| ArchiveError::Io {
+            action,
+            path: out.to_path_buf(),
+            source,
+        }
+    };
+    let out_metadata = fs::symlink_metadata(out).map_err(io_error("inspect staging directory"))?;
     if !out_metadata.file_type().is_dir() {
-        bail!("staging path {} is not a regular directory", out.display());
+        return Err(ArchiveError::StagingNotDirectory {
+            path: out.to_path_buf(),
+        });
     }
-    let mut entries = fs::read_dir(out)
-        .with_context(|| format!("failed to read staging directory {}", out.display()))?;
+    let mut entries = fs::read_dir(out).map_err(io_error("read staging directory"))?;
     if entries.next().is_some() {
-        bail!(
-            "staging directory {} is not empty; refusing to extract",
-            out.display()
-        );
+        return Err(ArchiveError::StagingNotEmpty {
+            path: out.to_path_buf(),
+        });
     }
 
     let snapshot = verified_snapshot(archive, out, sha256)?;
@@ -112,16 +124,25 @@ fn unpack_layout(
     loop {
         let read = tail
             .read(&mut buffer)
-            .context("failed to finish the gzip stream")?;
+            .map_err(|source| ArchiveError::Stream {
+                action: "finish the gzip stream",
+                source,
+            })?;
         if read == 0 {
             break;
         }
         if buffer[..read].iter().any(|byte| *byte != 0) {
-            bail!("unexpected data after the tar end marker");
+            return Err(ArchiveError::DataAfterTarEnd);
         }
     }
-    if !tail.inner.into_inner().fill_buf()?.is_empty() {
-        bail!("unexpected bytes after the gzip stream");
+    if !tail
+        .inner
+        .into_inner()
+        .fill_buf()
+        .map_err(ArchiveError::Read)?
+        .is_empty()
+    {
+        return Err(ArchiveError::BytesAfterGzip);
     }
 
     // Only now, with every regular entry written and the archive verified, are

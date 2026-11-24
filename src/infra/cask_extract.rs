@@ -17,6 +17,7 @@
 
 mod assemble;
 mod dmg_extract;
+mod error;
 mod format;
 mod limits;
 mod model;
@@ -28,8 +29,6 @@ mod zip_extract;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-
 use self::assemble::assemble_stage;
 use self::dmg_extract::extract_dmg;
 use self::format::{detect_format, stage_naked_payload};
@@ -40,6 +39,7 @@ use self::zip_extract::{preflight_zip, run_ditto_extract};
 use super::download::verify_file_digest;
 use crate::domain::cask_plan::PlannedCask;
 
+pub(crate) use error::CaskExtractError;
 #[cfg(test)]
 pub(crate) use model::{StagedAppBundle, StagedWrapper};
 pub(crate) use model::{StagedCaskLink, StagedCaskPayload};
@@ -52,30 +52,32 @@ pub(crate) fn stage(
     planned: &PlannedCask,
     prefix: &Path,
     appdir: &Path,
-) -> Result<StagedCaskPayload> {
-    verify_file_digest(download_path, &planned.sha256).with_context(|| {
-        format!(
-            "SHA-256 verification failed before staging cask {} {}",
-            planned.token, planned.version
-        )
+) -> Result<StagedCaskPayload, CaskExtractError> {
+    verify_file_digest(download_path, &planned.sha256).map_err(|source| {
+        CaskExtractError::DigestVerification {
+            token: planned.token.clone(),
+            version: planned.version.clone(),
+            source: source.into(),
+        }
     })?;
 
-    let stage_meta = fs::symlink_metadata(stage_dir)
-        .with_context(|| format!("failed to inspect stage '{}'", stage_dir.display()))?;
+    let stage_meta = fs::symlink_metadata(stage_dir).map_err(|source| CaskExtractError::Io {
+        action: "inspect stage",
+        path: stage_dir.to_path_buf(),
+        source,
+    })?;
     if stage_meta.file_type().is_symlink() || !stage_meta.is_dir() {
-        bail!(
-            "cask stage '{}' is not a real directory",
-            stage_dir.display()
-        );
+        return Err(CaskExtractError::StageNotDirectory {
+            path: stage_dir.to_path_buf(),
+        });
     }
 
     let format = detect_format(download_path, &planned.url, planned.container)?;
     let unpack_dir = stage_dir.join("unpack");
-    fs::create_dir(&unpack_dir).with_context(|| {
-        format!(
-            "failed to create unpack directory '{}'",
-            unpack_dir.display()
-        )
+    fs::create_dir(&unpack_dir).map_err(|source| CaskExtractError::Io {
+        action: "create unpack directory",
+        path: unpack_dir.clone(),
+        source,
     })?;
 
     match format {

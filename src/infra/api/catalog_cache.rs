@@ -13,13 +13,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 
 use super::brew_client::BrewApiClient;
+use super::error::{ApiError, error_chain};
 use super::types::{Cask, Formula};
 
 /// Cached catalogs stay fresh for one day, matching the cadence at which the
@@ -120,7 +120,10 @@ pub fn cached_formula_names(config: &Config) -> Option<Vec<String>> {
 
 /// Resolve an alias or old name using the cached formula catalog, refreshing
 /// once if the cached catalog appears to predate `aliases`/`oldnames` fields.
-pub async fn resolve_formula_alias(config: &Config, query: &str) -> Result<Option<String>> {
+pub async fn resolve_formula_alias(
+    config: &Config,
+    query: &str,
+) -> Result<Option<String>, ApiError> {
     let client = BrewApiClient::new(config)?;
     let catalog = load_formulae(&client, config, CachePolicy::PreferFresh).await?;
     if let Some(canonical) = find_formula_alias(&catalog.items, query) {
@@ -140,7 +143,10 @@ pub async fn resolve_formula_alias(config: &Config, query: &str) -> Result<Optio
 
 /// Resolve an old cask token using the cached cask catalog, refreshing once if
 /// the cached catalog appears to predate `old_tokens` fields.
-pub async fn resolve_cask_old_token(config: &Config, query: &str) -> Result<Option<String>> {
+pub async fn resolve_cask_old_token(
+    config: &Config,
+    query: &str,
+) -> Result<Option<String>, ApiError> {
     let client = BrewApiClient::new(config)?;
     let catalog = load_casks(&client, config, CachePolicy::PreferFresh).await?;
     if let Some(canonical) = find_cask_old_token(&catalog.items, query) {
@@ -158,13 +164,16 @@ pub async fn load_formulae(
     client: &BrewApiClient,
     config: &Config,
     policy: CachePolicy,
-) -> Result<Catalog<Vec<Formula>>> {
+) -> Result<Catalog<Vec<Formula>>, ApiError> {
     let path = catalogs_dir(config).join(FORMULAE_FILE);
     load_catalog(&path, policy, || async {
         client
             .get_all_formulae()
             .await
-            .context("Failed to fetch formulae from the Homebrew API")
+            .map_err(|source| ApiError::CatalogFetch {
+                catalog: "formulae",
+                source: Box::new(source),
+            })
     })
     .await
 }
@@ -174,13 +183,16 @@ pub async fn load_casks(
     client: &BrewApiClient,
     config: &Config,
     policy: CachePolicy,
-) -> Result<Catalog<Vec<Cask>>> {
+) -> Result<Catalog<Vec<Cask>>, ApiError> {
     let path = catalogs_dir(config).join(CASKS_FILE);
     load_catalog(&path, policy, || async {
         client
             .get_all_casks()
             .await
-            .context("Failed to fetch casks from the Homebrew API")
+            .map_err(|source| ApiError::CatalogFetch {
+                catalog: "casks",
+                source: Box::new(source),
+            })
     })
     .await
 }
@@ -190,26 +202,20 @@ pub async fn load_casks(
 /// With `all` the files are removed unconditionally; otherwise only entries
 /// older than the configured storage retention are removed. Returns the number
 /// of files removed and the number of bytes they occupied.
-pub async fn clean_catalogs(config: &Config, all: bool) -> Result<(usize, u64)> {
+pub async fn clean_catalogs(config: &Config, all: bool) -> Result<(usize, u64), ApiError> {
     let dir = catalogs_dir(config);
 
     match fs::symlink_metadata(&dir) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                bail!(
-                    "Refusing to clean catalog cache through symlinked directory {}",
-                    dir.display()
-                );
+                return Err(ApiError::CacheDirSymlink { path: dir });
             }
             if !metadata.is_dir() {
-                bail!("Catalog cache path {} is not a directory", dir.display());
+                return Err(ApiError::CacheDirNotDirectory { path: dir });
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to inspect catalog cache {}", dir.display()));
-        }
+        Err(source) => return Err(ApiError::InspectCacheDir { path: dir, source }),
     }
 
     let now = SystemTime::now();
@@ -221,10 +227,7 @@ pub async fn clean_catalogs(config: &Config, all: bool) -> Result<(usize, u64)> 
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to inspect cache file {}", path.display()));
-            }
+            Err(source) => return Err(ApiError::InspectCacheFile { path, source }),
         };
         if !metadata.is_file() {
             continue;
@@ -234,8 +237,10 @@ pub async fn clean_catalogs(config: &Config, all: bool) -> Result<(usize, u64)> 
         }
 
         let bytes = metadata.len();
-        fs::remove_file(&path)
-            .with_context(|| format!("Failed to remove cache file {}", path.display()))?;
+        fs::remove_file(&path).map_err(|source| ApiError::RemoveCacheFile {
+            path: path.clone(),
+            source,
+        })?;
         removed += 1;
         freed += bytes;
     }
@@ -247,19 +252,24 @@ fn catalogs_dir(config: &Config) -> PathBuf {
     config.storage.cache_dir.join("catalogs")
 }
 
-async fn load_catalog<T, F, Fut>(path: &Path, policy: CachePolicy, fetch: F) -> Result<Catalog<T>>
+async fn load_catalog<T, F, Fut>(
+    path: &Path,
+    policy: CachePolicy,
+    fetch: F,
+) -> Result<Catalog<T>, ApiError>
 where
     T: Serialize + DeserializeOwned,
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = Result<T, ApiError>>,
 {
     let mut warnings = Vec::new();
     let cached = match read_cached(path) {
         Ok(cached) => cached,
         Err(error) => {
             warnings.push(format!(
-                "Ignoring unreadable catalog cache {}: {error:#}",
-                path.display()
+                "Ignoring unreadable catalog cache {}: {}",
+                path.display(),
+                error_chain(&error)
             ));
             Cached::Missing
         }
@@ -276,10 +286,9 @@ where
                 }
                 Ok(Catalog { items, warnings })
             }
-            Cached::Missing => bail!(
-                "No cached catalog at {}; run a search without --offline once to populate it",
-                path.display()
-            ),
+            Cached::Missing => Err(ApiError::NoCachedCatalog {
+                path: path.to_path_buf(),
+            }),
         },
         CachePolicy::Refresh => {
             let items = fetch().await?;
@@ -306,8 +315,9 @@ where
                 Err(error) => match stale_items {
                     Some(items) => {
                         warnings.push(format!(
-                            "Homebrew API request failed; using stale catalog cache at {}: {error:#}",
-                            path.display()
+                            "Homebrew API request failed; using stale catalog cache at {}: {}",
+                            path.display(),
+                            error_chain(&error)
                         ));
                         Ok(Catalog { items, warnings })
                     }
@@ -323,20 +333,28 @@ enum Cached<T> {
     Missing,
 }
 
-fn read_cached<T: DeserializeOwned>(path: &Path) -> Result<Cached<T>> {
+fn read_cached<T: DeserializeOwned>(path: &Path) -> Result<Cached<T>, ApiError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Cached::Missing),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
+        Err(source) => {
+            return Err(ApiError::ReadCache {
+                path: path.to_path_buf(),
+                source,
+            });
         }
     };
 
     let modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
-        .with_context(|| format!("Failed to read the timestamp of {}", path.display()))?;
-    let items = serde_json::from_slice(&bytes)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+        .map_err(|source| ApiError::CacheTimestamp {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let items = serde_json::from_slice(&bytes).map_err(|source| ApiError::ParseCache {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
     Ok(Cached::Hit {
         items,
@@ -376,24 +394,21 @@ fn write_cached<T: Serialize>(path: &Path, items: &T, warnings: &mut Vec<String>
         // A cache write must never fail a search: the fetched data is already
         // in hand, so report the problem and move on.
         warnings.push(format!(
-            "Could not write catalog cache {}: {error:#}",
-            path.display()
+            "Could not write catalog cache {}: {}",
+            path.display(),
+            error_chain(&error)
         ));
     }
 }
 
-fn write_atomic<T: Serialize>(path: &Path, items: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("Catalog cache path has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "Failed to create catalog cache directory {}",
-            parent.display()
-        )
+fn write_atomic<T: Serialize>(path: &Path, items: &T) -> Result<(), ApiError> {
+    let parent = path.parent().ok_or(ApiError::CachePathHasNoParent)?;
+    fs::create_dir_all(parent).map_err(|source| ApiError::CreateCacheDir {
+        path: parent.to_path_buf(),
+        source,
     })?;
 
-    let bytes = serde_json::to_vec(items).context("Failed to serialize catalog cache")?;
+    let bytes = serde_json::to_vec(items).map_err(ApiError::SerializeCache)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -405,9 +420,15 @@ fn write_atomic<T: Serialize>(path: &Path, items: &T) -> Result<()> {
     let temp = parent.join(format!(".{file_name}.{}.{unique}.tmp", std::process::id()));
 
     let result = fs::write(&temp, &bytes)
-        .with_context(|| format!("Failed to write {}", temp.display()))
+        .map_err(|source| ApiError::WriteCache {
+            path: temp.clone(),
+            source,
+        })
         .and_then(|()| {
-            fs::rename(&temp, path).with_context(|| format!("Failed to replace {}", path.display()))
+            fs::rename(&temp, path).map_err(|source| ApiError::ReplaceCache {
+                path: path.to_path_buf(),
+                source,
+            })
         });
 
     if result.is_err() {

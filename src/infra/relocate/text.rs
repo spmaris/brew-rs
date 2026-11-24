@@ -21,13 +21,13 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-
+mod error;
 mod general;
 mod mapping;
 mod pcre2_config;
 mod pkg_config;
 
+pub(crate) use error::TextError;
 use general::rewrite_general_text;
 use pcre2_config::rewrite_pcre2_config;
 use pkg_config::{pc_name_byte, rewrite_pkg_config};
@@ -53,9 +53,9 @@ enum Kind {
 }
 
 impl Kind {
-    fn classify(relative: &Path) -> Result<Self> {
+    fn classify(relative: &Path) -> Result<Self, TextError> {
         let Some(text) = relative.to_str() else {
-            bail!("Text relocation requires a UTF-8 relative path");
+            return Err(TextError::NonUtf8Path);
         };
         if text == "bin/pcre2-config" {
             return Ok(Self::Pcre2Config);
@@ -73,7 +73,9 @@ impl Kind {
             {
                 return Ok(Self::PkgConfig);
             }
-            bail!("Unsupported pkg-config file name {name:?}");
+            return Err(TextError::UnsupportedPkgConfigName {
+                name: name.to_owned(),
+            });
         }
         Ok(Self::GeneralText)
     }
@@ -92,52 +94,56 @@ pub(super) fn rewrite(
     relative: &std::path::Path,
     bytes: &[u8],
     paths: &super::paths::Paths<'_>,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, TextError> {
     if !contains(bytes, MARKER.as_bytes()) {
         return Ok(None);
     }
     if bytes.len() > MAX_TEXT_BYTES {
-        bail!(
-            "Refusing to relocate {}: text file exceeds the {MAX_TEXT_BYTES} byte limit",
-            relative.display()
-        );
+        return Err(TextError::TooLarge {
+            path: relative.to_path_buf(),
+            limit: MAX_TEXT_BYTES,
+        });
     }
     let kind = Kind::classify(relative)?;
     let text = decode(bytes, relative, kind.require_trailing_newline())?;
     let rewritten = match kind {
-        Kind::PkgConfig => rewrite_pkg_config(text, paths)
-            .with_context(|| format!("Refusing to rewrite {}", relative.display()))?,
-        Kind::Pcre2Config => rewrite_pcre2_config(text, paths)
-            .with_context(|| format!("Refusing to rewrite {}", relative.display()))?,
-        Kind::GeneralText => rewrite_general_text(text, paths)
-            .with_context(|| format!("Refusing to rewrite {}", relative.display()))?,
-    };
+        Kind::PkgConfig => rewrite_pkg_config(text, paths),
+        Kind::Pcre2Config => rewrite_pcre2_config(text, paths),
+        Kind::GeneralText => rewrite_general_text(text, paths),
+    }
+    .map_err(|source| TextError::Rewrite {
+        path: relative.to_path_buf(),
+        source: Box::new(source),
+    })?;
     if rewritten.contains(MARKER) {
-        bail!(
-            "Refusing to leave a Homebrew marker in {}",
-            relative.display()
-        );
+        return Err(TextError::LeftMarker {
+            path: relative.to_path_buf(),
+        });
     }
     Ok(Some(rewritten.into_bytes()))
 }
 
 /// Decode a supported text file with a bounded UTF-8 byte grammar.
-fn decode<'a>(bytes: &'a [u8], relative: &Path, require_trailing_newline: bool) -> Result<&'a str> {
-    let text = std::str::from_utf8(bytes)
-        .with_context(|| format!("{} is not valid UTF-8 text", relative.display()))?;
+fn decode<'a>(
+    bytes: &'a [u8],
+    relative: &Path,
+    require_trailing_newline: bool,
+) -> Result<&'a str, TextError> {
+    let text = std::str::from_utf8(bytes).map_err(|source| TextError::NotUtf8 {
+        path: relative.to_path_buf(),
+        source,
+    })?;
     if require_trailing_newline && !text.ends_with('\n') {
-        bail!(
-            "Refusing to rewrite {}: file must end with a newline",
-            relative.display()
-        );
+        return Err(TextError::MissingNewline {
+            path: relative.to_path_buf(),
+        });
     }
     if text.bytes().any(|byte| {
         byte == b'\r' || (byte < 0x20 && byte != b'\n' && byte != b'\t') || byte == 0x7f
     }) {
-        bail!(
-            "Refusing to rewrite {}: file contains unsupported control bytes",
-            relative.display()
-        );
+        return Err(TextError::ControlBytes {
+            path: relative.to_path_buf(),
+        });
     }
     Ok(text)
 }

@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
+use super::error::CaskExtractError;
 use super::model::{StagedAppBundle, StagedCaskLink, StagedCaskPayload, StagedWrapper};
 use super::tree::validate_relative_symlink_lexically;
 use super::wrapper::{build_command_wrapper_script, set_executable};
@@ -23,7 +23,7 @@ pub(super) fn assemble_stage(
     planned: &PlannedCask,
     prefix: &Path,
     appdir: &Path,
-) -> Result<StagedCaskPayload> {
+) -> Result<StagedCaskPayload, CaskExtractError> {
     let apps_stage = stage_dir.join("apps");
     let caskroom_stage = stage_dir.join("caskroom");
     let wrappers_stage = stage_dir.join("wrappers");
@@ -37,33 +37,31 @@ pub(super) fn assemble_stage(
             bundle_name,
         } = artifact
         {
-            fs::create_dir_all(&apps_stage)?;
+            fs::create_dir_all(&apps_stage).map_err(CaskExtractError::Fs)?;
             let src = resolve_unpack_dir_path(unpack_dir, source)?;
-            let meta = fs::symlink_metadata(&src).with_context(|| {
-                format!(
-                    "cask '{}' declared app '{}' which was not found in the archive",
-                    planned.token, source
-                )
-            })?;
+            let meta =
+                fs::symlink_metadata(&src).map_err(|error| CaskExtractError::AppNotFound {
+                    token: planned.token.clone(),
+                    app: source.clone(),
+                    source: error,
+                })?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
-                bail!(
-                    "cask '{}' app '{source}' is not a regular .app directory",
-                    planned.token
-                );
+                return Err(CaskExtractError::AppNotBundle {
+                    token: planned.token.clone(),
+                    app: source.clone(),
+                });
             }
             if !src.join("Contents").is_dir() {
-                bail!(
-                    "cask '{}' app '{source}' is missing a Contents directory",
-                    planned.token
-                );
+                return Err(CaskExtractError::AppMissingContents {
+                    token: planned.token.clone(),
+                    app: source.clone(),
+                });
             }
             let dst = apps_stage.join(bundle_name);
-            fs::rename(&src, &dst).with_context(|| {
-                format!(
-                    "failed to stage app bundle '{}' into '{}'",
-                    bundle_name,
-                    dst.display()
-                )
+            fs::rename(&src, &dst).map_err(|error| CaskExtractError::StageApp {
+                bundle_name: bundle_name.clone(),
+                dest: dst.clone(),
+                source: error,
             })?;
             staged_apps_by_name.insert(bundle_name.clone(), dst.clone());
             app_bundles.push(StagedAppBundle {
@@ -143,14 +141,15 @@ pub(super) fn assemble_stage(
                     &mut caskroom_files,
                     &mut copied_payload_paths,
                 )?;
-                fs::create_dir_all(&wrappers_stage)?;
+                fs::create_dir_all(&wrappers_stage).map_err(CaskExtractError::Fs)?;
                 let script = build_command_wrapper_script(&exec_abs, args);
                 let wrapper_path = wrappers_stage.join(link_name);
-                fs::write(&wrapper_path, script.as_bytes()).with_context(|| {
-                    format!(
-                        "failed to write command wrapper '{}'",
-                        wrapper_path.display()
-                    )
+                fs::write(&wrapper_path, script.as_bytes()).map_err(|source| {
+                    CaskExtractError::Io {
+                        action: "write command wrapper",
+                        path: wrapper_path.clone(),
+                        source,
+                    }
                 })?;
                 set_executable(&wrapper_path)?;
                 let digest = hex::encode(Sha256::digest(script.as_bytes()));
@@ -190,7 +189,7 @@ fn stage_source_and_compute_target(
     caskroom_files: &mut Vec<String>,
     copied_payload_paths: &mut HashMap<String, String>,
     relative_up_to_prefix: &str,
-) -> Result<String> {
+) -> Result<String, CaskExtractError> {
     match source {
         CaskSourcePath::Payload(rel) => {
             ensure_payload_file_staged(
@@ -209,9 +208,12 @@ fn stage_source_and_compute_target(
             bundle_name,
             inner_path,
         } => {
-            let bundle_dir = staged_apps
-                .get(bundle_name)
-                .with_context(|| format!("referenced app bundle '{bundle_name}' was not staged"))?;
+            let bundle_dir =
+                staged_apps
+                    .get(bundle_name)
+                    .ok_or_else(|| CaskExtractError::BundleNotStaged {
+                        bundle_name: bundle_name.clone(),
+                    })?;
             verify_regular_file_in_bundle(bundle_dir, inner_path)?;
             if appdir == prefix.join("Applications") {
                 Ok(format!(
@@ -240,7 +242,7 @@ fn stage_source_for_wrapper_exec(
     version: &str,
     caskroom_files: &mut Vec<String>,
     copied_payload_paths: &mut HashMap<String, String>,
-) -> Result<PathBuf> {
+) -> Result<PathBuf, CaskExtractError> {
     match executable {
         CaskSourcePath::Payload(rel) => {
             ensure_payload_file_staged(
@@ -257,9 +259,12 @@ fn stage_source_for_wrapper_exec(
             bundle_name,
             inner_path,
         } => {
-            let bundle_dir = staged_apps
-                .get(bundle_name)
-                .with_context(|| format!("referenced app bundle '{bundle_name}' was not staged"))?;
+            let bundle_dir =
+                staged_apps
+                    .get(bundle_name)
+                    .ok_or_else(|| CaskExtractError::BundleNotStaged {
+                        bundle_name: bundle_name.clone(),
+                    })?;
             verify_regular_file_in_bundle(bundle_dir, inner_path)?;
             Ok(appdir.join(bundle_name).join(inner_path))
         }
@@ -273,7 +278,7 @@ fn ensure_payload_file_staged(
     chmod_exec: bool,
     caskroom_files: &mut Vec<String>,
     copied_payload_paths: &mut HashMap<String, String>,
-) -> Result<()> {
+) -> Result<(), CaskExtractError> {
     if copied_payload_paths.contains_key(rel) {
         if chmod_exec {
             set_executable(&caskroom_stage.join(rel))?;
@@ -281,18 +286,26 @@ fn ensure_payload_file_staged(
         return Ok(());
     }
     let src = resolve_unpack_dir_path(unpack_dir, rel)?;
-    let meta = fs::symlink_metadata(&src)
-        .with_context(|| format!("missing declared payload artifact '{rel}'"))?;
+    let meta = fs::symlink_metadata(&src).map_err(|source| CaskExtractError::PayloadMissing {
+        rel: rel.to_owned(),
+        source,
+    })?;
     if meta.file_type().is_symlink() || !meta.is_file() {
-        bail!("declared payload artifact '{rel}' is not a regular file");
+        return Err(CaskExtractError::PayloadNotRegular {
+            rel: rel.to_owned(),
+        });
     }
     let dst = caskroom_stage.join(rel);
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
     }
     fs::rename(&src, &dst)
         .or_else(|_| fs::copy(&src, &dst).map(|_| ()))
-        .with_context(|| format!("failed to stage Caskroom file '{rel}'"))?;
+        .map_err(|source| CaskExtractError::Io {
+            action: "stage Caskroom file",
+            path: PathBuf::from(rel),
+            source,
+        })?;
     if chmod_exec {
         set_executable(&dst)?;
     }
@@ -301,14 +314,19 @@ fn ensure_payload_file_staged(
     Ok(())
 }
 
-fn resolve_unpack_dir_path(unpack_dir: &Path, rel: &str) -> Result<PathBuf> {
+fn resolve_unpack_dir_path(unpack_dir: &Path, rel: &str) -> Result<PathBuf, CaskExtractError> {
     let mut cur = unpack_dir.to_path_buf();
     for segment in rel.split('/') {
         cur.push(segment);
-        let meta = fs::symlink_metadata(&cur)
-            .with_context(|| format!("extracted artifact '{rel}' not found in archive"))?;
+        let meta =
+            fs::symlink_metadata(&cur).map_err(|source| CaskExtractError::ArtifactNotFound {
+                rel: rel.to_owned(),
+                source,
+            })?;
         if meta.file_type().is_symlink() {
-            bail!("refusing symlink along declared artifact path '{rel}'");
+            return Err(CaskExtractError::ArtifactSymlink {
+                rel: rel.to_owned(),
+            });
         }
     }
     Ok(cur)
@@ -316,7 +334,10 @@ fn resolve_unpack_dir_path(unpack_dir: &Path, rel: &str) -> Result<PathBuf> {
 
 /// Resolve `inner_path` inside `bundle_dir` without escaping `bundle_dir`,
 /// allowing bounded relative symlinks within the bundle.
-fn verify_regular_file_in_bundle(bundle_dir: &Path, inner_path: &str) -> Result<()> {
+fn verify_regular_file_in_bundle(
+    bundle_dir: &Path,
+    inner_path: &str,
+) -> Result<(), CaskExtractError> {
     let mut current_rel = PathBuf::new();
     let mut remaining: Vec<String> = inner_path.split('/').map(str::to_string).collect();
     remaining.reverse();
@@ -327,10 +348,10 @@ fn verify_regular_file_in_bundle(bundle_dir: &Path, inner_path: &str) -> Result<
             "" | "." => continue,
             ".." => {
                 if !current_rel.pop() {
-                    bail!(
-                        "path '{inner_path}' escapes bundle '{}'",
-                        bundle_dir.display()
-                    );
+                    return Err(CaskExtractError::BundleEscape {
+                        inner_path: inner_path.to_owned(),
+                        bundle: bundle_dir.to_path_buf(),
+                    });
                 }
                 continue;
             }
@@ -338,45 +359,48 @@ fn verify_regular_file_in_bundle(bundle_dir: &Path, inner_path: &str) -> Result<
         }
         current_rel.push(&seg);
         let abs = bundle_dir.join(&current_rel);
-        let meta = fs::symlink_metadata(&abs).with_context(|| {
-            format!(
-                "missing file '{inner_path}' inside bundle '{}'",
-                bundle_dir.display()
-            )
-        })?;
+        let meta =
+            fs::symlink_metadata(&abs).map_err(|source| CaskExtractError::BundleFileMissing {
+                inner_path: inner_path.to_owned(),
+                bundle: bundle_dir.to_path_buf(),
+                source,
+            })?;
         if meta.file_type().is_symlink() {
             hops += 1;
             if hops > MAX_SYMLINK_HOPS {
-                bail!("symlink loop resolving '{inner_path}' in bundle");
+                return Err(CaskExtractError::BundleSymlinkLoop {
+                    inner_path: inner_path.to_owned(),
+                });
             }
-            let target = fs::read_link(&abs)?;
+            let target = fs::read_link(&abs).map_err(CaskExtractError::Fs)?;
             let target_str = target
                 .to_str()
-                .context("non-UTF-8 symlink inside .app bundle")?;
+                .ok_or(CaskExtractError::BundleSymlinkNotUtf8)?;
             validate_relative_symlink_lexically(&current_rel, target_str)?;
             current_rel.pop();
             let mut replacement: Vec<String> = target_str.split('/').map(str::to_string).collect();
             replacement.reverse();
             remaining.extend(replacement);
         } else if !remaining.is_empty() && !meta.is_dir() {
-            bail!(
-                "non-directory component along '{inner_path}' in '{}'",
-                bundle_dir.display()
-            );
+            return Err(CaskExtractError::BundleNonDirectory {
+                inner_path: inner_path.to_owned(),
+                bundle: bundle_dir.to_path_buf(),
+            });
         }
     }
 
-    let final_meta = fs::symlink_metadata(bundle_dir.join(&current_rel)).with_context(|| {
-        format!(
-            "missing target '{inner_path}' in bundle '{}'",
-            bundle_dir.display()
-        )
+    let final_meta = fs::symlink_metadata(bundle_dir.join(&current_rel)).map_err(|source| {
+        CaskExtractError::BundleTargetMissing {
+            inner_path: inner_path.to_owned(),
+            bundle: bundle_dir.to_path_buf(),
+            source,
+        }
     })?;
     if !final_meta.is_file() {
-        bail!(
-            "target '{inner_path}' inside '{}' is not a regular file",
-            bundle_dir.display()
-        );
+        return Err(CaskExtractError::BundleTargetNotRegular {
+            inner_path: inner_path.to_owned(),
+            bundle: bundle_dir.to_path_buf(),
+        });
     }
     Ok(())
 }

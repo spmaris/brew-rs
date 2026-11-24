@@ -4,9 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
-
 use super::constants::LC_CODE_SIGNATURE;
+use super::error::MachoError;
 use super::model::Parsed;
 use super::parse::{parse, validate_relocatable};
 use super::rewrite_plan::{Plan, reject_any_marker};
@@ -20,7 +19,7 @@ const INSTALL_NAME_TOOL: &str = "/usr/bin/install_name_tool";
 const CODESIGN: &str = "/usr/bin/codesign";
 
 /// Run the Apple rewriter, sign, and verify, re-parsing after every mutation.
-pub(super) fn apply(path: &Path, original: &Parsed, plan: &Plan) -> Result<()> {
+pub(super) fn apply(path: &Path, original: &Parsed, plan: &Plan) -> Result<(), MachoError> {
     let arguments = plan.arguments();
     run_tool(
         INSTALL_NAME_TOOL,
@@ -29,10 +28,8 @@ pub(super) fn apply(path: &Path, original: &Parsed, plan: &Plan) -> Result<()> {
         "install_name_tool could not rewrite the staged image",
     )?;
 
-    let rewritten = fs::read(path)
-        .with_context(|| format!("Could not read rewritten image {}", path.display()))?;
-    verify_stage(original, plan, &rewritten)
-        .context("The image did not match the relocation plan after install_name_tool")?;
+    let rewritten = read_image(path, "rewritten")?;
+    verify_stage(original, plan, &rewritten).map_err(plan_mismatch("install_name_tool"))?;
 
     let sign_arguments = signing_arguments(original.signed);
     run_tool(
@@ -42,10 +39,8 @@ pub(super) fn apply(path: &Path, original: &Parsed, plan: &Plan) -> Result<()> {
         "codesign could not ad-hoc sign the staged image",
     )?;
 
-    let signed = fs::read(path)
-        .with_context(|| format!("Could not read signed image {}", path.display()))?;
-    verify_stage(original, plan, &signed)
-        .context("The image did not match the relocation plan after codesign")?;
+    let signed = read_image(path, "signed")?;
+    verify_stage(original, plan, &signed).map_err(plan_mismatch("codesign"))?;
 
     let verify_arguments = ["--verify".to_owned(), "--strict".to_owned()];
     run_tool(
@@ -55,20 +50,38 @@ pub(super) fn apply(path: &Path, original: &Parsed, plan: &Plan) -> Result<()> {
         "codesign could not verify the staged image",
     )?;
 
-    let verified = fs::read(path)
-        .with_context(|| format!("Could not read verified image {}", path.display()))?;
-    verify_stage(original, plan, &verified)
-        .context("The image did not match the relocation plan after signature verification")?;
+    let verified = read_image(path, "verified")?;
+    verify_stage(original, plan, &verified).map_err(plan_mismatch("signature verification"))?;
     Ok(())
+}
+
+/// Read back an image the tools just wrote.
+fn read_image(path: &Path, stage: &'static str) -> Result<Vec<u8>, MachoError> {
+    fs::read(path).map_err(|source| MachoError::ReadImage {
+        stage,
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Wrap a verification failure with the tool step that preceded it.
+fn plan_mismatch(stage: &'static str) -> impl FnOnce(MachoError) -> MachoError {
+    move |source| MachoError::PlanMismatch {
+        stage,
+        source: Box::new(source),
+    }
 }
 
 /// Parse the rewritten bytes and check them against the original identity and
 /// the exact plan.
-pub(super) fn verify_stage(original: &Parsed, plan: &Plan, bytes: &[u8]) -> Result<()> {
+pub(super) fn verify_stage(original: &Parsed, plan: &Plan, bytes: &[u8]) -> Result<(), MachoError> {
     reject_any_marker(bytes)?;
-    let parsed =
-        parse(bytes).context("Rewritten file is not a supported thin 64-bit Mach-O image")?;
-    validate_relocatable(&parsed).context("Rewritten load-command set is not relocatable")?;
+    let parsed = parse(bytes).map_err(|source| MachoError::RewrittenUnsupported {
+        source: Box::new(source),
+    })?;
+    validate_relocatable(&parsed).map_err(|source| MachoError::RewrittenNotRelocatable {
+        source: Box::new(source),
+    })?;
     compare_rewrite(original, &plan.expected, &parsed)
 }
 
@@ -82,12 +95,12 @@ pub(super) fn compare_rewrite(
     original: &Parsed,
     expected: &[Option<String>],
     after: &Parsed,
-) -> Result<()> {
+) -> Result<(), MachoError> {
     if after.header.cputype != original.header.cputype
         || after.header.cpusubtype != original.header.cpusubtype
         || after.header.filetype != original.header.filetype
     {
-        bail!("Rewritten Mach-O header identity changed");
+        return Err(MachoError::HeaderIdentityChanged);
     }
 
     let mut rewritten = after
@@ -99,38 +112,40 @@ pub(super) fn compare_rewrite(
             continue;
         }
         let Some(actual) = rewritten.next() else {
-            bail!("Load command {index} disappeared from the rewritten image");
+            return Err(MachoError::CommandDisappeared { index });
         };
         if actual.command != command.command {
-            bail!(
-                "Load command {index} changed type from {:#x} to {:#x}",
-                command.command,
-                actual.command
-            );
+            return Err(MachoError::CommandTypeChanged {
+                index,
+                from: command.command,
+                to: actual.command,
+            });
         }
         match (&expected[index], actual.name.as_deref()) {
             (Some(target), Some(value)) if target == value => {}
             (Some(target), Some(value)) => {
-                bail!(
-                    "Load command {index} expected path {target:?}, but the rewritten image contains {value:?}"
-                );
+                return Err(MachoError::PathMismatch {
+                    index,
+                    expected: target.clone(),
+                    actual: value.to_owned(),
+                });
             }
             (Some(_), None) => {
-                bail!("Load command {index} lost its path in the rewritten image");
+                return Err(MachoError::PathLost { index });
             }
             (None, Some(value)) => {
-                bail!(
-                    "Load command {index} unexpectedly gained the path {value:?} in the rewritten image"
-                );
+                return Err(MachoError::PathGained {
+                    index,
+                    value: value.to_owned(),
+                });
             }
             (None, None) => {}
         }
     }
     if let Some(extra) = rewritten.next() {
-        bail!(
-            "Rewritten image gained an unexpected load command {:#x}",
-            extra.command
-        );
+        return Err(MachoError::ExtraCommand {
+            command: extra.command,
+        });
     }
     Ok(())
 }
@@ -148,12 +163,17 @@ pub(super) fn signing_arguments(originally_signed: bool) -> Vec<String> {
 }
 
 /// Run one absolute Apple tool with `arguments` followed by `path`.
-fn run_tool(program: &str, arguments: &[String], path: &Path, context: &str) -> Result<()> {
+fn run_tool(
+    program: &'static str,
+    arguments: &[String],
+    path: &Path,
+    context: &'static str,
+) -> Result<(), MachoError> {
     let output = Command::new(program)
         .args(arguments)
         .arg(path)
         .output()
-        .with_context(|| format!("Could not run {program}"))?;
+        .map_err(|source| MachoError::ToolSpawn { program, source })?;
     if output.status.success() {
         return Ok(());
     }
@@ -169,7 +189,11 @@ fn run_tool(program: &str, arguments: &[String], path: &Path, context: &str) -> 
     } else {
         diagnostics.join("; ")
     };
-    bail!("{context} ({}): {detail}", output.status)
+    Err(MachoError::ToolFailed {
+        context,
+        status: output.status,
+        detail,
+    })
 }
 
 /// Render a bounded, lossy version of one tool stream.
@@ -185,11 +209,15 @@ fn diagnostic(bytes: &[u8]) -> Option<String> {
 }
 
 /// Require a regular, non-symlink staged file.
-pub(super) fn ensure_regular_file(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("Could not inspect staged image {}", path.display()))?;
+pub(super) fn ensure_regular_file(path: &Path) -> Result<(), MachoError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| MachoError::InspectImage {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if !metadata.file_type().is_file() {
-        bail!("Staged image {} is not a regular file", path.display());
+        return Err(MachoError::ImageNotRegular {
+            path: path.to_path_buf(),
+        });
     }
     Ok(())
 }

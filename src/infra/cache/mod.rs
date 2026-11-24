@@ -1,5 +1,6 @@
 pub mod bottle_store;
 pub mod cleanup;
+pub mod error;
 pub mod manager;
 
 pub use manager::CacheManager;

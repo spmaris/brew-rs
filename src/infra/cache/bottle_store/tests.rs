@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -106,7 +107,10 @@ async fn refuses_symlinked_bottle_directory() -> Result<()> {
     symlink(&target, cache_dir.join("bottles"))?;
 
     assert!(
-        BottleStore::new(&cache_dir).is_err(),
+        matches!(
+            BottleStore::new(&cache_dir),
+            Err(CacheError::SymlinkedDir { .. })
+        ),
         "symlinked bottles directory must be refused"
     );
 

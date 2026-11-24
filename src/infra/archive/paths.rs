@@ -5,8 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-
+use super::error::ArchiveError;
 use super::extract::Seen;
 use super::limits::MAX_COMPONENT_BYTES;
 
@@ -19,7 +18,7 @@ pub(super) fn relative_path(
     name: &str,
     version: Option<&str>,
     is_dir: bool,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<PathBuf>, ArchiveError> {
     let trailing_slash = bytes.ends_with(b"/");
     let bytes = if trailing_slash {
         &bytes[..bytes.len() - 1]
@@ -27,44 +26,53 @@ pub(super) fn relative_path(
         bytes
     };
     if bytes.is_empty() {
-        bail!("bottle archive contains an empty path");
+        return Err(ArchiveError::EmptyPath);
     }
     if bytes
         .iter()
         .any(|byte| *byte == b'\\' || *byte == 0 || byte.is_ascii_control())
     {
-        bail!(
-            "bottle archive path '{}' contains a backslash, NUL, or control byte",
-            String::from_utf8_lossy(bytes)
-        );
+        return Err(ArchiveError::PathControlBytes {
+            path: String::from_utf8_lossy(bytes).into_owned(),
+        });
     }
-    let path = std::str::from_utf8(bytes)
-        .ok()
-        .context("bottle archive path is not valid UTF-8")?;
+    let path = std::str::from_utf8(bytes).map_err(|_| ArchiveError::PathNotUtf8)?;
     let components: Vec<&str> = path.split('/').collect();
     if components
         .iter()
         .any(|component| component.is_empty() || *component == "." || *component == "..")
     {
-        bail!("bottle archive path '{path}' is not a normalized relative path");
+        return Err(ArchiveError::PathNotNormalized {
+            path: path.to_owned(),
+        });
     }
     if components
         .iter()
         .any(|component| component.len() > MAX_COMPONENT_BYTES)
     {
-        bail!("bottle archive path '{path}' contains an overlong component");
+        return Err(ArchiveError::PathOverlongComponent {
+            path: path.to_owned(),
+        });
     }
     #[cfg(windows)]
     if components.iter().any(|component| component.contains(':')) {
-        bail!("bottle archive path '{path}' contains a Windows drive prefix");
+        return Err(ArchiveError::PathDrivePrefix {
+            path: path.to_owned(),
+        });
     }
 
     if components[0] != name {
-        bail!("bottle archive path '{path}' is outside '{name}/'");
+        return Err(ArchiveError::UnexpectedRoot {
+            path: path.to_owned(),
+            expected: format!("{name}/"),
+        });
     }
     let root_depth = if let Some(version) = version {
         if components.len() > 1 && components[1] != version {
-            bail!("bottle archive path '{path}' is outside '{name}/{version}/'");
+            return Err(ArchiveError::UnexpectedRoot {
+                path: path.to_owned(),
+                expected: format!("{name}/{version}/"),
+            });
         }
         2
     } else {
@@ -72,12 +80,16 @@ pub(super) fn relative_path(
     };
     if components.len() <= root_depth {
         if !is_dir {
-            bail!("bottle archive path '{path}' is not a directory");
+            return Err(ArchiveError::PathNotDirectory {
+                path: path.to_owned(),
+            });
         }
         return Ok(None);
     }
     if trailing_slash && !is_dir {
-        bail!("bottle archive file path '{path}' ends with a slash");
+        return Err(ArchiveError::FilePathTrailingSlash {
+            path: path.to_owned(),
+        });
     }
     let relative = components[root_depth..].iter().collect();
     Ok(Some(relative))
@@ -85,7 +97,10 @@ pub(super) fn relative_path(
 
 /// Reject an entry nested under a path that was already extracted as a file,
 /// or under a symlink that will only be created after extraction.
-pub(super) fn check_ancestors(relative: &Path, seen: &HashMap<PathBuf, Seen>) -> Result<()> {
+pub(super) fn check_ancestors(
+    relative: &Path,
+    seen: &HashMap<PathBuf, Seen>,
+) -> Result<(), ArchiveError> {
     let mut ancestor = PathBuf::new();
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
@@ -94,14 +109,16 @@ pub(super) fn check_ancestors(relative: &Path, seen: &HashMap<PathBuf, Seen>) ->
         }
         ancestor.push(component);
         match seen.get(&ancestor) {
-            Some(Seen::File) => bail!(
-                "bottle archive path '{}' is nested under an extracted file",
-                relative.display()
-            ),
-            Some(Seen::Symlink) => bail!(
-                "bottle archive path '{}' is nested under an extracted symlink",
-                relative.display()
-            ),
+            Some(Seen::File) => {
+                return Err(ArchiveError::NestedUnderFile {
+                    path: relative.to_path_buf(),
+                });
+            }
+            Some(Seen::Symlink) => {
+                return Err(ArchiveError::NestedUnderSymlink {
+                    path: relative.to_path_buf(),
+                });
+            }
             _ => {}
         }
     }
@@ -109,26 +126,29 @@ pub(super) fn check_ancestors(relative: &Path, seen: &HashMap<PathBuf, Seen>) ->
 }
 
 /// Create each component of `relative` below `out` with a normalized mode.
-pub(super) fn create_directories(out: &Path, relative: &Path) -> Result<()> {
+pub(super) fn create_directories(out: &Path, relative: &Path) -> Result<(), ArchiveError> {
     let mut current = out.to_path_buf();
     for component in relative.components() {
         current.push(component);
         match fs::create_dir(&current) {
             Ok(()) => set_mode(&current, 0o755)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&current).with_context(|| {
-                    format!("failed to inspect extraction path {}", current.display())
-                })?;
+                let metadata =
+                    fs::symlink_metadata(&current).map_err(|source| ArchiveError::Io {
+                        action: "inspect extraction path",
+                        path: current.clone(),
+                        source,
+                    })?;
                 if !metadata.file_type().is_dir() {
-                    bail!(
-                        "extraction path {} is not a regular directory",
-                        current.display()
-                    );
+                    return Err(ArchiveError::ExtractionPathNotDirectory { path: current });
                 }
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to create directory {}", current.display()));
+                return Err(ArchiveError::Io {
+                    action: "create directory",
+                    path: current,
+                    source: error,
+                });
             }
         }
     }
@@ -136,12 +156,17 @@ pub(super) fn create_directories(out: &Path, relative: &Path) -> Result<()> {
 }
 
 /// Apply a normalized permission mode where the platform supports one.
-pub(super) fn set_mode(path: &Path, mode: u32) -> Result<()> {
+pub(super) fn set_mode(path: &Path, mode: u32) -> Result<(), ArchiveError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+            ArchiveError::Io {
+                action: "set permissions on",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
     }
     #[cfg(not(unix))]
     {

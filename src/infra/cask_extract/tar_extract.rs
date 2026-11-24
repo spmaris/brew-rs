@@ -5,10 +5,10 @@ use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
 use flate2::bufread::GzDecoder;
 use tar::EntryType;
 
+use super::error::CaskExtractError;
 use super::limits::{MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_UNPACKED_BYTES};
 use super::tree::{
     normalize_relative_entry_path, validate_archive_entry_path, validate_relative_symlink_lexically,
@@ -17,9 +17,15 @@ use super::tree::{
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Bounded tar extraction for `.tar.gz` casks (no fixed `<name>/<version>` wrapper).
-pub(super) fn extract_tar_gz(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
-    let file = File::open(archive_path)
-        .with_context(|| format!("failed to open tarball '{}'", archive_path.display()))?;
+pub(super) fn extract_tar_gz(
+    archive_path: &Path,
+    unpack_dir: &Path,
+) -> Result<(), CaskExtractError> {
+    let file = File::open(archive_path).map_err(|source| CaskExtractError::Io {
+        action: "open tarball",
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
     let decoder = GzDecoder::new(BufReader::new(file));
     let mut tar = tar::Archive::new(BoundedReader {
         inner: decoder,
@@ -28,16 +34,23 @@ pub(super) fn extract_tar_gz(archive_path: &Path, unpack_dir: &Path) -> Result<(
 
     let mut count = 0_usize;
     let mut symlinks = Vec::new();
-    for entry in tar.entries().context("failed to read cask tarball")? {
-        let mut entry = entry.context("failed to read cask tarball entry")?;
+    let entries = tar.entries().map_err(|source| CaskExtractError::Stream {
+        action: "read cask tarball",
+        source,
+    })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|source| CaskExtractError::Stream {
+            action: "read cask tarball entry",
+            source,
+        })?;
         count += 1;
         if count > MAX_ENTRIES {
-            bail!("cask tarball exceeds {MAX_ENTRIES} entries");
+            return Err(CaskExtractError::TarballTooManyEntries { limit: MAX_ENTRIES });
         }
 
         let entry_path = entry
             .path()
-            .context("cask tarball entry has a non-UTF-8 or invalid path")?;
+            .map_err(|source| CaskExtractError::TarballEntryPath { source })?;
         let rel = normalize_relative_entry_path(&entry_path)?;
         if rel.as_os_str().is_empty() {
             continue;
@@ -48,39 +61,53 @@ pub(super) fn extract_tar_gz(archive_path: &Path, unpack_dir: &Path) -> Result<(
 
         match entry_type {
             EntryType::Directory => {
-                fs::create_dir_all(&dest)
-                    .with_context(|| format!("failed to create directory '{}'", dest.display()))?;
+                fs::create_dir_all(&dest).map_err(|source| CaskExtractError::Io {
+                    action: "create directory",
+                    path: dest.clone(),
+                    source,
+                })?;
             }
             EntryType::Regular | EntryType::Continuous => {
                 let size = entry.header().size().unwrap_or(0);
                 if size > MAX_ARCHIVE_BYTES {
-                    bail!("cask tarball entry '{}' exceeds size limit", rel.display());
+                    return Err(CaskExtractError::TarballEntryTooLarge { path: rel });
                 }
                 if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
+                    fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
                 }
                 let mut out_file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&dest)
-                    .with_context(|| format!("failed to create file '{}'", dest.display()))?;
-                io::copy(&mut entry, &mut out_file)
-                    .with_context(|| format!("failed to extract '{}'", rel.display()))?;
+                    .map_err(|source| CaskExtractError::Io {
+                        action: "create file",
+                        path: dest.clone(),
+                        source,
+                    })?;
+                io::copy(&mut entry, &mut out_file).map_err(|source| CaskExtractError::Io {
+                    action: "extract",
+                    path: rel.clone(),
+                    source,
+                })?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let safe_mode = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
-                    fs::set_permissions(&dest, fs::Permissions::from_mode(safe_mode))?;
+                    fs::set_permissions(&dest, fs::Permissions::from_mode(safe_mode))
+                        .map_err(CaskExtractError::Fs)?;
                 }
             }
             EntryType::Symlink => {
                 let target = entry
                     .link_name()
-                    .context("failed to read tar symlink target")?
-                    .context("tar symlink missing link target")?;
+                    .map_err(|source| CaskExtractError::Stream {
+                        action: "read tar symlink target",
+                        source,
+                    })?
+                    .ok_or(CaskExtractError::TarSymlinkNoTarget)?;
                 let target_str = target
                     .to_str()
-                    .context("tar symlink target is not UTF-8")?
+                    .ok_or(CaskExtractError::TarSymlinkTargetNotUtf8)?
                     .to_string();
                 symlinks.push((rel, dest, target_str));
             }
@@ -90,30 +117,32 @@ pub(super) fn extract_tar_gz(archive_path: &Path, unpack_dir: &Path) -> Result<(
             | EntryType::GNULongLink => {
                 continue;
             }
-            other => bail!(
-                "cask tarball entry '{}' uses unsupported entry type {:?}",
-                rel.display(),
-                other
-            ),
+            entry_type => {
+                return Err(CaskExtractError::TarballEntryType {
+                    path: rel,
+                    entry_type,
+                });
+            }
         }
     }
 
     // Drain remainder to check gzip CRC & trailer cleanly.
     let mut reader = tar.into_inner();
     let mut buf = [0_u8; IO_BUFFER_BYTES];
-    while reader.read(&mut buf)? != 0 {}
+    while reader.read(&mut buf).map_err(CaskExtractError::Fs)? != 0 {}
 
     #[cfg(unix)]
     for (rel, dest, target) in symlinks {
         validate_relative_symlink_lexically(&rel, &target)?;
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
         }
-        std::os::unix::fs::symlink(&target, &dest).with_context(|| {
-            format!(
-                "failed to create staged symlink '{}' -> '{target}'",
-                dest.display()
-            )
+        std::os::unix::fs::symlink(&target, &dest).map_err(|source| {
+            CaskExtractError::SymlinkCreate {
+                path: dest.clone(),
+                target: target.clone(),
+                source,
+            }
         })?;
     }
 
@@ -145,30 +174,35 @@ impl<R: Read> Read for BoundedReader<R> {
     }
 }
 
-pub(super) fn preflight_bsdtar(path: &Path) -> Result<()> {
+pub(super) fn preflight_bsdtar(path: &Path) -> Result<(), CaskExtractError> {
     let output = Command::new("/usr/bin/tar")
         .arg("-tf")
         .arg(path)
         .stdin(Stdio::null())
         .output()
-        .context("failed to list tarball contents with /usr/bin/tar")?;
+        .map_err(|source| CaskExtractError::Stream {
+            action: "list tarball contents with /usr/bin/tar",
+            source,
+        })?;
     if !output.status.success() {
-        bail!("/usr/bin/tar -tf failed ({})", output.status);
+        return Err(CaskExtractError::TarListFailed {
+            status: output.status,
+        });
     }
-    let listing =
-        std::str::from_utf8(&output.stdout).context("tarball contains non-UTF-8 entry paths")?;
+    let listing = std::str::from_utf8(&output.stdout)
+        .map_err(|source| CaskExtractError::TarListingNotUtf8 { source })?;
     let mut count = 0_usize;
     for line in listing.lines() {
         count += 1;
         if count > MAX_ENTRIES {
-            bail!("tarball exceeds {MAX_ENTRIES} entries");
+            return Err(CaskExtractError::TarTooManyEntries { limit: MAX_ENTRIES });
         }
         validate_archive_entry_path(line, true)?;
     }
     Ok(())
 }
 
-pub(super) fn run_bsdtar_extract(path: &Path, unpack_dir: &Path) -> Result<()> {
+pub(super) fn run_bsdtar_extract(path: &Path, unpack_dir: &Path) -> Result<(), CaskExtractError> {
     let status = Command::new("/usr/bin/tar")
         .arg("--no-same-owner")
         .arg("--no-same-permissions")
@@ -178,9 +212,12 @@ pub(super) fn run_bsdtar_extract(path: &Path, unpack_dir: &Path) -> Result<()> {
         .arg(unpack_dir)
         .stdin(Stdio::null())
         .status()
-        .context("failed to extract tarball with /usr/bin/tar")?;
+        .map_err(|source| CaskExtractError::Stream {
+            action: "extract tarball with /usr/bin/tar",
+            source,
+        })?;
     if !status.success() {
-        bail!("/usr/bin/tar extraction failed ({status})");
+        return Err(CaskExtractError::TarExtractFailed { status });
     }
     Ok(())
 }

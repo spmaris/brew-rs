@@ -2,7 +2,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use crate::infra::store::StoreError;
+use crate::infra::store::error::Action;
 
 use crate::infra::store::{AppliedChange, MovedPath, RemovalStep, StepKind};
 
@@ -15,53 +16,54 @@ pub(crate) fn move_aside(
     quarantine: &Path,
     index: usize,
     applied: &mut Vec<AppliedChange>,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let source = &step.source;
     let metadata = match fs::symlink_metadata(source) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-            "refusing to remove '{}': it disappeared after preflight",
-            source.display()
-        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(StoreError::Disappeared {
+                action: Action::Remove,
+                path: source.to_path_buf(),
+            });
+        }
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect '{}'", source.display()));
+            return Err(StoreError::io("failed to inspect", &source)(error));
         }
     };
     match &step.kind {
-        StepKind::Receipt if metadata.file_type().is_symlink() || !metadata.is_file() => bail!(
-            "refusing to remove '{}': it is no longer a regular receipt",
-            source.display()
-        ),
-        StepKind::Directory if metadata.file_type().is_symlink() || !metadata.is_dir() => bail!(
-            "refusing to remove '{}': it is no longer a real directory",
-            source.display()
-        ),
+        StepKind::Receipt if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(StoreError::NoLongerRegularReceipt {
+                action: Action::Remove,
+                path: source.to_path_buf(),
+            });
+        }
+        StepKind::Directory if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(StoreError::NoLongerRealDirectory {
+                path: source.to_path_buf(),
+            });
+        }
         StepKind::Link { target } => {
             if !metadata.file_type().is_symlink() {
-                bail!(
-                    "refusing to remove '{}': it is no longer a brewrs symlink",
-                    source.display()
-                );
+                return Err(StoreError::NoLongerBrewrsSymlink {
+                    path: source.to_path_buf(),
+                });
             }
-            let actual = fs::read_link(source)
-                .with_context(|| format!("failed to read link '{}'", source.display()))?;
+            let actual =
+                fs::read_link(source).map_err(StoreError::io("failed to read link", &source))?;
             if actual.as_os_str() != target.as_os_str() {
-                bail!(
-                    "refusing to remove '{}': the link target is now '{}'",
-                    source.display(),
-                    actual.display()
-                );
+                return Err(StoreError::LinkTargetChanged {
+                    path: source.to_path_buf(),
+                    actual: actual.to_path_buf(),
+                });
             }
         }
         _ => {}
     }
 
     let parked = quarantine.join(format!("item-{index}"));
-    fs::rename(source, &parked).with_context(|| {
-        format!(
-            "failed to move '{}' into the removal quarantine",
-            source.display()
-        )
+    fs::rename(source, &parked).map_err(|error| StoreError::QuarantineMove {
+        path: source.clone(),
+        source: error,
     })?;
     applied.push(AppliedChange::Moved(MovedPath {
         source: source.clone(),
@@ -77,7 +79,7 @@ pub(crate) fn move_aside(
 pub(super) fn prune_package_dir(
     step: &RemovalStep,
     applied: &mut Vec<AppliedChange>,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let directory = &step.source;
     match fs::remove_dir(directory) {
         Ok(()) => {
@@ -92,12 +94,10 @@ pub(super) fn prune_package_dir(
         {
             Ok(())
         }
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to remove the emptied package directory '{}'",
-                directory.display()
-            )
-        }),
+        Err(error) => Err(StoreError::io(
+            "failed to remove the emptied package directory",
+            &directory,
+        )(error)),
     }
 }
 

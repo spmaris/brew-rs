@@ -4,9 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
+use super::error::ArchiveError;
 use super::limits::{IO_BUFFER_BYTES, MAX_ARCHIVE_BYTES};
 
 /// `O_NOFOLLOW | O_NONBLOCK` where known, so a swapped-in symlink is not
@@ -29,17 +29,29 @@ fn no_follow_flags() -> i32 {
 }
 
 /// Copy the archive into private staging while checking its exact bytes.
-pub(super) fn verified_snapshot(archive: &Path, out: &Path, sha256: &str) -> Result<File> {
-    let before = fs::symlink_metadata(archive)
-        .with_context(|| format!("failed to inspect bottle archive {}", archive.display()))?;
+pub(super) fn verified_snapshot(
+    archive: &Path,
+    out: &Path,
+    sha256: &str,
+) -> Result<File, ArchiveError> {
+    let io_error = |action: &'static str| {
+        move |source: std::io::Error| ArchiveError::Io {
+            action,
+            path: archive.to_path_buf(),
+            source,
+        }
+    };
+    let before = fs::symlink_metadata(archive).map_err(io_error("inspect bottle archive"))?;
     if !before.file_type().is_file() {
-        bail!("bottle archive {} is not a regular file", archive.display());
+        return Err(ArchiveError::NotRegularFile {
+            path: archive.to_path_buf(),
+        });
     }
     if before.len() == 0 || before.len() > MAX_ARCHIVE_BYTES {
-        bail!(
-            "bottle archive {} is empty or exceeds the {MAX_ARCHIVE_BYTES} byte limit",
-            archive.display()
-        );
+        return Err(ArchiveError::ArchiveSizeOutOfRange {
+            path: archive.to_path_buf(),
+            limit: MAX_ARCHIVE_BYTES,
+        });
     }
 
     let mut options = OpenOptions::new();
@@ -51,67 +63,75 @@ pub(super) fn verified_snapshot(archive: &Path, out: &Path, sha256: &str) -> Res
     }
     let mut file = options
         .open(archive)
-        .with_context(|| format!("failed to open bottle archive {}", archive.display()))?;
+        .map_err(io_error("open bottle archive"))?;
     let opened = file
         .metadata()
-        .with_context(|| format!("failed to inspect opened archive {}", archive.display()))?;
+        .map_err(io_error("inspect opened archive"))?;
     if !opened.is_file() || opened.len() != before.len() {
-        bail!(
-            "bottle archive {} changed while it was being opened",
-            archive.display()
-        );
+        return Err(ArchiveError::ChangedWhileOpening {
+            path: archive.to_path_buf(),
+        });
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if opened.dev() != before.dev() || opened.ino() != before.ino() {
-            bail!(
-                "bottle archive {} was replaced while it was being opened",
-                archive.display()
-            );
+            return Err(ArchiveError::ReplacedWhileOpening {
+                path: archive.to_path_buf(),
+            });
         }
     }
 
-    let mut snapshot =
-        tempfile::tempfile_in(out).context("failed to create a private bottle snapshot")?;
+    let mut snapshot = tempfile::tempfile_in(out).map_err(|source| ArchiveError::Stream {
+        action: "create a private bottle snapshot",
+        source,
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; IO_BUFFER_BYTES];
     let mut total = 0_u64;
     loop {
         let read = file
             .read(&mut buffer)
-            .with_context(|| format!("failed to hash bottle archive {}", archive.display()))?;
+            .map_err(io_error("hash bottle archive"))?;
         if read == 0 {
             break;
         }
         total = total
             .checked_add(read as u64)
-            .context("bottle archive size overflowed")?;
+            .ok_or(ArchiveError::ArchiveSizeOverflow)?;
         if total > MAX_ARCHIVE_BYTES {
-            bail!(
-                "bottle archive {} exceeds the {MAX_ARCHIVE_BYTES} byte limit",
-                archive.display()
-            );
+            return Err(ArchiveError::ArchiveTooLarge {
+                path: archive.to_path_buf(),
+                limit: MAX_ARCHIVE_BYTES,
+            });
         }
         snapshot
             .write_all(&buffer[..read])
-            .context("failed to copy the bottle snapshot")?;
+            .map_err(|source| ArchiveError::Stream {
+                action: "copy the bottle snapshot",
+                source,
+            })?;
         hasher.update(&buffer[..read]);
     }
     if total != opened.len() {
-        bail!(
-            "bottle archive {} changed while it was being read",
-            archive.display()
-        );
+        return Err(ArchiveError::ChangedWhileReading {
+            path: archive.to_path_buf(),
+        });
     }
 
     let actual = hex::encode(hasher.finalize());
     if actual != sha256 {
-        bail!("SHA-256 mismatch for the bottle archive: expected {sha256}, got {actual}");
+        return Err(ArchiveError::DigestMismatch {
+            expected: sha256.to_owned(),
+            actual,
+        });
     }
 
     snapshot
         .seek(SeekFrom::Start(0))
-        .context("failed to rewind the verified bottle snapshot")?;
+        .map_err(|source| ArchiveError::Stream {
+            action: "rewind the verified bottle snapshot",
+            source,
+        })?;
     Ok(snapshot)
 }

@@ -19,6 +19,7 @@
 //! explicitly requested, provided they are existing non-symlink directories
 //! outside protected Homebrew prefixes.
 
+mod error;
 mod install;
 mod removal;
 mod support;
@@ -27,9 +28,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub(crate) use self::error::CaskStoreError;
 use self::install::{
     apply_commit, finish_commit, finish_upgrade_err, prepare_commit, rollback_applied,
 };
@@ -141,7 +142,10 @@ enum ParkedEntry {
 ///
 /// The default is `<prefix>/Applications`. An explicit `--appdir` must be an
 /// existing absolute non-symlink directory outside protected Homebrew prefixes.
-pub(crate) fn resolve_appdir(prefix: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_appdir(
+    prefix: &Path,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, CaskStoreError> {
     match explicit {
         None => {
             let default = applications_dir(prefix);
@@ -150,26 +154,23 @@ pub(crate) fn resolve_appdir(prefix: &Path, explicit: Option<&Path>) -> Result<P
         }
         Some(dir) => {
             if dir.as_os_str().is_empty() || !dir.is_absolute() {
-                bail!(
-                    "refusing --appdir '{}': use an absolute directory path",
-                    dir.display()
-                );
+                return Err(CaskStoreError::AppdirNotAbsolute {
+                    path: dir.to_path_buf(),
+                });
             }
             reject_protected_prefix(dir)?;
-            let meta = fs::symlink_metadata(dir).with_context(|| {
-                format!(
-                    "refusing --appdir '{}': directory does not exist or cannot be inspected",
-                    dir.display()
-                )
-            })?;
+            let meta =
+                fs::symlink_metadata(dir).map_err(|source| CaskStoreError::AppdirInaccessible {
+                    path: dir.to_path_buf(),
+                    source,
+                })?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
-                bail!(
-                    "refusing --appdir '{}': must be a real directory, not a symlink",
-                    dir.display()
-                );
+                return Err(CaskStoreError::AppdirNotRealDirectory {
+                    path: dir.to_path_buf(),
+                });
             }
             let canonical = fs::canonicalize(dir)
-                .with_context(|| format!("failed to resolve --appdir '{}'", dir.display()))?;
+                .map_err(CaskStoreError::io("failed to resolve --appdir", &dir))?;
             reject_protected_prefix(&canonical)?;
             Ok(dir.to_path_buf())
         }
@@ -177,7 +178,7 @@ pub(crate) fn resolve_appdir(prefix: &Path, explicit: Option<&Path>) -> Result<P
 }
 
 /// Read every installed native cask receipt, sorted by token.
-pub(crate) fn installed(store: &Store) -> Result<Vec<CaskReceipt>> {
+pub(crate) fn installed(store: &Store) -> Result<Vec<CaskReceipt>, CaskStoreError> {
     if !store.is_owned() {
         return Ok(Vec::new());
     }
@@ -191,10 +192,8 @@ pub(crate) fn installed(store: &Store) -> Result<Vec<CaskReceipt>> {
 
     let dir = casks_state_dir(prefix);
     let mut receipts = Vec::new();
-    for entry in
-        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("failed to inspect '{}'", dir.display()))?;
+    for entry in fs::read_dir(&dir).map_err(CaskStoreError::io("failed to read", &dir))? {
+        let entry = entry.map_err(CaskStoreError::io("failed to inspect", &dir))?;
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -203,12 +202,11 @@ pub(crate) fn installed(store: &Store) -> Result<Vec<CaskReceipt>> {
         };
         let receipt = read_cask_receipt(&entry.path())?;
         if receipt.token != stem {
-            bail!(
-                "cask receipt '{}' names '{}', not '{}'",
-                entry.path().display(),
-                receipt.token,
-                stem
-            );
+            return Err(CaskStoreError::ReceiptNameMismatch {
+                path: entry.path().to_path_buf(),
+                actual: receipt.token.to_string(),
+                expected: stem.to_string(),
+            });
         }
         receipts.push(receipt);
     }
@@ -217,30 +215,27 @@ pub(crate) fn installed(store: &Store) -> Result<Vec<CaskReceipt>> {
 }
 
 /// Reject any projected cask+formula set with declared cask or formula conflicts.
-pub(crate) fn validate_cask_conflicts(casks: &[CaskReceipt], formulae: &[Receipt]) -> Result<()> {
+pub(crate) fn validate_cask_conflicts(
+    casks: &[CaskReceipt],
+    formulae: &[Receipt],
+) -> Result<(), CaskStoreError> {
     let cask_tokens: HashSet<&str> = casks.iter().map(|c| c.token.as_str()).collect();
     let formula_names: HashSet<&str> = formulae.iter().map(|f| f.name.as_str()).collect();
     for cask in casks {
         for conflict in &cask.conflicts_with_casks {
             if cask_tokens.contains(conflict.as_str()) {
-                bail!(
-                    "cask '{}' conflicts with '{}'; remove '{}' before installing '{}'",
-                    cask.token,
-                    conflict,
-                    conflict,
-                    cask.token
-                );
+                return Err(CaskStoreError::CaskConflict {
+                    token: cask.token.to_string(),
+                    conflict: conflict.to_string(),
+                });
             }
         }
         for conflict in &cask.conflicts_with_formulae {
             if formula_names.contains(conflict.as_str()) {
-                bail!(
-                    "cask '{}' conflicts with formula '{}'; remove '{}' before installing '{}'",
-                    cask.token,
-                    conflict,
-                    conflict,
-                    cask.token
-                );
+                return Err(CaskStoreError::FormulaConflict {
+                    token: cask.token.to_string(),
+                    conflict: conflict.to_string(),
+                });
             }
         }
     }
@@ -248,7 +243,7 @@ pub(crate) fn validate_cask_conflicts(casks: &[CaskReceipt], formulae: &[Receipt
 }
 
 /// Atomically install prepared casks into `store` under its writer lock.
-pub(crate) fn commit(store: &Store, packages: Vec<PreparedCask>) -> Result<()> {
+pub(crate) fn commit(store: &Store, packages: Vec<PreparedCask>) -> Result<(), CaskStoreError> {
     store.ensure_owned()?;
     if packages.is_empty() {
         return Ok(());
@@ -265,7 +260,7 @@ pub(crate) fn commit(store: &Store, packages: Vec<PreparedCask>) -> Result<()> {
 }
 
 /// Atomically remove exact observed cask receipts under `store`'s writer lock.
-pub(crate) fn remove(store: &Store, expected: &[CaskReceipt]) -> Result<()> {
+pub(crate) fn remove(store: &Store, expected: &[CaskReceipt]) -> Result<(), CaskStoreError> {
     store.verify_owned()?;
     if expected.is_empty() {
         return Ok(());
@@ -275,7 +270,7 @@ pub(crate) fn remove(store: &Store, expected: &[CaskReceipt]) -> Result<()> {
     let quarantine = tempfile::Builder::new()
         .prefix("cask-remove-")
         .tempdir_in(stages_dir(store.prefix()))
-        .context("failed to create cask removal quarantine")?;
+        .map_err(|source| CaskStoreError::RemovalQuarantine { source })?;
 
     let mut parked = Vec::new();
     match apply_removals(&removals, quarantine.path(), &mut parked) {
@@ -286,22 +281,26 @@ pub(crate) fn remove(store: &Store, expected: &[CaskReceipt]) -> Result<()> {
         }
         Err(error) => {
             let mut issues = rollback_parked(&parked);
-            let msg = if issues.is_empty() {
+            if issues.is_empty() {
                 drop(quarantine);
                 return Err(error);
-            } else {
-                let kept = quarantine.keep();
-                issues.push(format!("quarantine kept at '{}'", kept.display()));
-                issues.join("; ")
-            };
-            Err(error.context(format!("cask removal rollback was incomplete: {msg}")))
+            }
+            let kept = quarantine.keep();
+            issues.push(format!("quarantine kept at '{}'", kept.display()));
+            Err(CaskStoreError::RemovalRollbackIncomplete {
+                issues,
+                source: Box::new(error),
+            })
         }
     }
 }
 
 /// Atomically upgrade observed cask receipts to their replacements under one
 /// writer lock, restoring old casks on failure.
-pub(crate) fn upgrade(store: &Store, replacements: Vec<(CaskReceipt, PreparedCask)>) -> Result<()> {
+pub(crate) fn upgrade(
+    store: &Store,
+    replacements: Vec<(CaskReceipt, PreparedCask)>,
+) -> Result<(), CaskStoreError> {
     store.ensure_owned()?;
     if replacements.is_empty() {
         return Ok(());
@@ -313,21 +312,21 @@ pub(crate) fn upgrade(store: &Store, replacements: Vec<(CaskReceipt, PreparedCas
     let mut seen = HashSet::new();
     for (old, new) in replacements {
         if old.token != new.receipt.token {
-            bail!(
-                "refusing cask upgrade from '{}' to mismatched token '{}'",
-                old.token,
-                new.receipt.token
-            );
+            return Err(CaskStoreError::UpgradeTokenMismatch {
+                from: old.token.to_string(),
+                to: new.receipt.token.to_string(),
+            });
         }
         if old.version == new.receipt.version && old.sha256 == new.receipt.sha256 {
-            bail!(
-                "refusing to upgrade cask '{}' in place at identical version '{}' and sha256",
-                old.token,
-                old.version
-            );
+            return Err(CaskStoreError::UpgradeIdentical {
+                token: old.token.to_string(),
+                version: old.version.to_string(),
+            });
         }
         if !seen.insert(old.token.clone()) {
-            bail!("cask '{}' appears more than once in one upgrade", old.token);
+            return Err(CaskStoreError::DuplicateInUpgrade {
+                token: old.token.to_string(),
+            });
         }
         olds.push(old);
         prepared_news.push(new);
@@ -351,7 +350,7 @@ pub(crate) fn upgrade(store: &Store, replacements: Vec<(CaskReceipt, PreparedCas
     let quarantine = tempfile::Builder::new()
         .prefix("cask-upgrade-")
         .tempdir_in(stages_dir(store.prefix()))
-        .context("failed to create cask upgrade quarantine")?;
+        .map_err(|source| CaskStoreError::UpgradeQuarantine { source })?;
     let mut parked = Vec::new();
     if let Err(error) = apply_removals(&removals, quarantine.path(), &mut parked) {
         let issues = rollback_parked(&parked);
@@ -360,11 +359,11 @@ pub(crate) fn upgrade(store: &Store, replacements: Vec<(CaskReceipt, PreparedCas
             Err(error)
         } else {
             let kept = quarantine.keep();
-            Err(error.context(format!(
-                "upgrade preflight rollback failed: {}; quarantine kept at '{}'",
-                issues.join("; "),
-                kept.display()
-            )))
+            Err(CaskStoreError::UpgradePreflightRollbackFailed {
+                issues,
+                kept,
+                source: Box::new(error),
+            })
         };
     }
 

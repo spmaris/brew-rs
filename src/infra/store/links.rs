@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
 
 use super::prefix::ensure_directory;
 use super::receipt::is_safe_bin_name;
@@ -125,14 +125,13 @@ pub(super) fn collect_owned_links(
     root: &LinkDirectory,
     name: &str,
     version: &str,
-) -> Result<Vec<OwnedLink>> {
+) -> Result<Vec<OwnedLink>, StoreError> {
     let mut links = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read '{}'", dir.display()))? {
-        let entry =
-            entry.with_context(|| format!("failed to read an entry in '{}'", dir.display()))?;
+    for entry in fs::read_dir(dir).map_err(StoreError::io("failed to read", &dir))? {
+        let entry = entry.map_err(StoreError::io("failed to read an entry in", &dir))?;
         if !entry
             .file_type()
-            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
+            .map_err(StoreError::io("failed to inspect", &entry.path()))?
             .is_symlink()
         {
             continue;
@@ -150,8 +149,7 @@ pub(super) fn collect_owned_links(
         }
         let path = entry.path();
         let target = keg_link_target(name, version, root.subdir, &member);
-        let actual = fs::read_link(&path)
-            .with_context(|| format!("failed to read link '{}'", path.display()))?;
+        let actual = fs::read_link(&path).map_err(StoreError::io("failed to read link", &path))?;
         if actual.as_os_str() == target.as_os_str() {
             links.push(OwnedLink { path, target });
         }
@@ -165,7 +163,7 @@ pub(super) fn opt_link_target(name: &str, version: &str) -> PathBuf {
 }
 
 /// Collect every linkable member below the staged keg's managed directories.
-pub(super) fn staged_links(stage: &Path) -> Result<Vec<ManagedLink>> {
+pub(super) fn staged_links(stage: &Path) -> Result<Vec<ManagedLink>, StoreError> {
     let mut links = Vec::new();
     for root in LINK_DIRECTORIES {
         for name in staged_members(stage, &root)? {
@@ -180,21 +178,22 @@ pub(super) fn staged_links(stage: &Path) -> Result<Vec<ManagedLink>> {
 
 /// Resolve a managed directory below the stage without following symlinked
 /// ancestors. `None` means the stage simply does not ship that directory.
-fn staged_directory(stage: &Path, subdir: &str) -> Result<Option<PathBuf>> {
+fn staged_directory(stage: &Path, subdir: &str) -> Result<Option<PathBuf>, StoreError> {
     let mut directory = stage.to_path_buf();
     for component in subdir.split('/') {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "refusing stage '{}': '{subdir}' has a symlinked parent directory",
-                stage.display()
-            ),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::StageSymlinkedParent {
+                    stage: stage.to_path_buf(),
+                    subdir: subdir.to_string(),
+                });
+            }
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+                return Err(StoreError::io("failed to inspect", &directory)(error));
             }
         }
     }
@@ -203,20 +202,17 @@ fn staged_directory(stage: &Path, subdir: &str) -> Result<Option<PathBuf>> {
 
 /// Direct regular files or keg-contained relative symlinks below one staged
 /// managed directory.
-fn staged_members(stage: &Path, root: &LinkDirectory) -> Result<Vec<String>> {
+fn staged_members(stage: &Path, root: &LinkDirectory) -> Result<Vec<String>, StoreError> {
     let Some(dir) = staged_directory(stage, root.subdir)? else {
         return Ok(Vec::new());
     };
 
     let stage_root = stage
         .canonicalize()
-        .with_context(|| format!("failed to resolve stage '{}'", stage.display()))?;
+        .map_err(StoreError::io("failed to resolve stage", &stage))?;
     let mut members = Vec::new();
-    for entry in
-        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("failed to read an entry in '{}'", dir.display()))?;
+    for entry in fs::read_dir(&dir).map_err(StoreError::io("failed to read", &dir))? {
+        let entry = entry.map_err(StoreError::io("failed to read an entry in", &dir))?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -231,43 +227,40 @@ fn staged_members(stage: &Path, root: &LinkDirectory) -> Result<Vec<String>> {
         let entry_path = entry.path();
         let file_type = entry
             .file_type()
-            .with_context(|| format!("failed to inspect '{}'", entry_path.display()))?;
+            .map_err(StoreError::io("failed to inspect", &entry_path))?;
         if file_type.is_file() {
             let metadata = entry
                 .metadata()
-                .with_context(|| format!("failed to inspect '{}'", entry_path.display()))?;
+                .map_err(StoreError::io("failed to inspect", &entry_path))?;
             if !root.executable || is_executable(&metadata) {
                 members.push(name);
             }
         } else if file_type.is_symlink() {
             let raw_target = fs::read_link(&entry_path)
-                .with_context(|| format!("failed to read link '{}'", entry_path.display()))?;
+                .map_err(StoreError::io("failed to read link", &entry_path))?;
             if raw_target.is_absolute() {
-                bail!(
-                    "refusing stage '{}': '{}/{}' is an absolute symlink",
-                    stage.display(),
-                    root.subdir,
-                    name
-                );
+                return Err(StoreError::StageAbsoluteSymlink {
+                    stage: stage.to_path_buf(),
+                    subdir: root.subdir,
+                    member: name.to_string(),
+                });
             }
-            let resolved = fs::canonicalize(&entry_path).with_context(|| {
-                format!(
-                    "refusing stage '{}': '{}/{}' is a broken symlink",
-                    stage.display(),
-                    root.subdir,
-                    name
-                )
-            })?;
+            let resolved =
+                fs::canonicalize(&entry_path).map_err(|source| StoreError::StageBrokenSymlink {
+                    stage: stage.to_path_buf(),
+                    subdir: root.subdir,
+                    member: name.clone(),
+                    source,
+                })?;
             if !resolved.starts_with(&stage_root) {
-                bail!(
-                    "refusing stage '{}': '{}/{}' escapes the staged keg",
-                    stage.display(),
-                    root.subdir,
-                    name
-                );
+                return Err(StoreError::StageEscapes {
+                    stage: stage.to_path_buf(),
+                    subdir: root.subdir,
+                    member: name.to_string(),
+                });
             }
             let target_meta = fs::symlink_metadata(&resolved)
-                .with_context(|| format!("failed to inspect '{}'", resolved.display()))?;
+                .map_err(StoreError::io("failed to inspect", &resolved))?;
             if target_meta.is_file() && (!root.executable || is_executable(&target_meta)) {
                 members.push(name);
             }
@@ -287,32 +280,33 @@ pub(super) fn link_directory(
     prefix: &Path,
     subdir: &str,
     mut created: Option<&mut Vec<PathBuf>>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<PathBuf>, StoreError> {
     let mut directory = prefix.to_path_buf();
     for component in subdir.split('/') {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "refusing '{}': a brewrs path may not be a symlink",
-                directory.display()
-            ),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::PathSymlink {
+                    path: directory.to_path_buf(),
+                });
+            }
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => bail!(
-                "refusing '{}': a brewrs path must be a directory",
-                directory.display()
-            ),
+            Ok(_) => {
+                return Err(StoreError::PathNotDirectory {
+                    path: directory.to_path_buf(),
+                });
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let Some(created) = created.as_mut() else {
                     return Ok(None);
                 };
                 fs::create_dir(&directory)
-                    .with_context(|| format!("failed to create '{}'", directory.display()))?;
+                    .map_err(StoreError::io("failed to create", &directory))?;
                 created.push(directory.clone());
                 ensure_directory(&directory, false)?;
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect '{}'", directory.display()));
+                return Err(StoreError::io("failed to inspect", &directory)(error));
             }
         }
     }
@@ -322,7 +316,9 @@ pub(super) fn link_directory(
 /// Every managed link directory that already exists, keyed by prefix-relative
 /// path. Missing directories are absent from the map and are created on demand
 /// by a package that actually provides a member.
-pub(super) fn existing_link_directories(prefix: &Path) -> Result<HashMap<&'static str, PathBuf>> {
+pub(super) fn existing_link_directories(
+    prefix: &Path,
+) -> Result<HashMap<&'static str, PathBuf>, StoreError> {
     let mut directories = HashMap::with_capacity(LINK_DIRECTORIES.len());
     for root in LINK_DIRECTORIES {
         if let Some(directory) = link_directory(prefix, root.subdir, None)? {

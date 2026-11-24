@@ -5,6 +5,7 @@ use super::model::{Kind, Parsed};
 use super::parse::{MACH_HEADER_64_BYTES, MAX_LOAD_COMMANDS, validate_name};
 use super::rewrite_plan::{Change, Plan, scan_markers};
 use super::*;
+use crate::infra::relocate::RelocateError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -146,8 +147,8 @@ fn parse_ok(image: Image) -> Parsed {
 
 fn plan_for(
     parsed: &Parsed,
-    mapper: impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>>,
-) -> Result<Plan> {
+    mapper: impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>, RelocateError>,
+) -> Result<Plan, MachoError> {
     let mut mapper = mapper;
     plan(parsed, &mut mapper)
 }
@@ -179,7 +180,11 @@ impl Drop for TempFile {
     }
 }
 
-fn placeholder_mapper(_kind: PathKind, path: &str, _rpaths: &[&str]) -> Result<Option<String>> {
+fn placeholder_mapper(
+    _kind: PathKind,
+    path: &str,
+    _rpaths: &[&str],
+) -> Result<Option<String>, RelocateError> {
     if path.starts_with("@@HOMEBREW_PREFIX@@/") {
         Ok(Some(path.replacen("@@HOMEBREW_PREFIX@@", PREFIX, 1)))
     } else if path.starts_with("@@HOMEBREW_CELLAR@@/") {
@@ -508,8 +513,9 @@ fn propagates_mapper_errors_with_context() {
             .dylib()
             .command(dylib_command(LC_LOAD_DYLIB, PREFIXED)),
     );
-    let error = plan_for(&parsed, |_, _, _| bail!("policy rejected the path")).unwrap_err();
-    assert!(format!("{error:#}").contains("policy rejected the path"));
+    let error = plan_for(&parsed, |_, _, _| Err(RelocateError::NotPinnedKeg)).unwrap_err();
+    assert!(matches!(error, MachoError::MapPath { .. }));
+    assert!(format!("{:#}", anyhow::Error::new(error)).contains("must name a pinned keg target"));
 }
 
 #[test]
@@ -850,4 +856,23 @@ fn scanner_finds_every_marker_without_overlapping() {
     })
     .unwrap();
     assert_eq!(found, vec![2, 23]);
+}
+
+#[test]
+fn malformed_images_are_typed_errors() {
+    assert!(matches!(parse(&[0xcf, 0xfa]), Err(MachoError::TooSmall)));
+
+    let mut truncated = vec![0_u8; 16];
+    truncated[..4].copy_from_slice(&MH_MAGIC_64_BYTES);
+    assert!(matches!(
+        parse(&truncated),
+        Err(MachoError::TruncatedHeader)
+    ));
+
+    let mut image = Image::new()
+        .dylib()
+        .command(dylib_command(LC_LOAD_DYLIB, SYSTEM_LIB))
+        .bytes();
+    image[..4].copy_from_slice(&MH_MAGIC_32_BYTES);
+    assert!(matches!(parse(&image), Err(MachoError::Bit32)));
 }

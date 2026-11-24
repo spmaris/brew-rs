@@ -16,8 +16,12 @@ pub(in crate::commands) async fn fetch_formula(
     formula: &PlannedFormula,
 ) -> Result<PathBuf> {
     let download = match formula.source {
-        PackageSource::Upstream => portable_fetch::fetch(config, formula).await,
-        PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256).await,
+        PackageSource::Upstream => portable_fetch::fetch(config, formula)
+            .await
+            .map_err(anyhow::Error::from),
+        PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256)
+            .await
+            .map_err(anyhow::Error::from),
     };
     download.with_context(|| format!("Failed to fetch {} {}", formula.name, formula.version))
 }

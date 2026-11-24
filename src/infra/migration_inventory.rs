@@ -34,6 +34,7 @@
 //!   `homebrew-` directory prefix is dropped.
 
 mod cellar;
+mod error;
 mod fs_scan;
 mod limits;
 mod records;
@@ -42,9 +43,8 @@ mod warnings;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-
 use self::cellar::cellar;
+pub(crate) use self::error::InventoryError;
 use self::records::{caskroom, services, taps};
 use self::warnings::Warnings;
 
@@ -89,7 +89,10 @@ pub(crate) struct Service {
 /// symlink because the caller named it explicitly; scanned descendants must be
 /// real directories and files. A missing optional directory (`Cellar`,
 /// `Caskroom`, `Library/Taps`) is normal and produces no warning.
-pub(crate) fn collect(prefix: &Path, service_dirs: &[PathBuf]) -> Result<Inventory> {
+pub(crate) fn collect(
+    prefix: &Path,
+    service_dirs: &[PathBuf],
+) -> Result<Inventory, InventoryError> {
     validate_prefix(prefix)?;
     let mut warnings = Warnings::new();
     let formulae = cellar(prefix, &mut warnings);
@@ -105,29 +108,31 @@ pub(crate) fn collect(prefix: &Path, service_dirs: &[PathBuf]) -> Result<Invento
     })
 }
 
-fn validate_prefix(prefix: &Path) -> Result<()> {
+fn validate_prefix(prefix: &Path) -> Result<(), InventoryError> {
     if !prefix.is_absolute() {
-        bail!(
-            "Homebrew inventory requires an absolute prefix; got {}",
-            prefix.display()
-        );
+        return Err(InventoryError::NotAbsolute {
+            path: prefix.to_path_buf(),
+        });
     }
     if prefix == Path::new("/") {
-        bail!("Homebrew inventory requires a prefix below the filesystem root");
+        return Err(InventoryError::Root);
     }
     if prefix
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        bail!(
-            "Homebrew inventory requires a normalized prefix without `..` components: {}",
-            prefix.display()
-        );
+        return Err(InventoryError::NotNormalized {
+            path: prefix.to_path_buf(),
+        });
     }
-    let metadata = fs::metadata(prefix)
-        .with_context(|| format!("Could not read the Homebrew prefix {}", prefix.display()))?;
+    let metadata = fs::metadata(prefix).map_err(|source| InventoryError::Unreadable {
+        path: prefix.to_path_buf(),
+        source,
+    })?;
     if !metadata.is_dir() {
-        bail!("Homebrew prefix is not a directory: {}", prefix.display());
+        return Err(InventoryError::NotDirectory {
+            path: prefix.to_path_buf(),
+        });
     }
     Ok(())
 }

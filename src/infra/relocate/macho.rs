@@ -33,10 +33,11 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use super::error::RelocateError;
 
 mod apply;
 mod constants;
+mod error;
 mod fat;
 mod model;
 mod parse;
@@ -46,6 +47,7 @@ use apply::{apply, ensure_regular_file};
 use parse::{parse, validate_relocatable};
 use rewrite_plan::{check_marker_plan, plan, validate_targets};
 
+pub(super) use error::MachoError;
 pub(super) use fat::is_macho;
 pub(super) use model::PathKind;
 
@@ -66,8 +68,8 @@ pub(super) use model::PathKind;
 pub(super) fn relocate(
     path: &Path,
     bytes: &[u8],
-    mut map: impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>>,
-) -> Result<()> {
+    mut map: impl FnMut(PathKind, &str, &[&str]) -> Result<Option<String>, RelocateError>,
+) -> Result<(), MachoError> {
     let parsed = parse(bytes)?;
     validate_relocatable(&parsed)?;
     let plan = plan(&parsed, &mut map)?;
@@ -79,29 +81,31 @@ pub(super) fn relocate(
     }
 
     ensure_regular_file(path)?;
-    let current = fs::read(path)
-        .with_context(|| format!("Could not re-read staged image {}", path.display()))?;
+    let current = fs::read(path).map_err(|source| MachoError::ReReadImage {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if current != bytes {
-        bail!(
-            "Staged image {} changed after it was inspected; refusing to rewrite it",
-            path.display()
-        );
+        return Err(MachoError::ImageChanged {
+            path: path.to_path_buf(),
+        });
     }
 
     if !cfg!(target_os = "macos") {
-        bail!("Mach-O relocation requires macOS");
+        return Err(MachoError::MacosRequired);
     }
 
     if let Err(error) = apply(path, &parsed, &plan) {
         return match fs::write(path, bytes) {
-            Ok(()) => Err(error.context(format!(
-                "macOS relocation failed; the original bytes of {} were restored",
-                path.display()
-            ))),
-            Err(restore_error) => Err(error.context(format!(
-                "macOS relocation failed and the original bytes of {} could not be restored: {restore_error:#}",
-                path.display()
-            ))),
+            Ok(()) => Err(MachoError::Restored {
+                path: path.to_path_buf(),
+                source: Box::new(error),
+            }),
+            Err(restore_error) => Err(MachoError::RestoreFailed {
+                path: path.to_path_buf(),
+                restore_error,
+                source: Box::new(error),
+            }),
         };
     }
     Ok(())

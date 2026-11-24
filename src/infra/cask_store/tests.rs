@@ -1,5 +1,6 @@
 use super::*;
 use crate::infra::cask_extract::StagedCaskLink;
+use crate::infra::store::error_chain;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use tempfile::tempdir;
@@ -234,7 +235,7 @@ fn enforces_cask_and_formula_conflicts_and_symlink_checks() {
 
     let c2 = stage_binary_cask(&store, "claude-code@latest", "2.0", &digest_b(), "claude2");
     let err = commit(&store, vec![c2]).unwrap_err();
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
 
     let list = installed(&store).unwrap();
     let mut formula_conflict = list[0].clone();
@@ -256,4 +257,35 @@ fn enforces_cask_and_formula_conflicts_and_symlink_checks() {
     fs::remove_file(prefix.join("bin/claude")).unwrap();
     symlink("../Caskroom/other/1.0/claude", prefix.join("bin/claude")).unwrap();
     assert!(remove(&store, &list).is_err());
+}
+
+#[test]
+fn cask_conflict_is_reported_as_a_typed_variant() {
+    let mut cask = CaskReceipt {
+        token: "alpha".into(),
+        version: "1.0".into(),
+        sha256: digest_a(),
+        auto_updates: false,
+        appdir: None,
+        apps: Vec::new(),
+        caskroom_files: Vec::new(),
+        links: Vec::new(),
+        wrappers: Vec::new(),
+        conflicts_with_casks: vec!["beta".into()],
+        conflicts_with_formulae: Vec::new(),
+    };
+    let mut beta = cask.clone();
+    beta.token = "beta".into();
+    beta.conflicts_with_casks = Vec::new();
+    let error = validate_cask_conflicts(&[cask.clone(), beta], &[]).unwrap_err();
+    assert!(
+        matches!(&error, CaskStoreError::CaskConflict { token, conflict } if token == "alpha" && conflict == "beta"),
+        "{error:?}"
+    );
+    cask.token = "Bad Token".into();
+    let error = validate_cask_receipt(&cask).unwrap_err();
+    assert!(
+        matches!(error, CaskStoreError::InvalidIdentifier { .. }),
+        "{error:?}"
+    );
 }

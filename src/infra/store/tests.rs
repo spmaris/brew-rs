@@ -1,5 +1,9 @@
+use super::error::error_chain;
 use super::paths::{cellar_dir, opt_dir, receipts_dir, sbin_dir};
-use super::receipt::{encode_receipt, is_safe_bin_name, is_safe_package_name, replace_receipt};
+use super::receipt::{
+    encode_receipt, is_safe_bin_name, is_safe_package_name, read_receipt, replace_receipt,
+    validate_receipt,
+};
 use super::*;
 use crate::domain::plan::PackageSource;
 use crate::domain::validate::{is_lower_hex_digest, is_safe_version};
@@ -290,7 +294,7 @@ fn refuses_a_nonempty_unowned_prefix_without_touching_it() {
     fs::write(prefix.join("keep"), b"x").expect("write foreign file");
 
     let error = Store::open(&prefix, true).expect_err("unowned prefix must fail");
-    assert!(format!("{error:#}").contains("not empty"), "{error:#}");
+    assert!(error_chain(&error).contains("not empty"), "{error:#}");
     assert!(prefix.join("keep").exists());
     assert!(!prefix.join(MARKER_FILE).exists());
 }
@@ -304,7 +308,7 @@ fn refuses_known_homebrew_prefixes() {
     let unique = format!("brewrs-store-test-{}", std::process::id());
     let candidate = Path::new("/usr/local").join(unique);
     let error = Store::open(&candidate, true).expect_err("Homebrew descendant must fail");
-    assert!(format!("{error:#}").contains("Homebrew"), "{error:#}");
+    assert!(error_chain(&error).contains("Homebrew"), "{error:#}");
     assert!(!candidate.exists());
 }
 
@@ -414,7 +418,7 @@ fn refuses_to_overwrite_an_existing_bin_path() {
     let error = store
         .commit(vec![prepare(&store, "alpha", "1.0", &[("tool", true)])])
         .expect_err("must not overwrite");
-    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert!(error_chain(&error).contains("already exists"), "{error:#}");
     assert_eq!(fs::read(&occupied).expect("foreign file"), b"keep");
     assert!(store.installed().expect("installed").is_empty());
     assert!(!store.prefix().join(CELLAR).join("alpha").exists());
@@ -430,7 +434,7 @@ fn refuses_duplicate_bin_names_across_one_commit() {
         ])
         .expect_err("cross-package collision must fail");
     assert!(
-        format!("{error:#}").contains("more than one package"),
+        error_chain(&error).contains("more than one package"),
         "{error:#}"
     );
     assert!(store.installed().expect("installed").is_empty());
@@ -451,7 +455,7 @@ fn refuses_duplicate_package_names_in_one_commit() {
             prepare(&store, "hello", "1.0", &[("other", true)]),
         ])
         .expect_err("duplicate package name must fail");
-    assert!(format!("{error:#}").contains("more than once"), "{error:#}");
+    assert!(error_chain(&error).contains("more than once"), "{error:#}");
     assert!(store.installed().expect("installed").is_empty());
 }
 
@@ -466,7 +470,7 @@ fn refuses_to_replace_an_installed_version() {
         .commit(vec![prepare(&store, "hello", "2.0", &[("hello", true)])])
         .expect_err("different version must fail");
     assert!(
-        format!("{error:#}").contains("already installed"),
+        error_chain(&error).contains("already installed"),
         "{error:#}"
     );
 
@@ -502,7 +506,7 @@ fn refuses_the_same_version_and_leaves_idempotence_to_the_caller() {
         .commit(vec![prepare(&store, "hello", "1.0", &[("hello", true)])])
         .expect_err("same version must fail defensively");
     assert!(
-        format!("{error:#}").contains("already installed"),
+        error_chain(&error).contains("already installed"),
         "{error:#}"
     );
     assert_eq!(store.installed().expect("installed").len(), 1);
@@ -549,7 +553,7 @@ fn refuses_a_stage_owned_by_another_directory() {
             stage: foreign,
         }])
         .expect_err("foreign stage must fail");
-    assert!(format!("{error:#}").contains("not owned"), "{error:#}");
+    assert!(error_chain(&error).contains("not owned"), "{error:#}");
     assert!(store.installed().expect("installed").is_empty());
 }
 
@@ -562,7 +566,7 @@ fn lock_blocks_writers_and_explains_stale_locks() {
     let error = store
         .commit(vec![prepare(&store, "hello", "1.0", &[])])
         .expect_err("held lock must fail");
-    let message = format!("{error:#}");
+    let message = error_chain(&error);
     assert!(message.contains("stale"), "{message}");
     assert!(message.contains("remove"), "{message}");
     assert!(lock.exists());
@@ -583,7 +587,7 @@ fn rolls_back_every_owned_path_when_a_later_package_fails() {
     let error = store
         .commit_inner(vec![first, second], Some(1))
         .expect_err("injected failure");
-    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    assert!(error_chain(&error).contains("injected"), "{error:#}");
 
     assert!(store.installed().expect("installed").is_empty());
     assert!(!store.prefix().join(CELLAR).join("alpha").exists());
@@ -672,7 +676,7 @@ fn removal_preflights_every_target_before_moving_anything() {
     let error = read_only(&store)
         .remove(&[alpha, beta])
         .expect_err("a missing keg must fail preflight");
-    assert!(format!("{error:#}").contains("beta"), "{error:#}");
+    assert!(error_chain(&error).contains("beta"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert_eq!(read_only(&store).installed().expect("installed").len(), 2);
 }
@@ -688,7 +692,7 @@ fn removal_rejects_a_stale_plan() {
     let error = read_only(&store)
         .remove(&[stale])
         .expect_err("stale receipt must fail");
-    assert!(format!("{error:#}").contains("re-read"), "{error:#}");
+    assert!(error_chain(&error).contains("re-read"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 }
 
@@ -702,7 +706,7 @@ fn removal_rejects_duplicate_targets() {
     let error = read_only(&store)
         .remove(&[hello.clone(), hello])
         .expect_err("duplicate target must fail");
-    assert!(format!("{error:#}").contains("more than once"), "{error:#}");
+    assert!(error_chain(&error).contains("more than once"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 }
 
@@ -748,7 +752,7 @@ fn removal_honours_the_install_writer_lock() {
     let error = read_only(&store)
         .remove(std::slice::from_ref(&hello))
         .expect_err("a held lock must fail");
-    assert!(format!("{error:#}").contains("stale"), "{error:#}");
+    assert!(error_chain(&error).contains("stale"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 }
 
@@ -806,7 +810,7 @@ fn removal_rolls_back_every_move_when_apply_fails() {
     let error = store
         .remove_inner(std::slice::from_ref(&hello), Some(4))
         .expect_err("injected removal failure");
-    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    assert!(error_chain(&error).contains("injected"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert_eq!(
         read_only(&store).installed().expect("installed"),
@@ -828,7 +832,7 @@ fn removal_rolls_back_a_pruned_package_directory() {
     let error = store
         .remove_inner(&[alpha, beta], Some(6))
         .expect_err("injected removal failure");
-    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    assert!(error_chain(&error).contains("injected"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert_eq!(read_only(&store).installed().expect("installed").len(), 2);
 }
@@ -867,7 +871,7 @@ fn removal_requires_a_marker_and_never_initializes_a_prefix() {
         .remove(std::slice::from_ref(&target))
         .expect_err("absent prefix must fail");
     assert!(
-        format!("{error:#}").contains("not an initialized"),
+        error_chain(&error).contains("not an initialized"),
         "{error:#}"
     );
     assert!(!absent.exists());
@@ -880,7 +884,7 @@ fn removal_requires_a_marker_and_never_initializes_a_prefix() {
         .remove(&[target])
         .expect_err("unowned prefix must fail");
     assert!(
-        format!("{error:#}").contains("not an initialized"),
+        error_chain(&error).contains("not an initialized"),
         "{error:#}"
     );
     assert_eq!(fs::read(unowned.join("keep")).expect("keep"), b"keep");
@@ -900,7 +904,7 @@ fn removal_refuses_a_prefix_inside_homebrew() {
     let error = store
         .remove(&[receipt("hello", "1.0", true)])
         .expect_err("Homebrew prefix must be refused");
-    assert!(format!("{error:#}").contains("Homebrew"), "{error:#}");
+    assert!(error_chain(&error).contains("Homebrew"), "{error:#}");
     assert!(!candidate.exists());
 }
 
@@ -911,7 +915,7 @@ fn open_existing_requires_ownership_and_never_initializes() {
     let absent = temp.path().join("absent");
     let error = Store::open_existing(&absent).expect_err("absent prefix must fail");
     assert!(
-        format!("{error:#}").contains("not an initialized"),
+        error_chain(&error).contains("not an initialized"),
         "{error:#}"
     );
     assert!(!absent.exists());
@@ -921,7 +925,7 @@ fn open_existing_requires_ownership_and_never_initializes() {
     fs::write(unowned.join("keep"), b"keep").expect("foreign file");
     let error = Store::open_existing(&unowned).expect_err("unowned prefix must fail");
     assert!(
-        format!("{error:#}").contains("not an initialized"),
+        error_chain(&error).contains("not an initialized"),
         "{error:#}"
     );
     assert_eq!(fs::read(unowned.join("keep")).expect("keep"), b"keep");
@@ -936,7 +940,7 @@ fn open_existing_requires_ownership_and_never_initializes() {
 
     fs::remove_dir(prefix.join(BIN)).expect("remove managed directory");
     let error = Store::open_existing(&prefix).expect_err("missing directory must fail");
-    assert!(format!("{error:#}").contains("missing"), "{error:#}");
+    assert!(error_chain(&error).contains("missing"), "{error:#}");
     assert!(!prefix.join(BIN).exists());
 }
 
@@ -1024,7 +1028,7 @@ fn upgrade_rejects_a_stale_or_missing_old_receipt() {
             prepare(&store, "hello", "2.0", &[("hello", true)]),
         )])
         .expect_err("stale old receipt must fail");
-    assert!(format!("{error:#}").contains("re-read"), "{error:#}");
+    assert!(error_chain(&error).contains("re-read"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 
     let receipt_path = prefix
@@ -1041,7 +1045,7 @@ fn upgrade_rejects_a_stale_or_missing_old_receipt() {
         )])
         .expect_err("missing old receipt must fail");
     assert!(
-        format!("{error:#}").contains("no longer exists"),
+        error_chain(&error).contains("no longer exists"),
         "{error:#}"
     );
     assert_eq!(tree(&prefix), missing);
@@ -1059,7 +1063,7 @@ fn upgrade_requires_matching_name_requested_status_and_a_new_version() {
     let error = store
         .upgrade(vec![(old.clone(), renamed)])
         .expect_err("name mismatch must fail");
-    assert!(format!("{error:#}").contains("staged package"), "{error:#}");
+    assert!(error_chain(&error).contains("staged package"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 
     let mut unrequested = prepare(&store, "hello", "2.0", &[("hello", true)]);
@@ -1068,7 +1072,7 @@ fn upgrade_requires_matching_name_requested_status_and_a_new_version() {
         .upgrade(vec![(old.clone(), unrequested)])
         .expect_err("requested mismatch must fail");
     assert!(
-        format!("{error:#}").contains("requested status"),
+        error_chain(&error).contains("requested status"),
         "{error:#}"
     );
     assert_eq!(tree(&prefix), before);
@@ -1080,7 +1084,7 @@ fn upgrade_requires_matching_name_requested_status_and_a_new_version() {
         )])
         .expect_err("same version must fail");
     assert!(
-        format!("{error:#}").contains("already installed"),
+        error_chain(&error).contains("already installed"),
         "{error:#}"
     );
     assert_eq!(tree(&prefix), before);
@@ -1102,7 +1106,7 @@ fn upgrade_rejects_foreign_alternate_version_and_batch_collisions() {
             prepare(&store, "alpha", "2.0", &[("tool", true)]),
         )])
         .expect_err("foreign bin collision must fail");
-    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert!(error_chain(&error).contains("already exists"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert_eq!(fs::read(&foreign).expect("foreign"), b"keep");
 
@@ -1119,7 +1123,7 @@ fn upgrade_rejects_foreign_alternate_version_and_batch_collisions() {
         ])
         .expect_err("batch bin collision must fail");
     assert!(
-        format!("{error:#}").contains("more than one package"),
+        error_chain(&error).contains("more than one package"),
         "{error:#}"
     );
     assert_eq!(tree(&prefix), before);
@@ -1136,7 +1140,7 @@ fn upgrade_rejects_foreign_alternate_version_and_batch_collisions() {
             ),
         ])
         .expect_err("duplicate package name must fail");
-    assert!(format!("{error:#}").contains("more than once"), "{error:#}");
+    assert!(error_chain(&error).contains("more than once"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 
     let alternate = prefix.join(CELLAR).join("alpha").join("0.9");
@@ -1149,7 +1153,7 @@ fn upgrade_rejects_foreign_alternate_version_and_batch_collisions() {
         )])
         .expect_err("alternate version must fail");
     assert!(
-        format!("{error:#}").contains("not the installed version"),
+        error_chain(&error).contains("not the installed version"),
         "{error:#}"
     );
     assert_eq!(tree(&prefix), damaged);
@@ -1183,7 +1187,7 @@ fn upgrade_rolls_back_new_paths_and_restores_the_old_package() {
             Some(1),
         )
         .expect_err("injected upgrade failure");
-    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    assert!(error_chain(&error).contains("injected"), "{error:#}");
 
     assert_eq!(tree(&prefix), before);
     assert_eq!(
@@ -1286,7 +1290,7 @@ fn commit_installs_a_dependency_graph_transactionally() {
     let error = store
         .commit(vec![missing_version])
         .expect_err("a missing dependency version must fail");
-    let message = format!("{error:#}");
+    let message = error_chain(&error);
     assert!(message.contains("'tool'"), "{message}");
     assert!(message.contains("libfoo 2.0"), "{message}");
     assert_eq!(tree(&prefix), before);
@@ -1301,7 +1305,7 @@ fn commit_installs_a_dependency_graph_transactionally() {
     let error = store
         .commit(vec![wrong_digest])
         .expect_err("a mismatched dependency digest must fail");
-    let message = format!("{error:#}");
+    let message = error_chain(&error);
     assert!(message.contains("'other'"), "{message}");
     assert!(message.contains("libfoo 1.0"), "{message}");
     assert_eq!(tree(&prefix), before);
@@ -1317,7 +1321,7 @@ fn commit_installs_a_dependency_graph_transactionally() {
     let error = store
         .commit(vec![good, bad])
         .expect_err("a dangling edge must fail the batch");
-    assert!(format!("{error:#}").contains("'bad'"), "{error:#}");
+    assert!(error_chain(&error).contains("'bad'"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert_eq!(store.installed().expect("installed").len(), 2);
     assert!(!prefix.join(CELLAR).join("good").exists());
@@ -1422,7 +1426,7 @@ fn commit_with_promotions_without_expected_delegates_to_commit() {
         .commit_with_promotions(vec![prepare(&store, "hello", "1.0", &[])], &[])
         .expect_err("the delegated commit still rejects an installed package");
     assert!(
-        format!("{error:#}").contains("already installed"),
+        error_chain(&error).contains("already installed"),
         "{error:#}"
     );
     assert_eq!(store.installed().expect("installed").len(), 1);
@@ -1456,7 +1460,7 @@ fn promotion_refuses_stale_missing_or_changed_receipts() {
         let error = store
             .commit_with_promotions(vec![app], std::slice::from_ref(&libfoo))
             .expect_err("a changed receipt must be refused");
-        let message = format!("{error:#}");
+        let message = error_chain(&error);
         assert!(message.contains("re-read"), "{message}");
         assert_eq!(tree(store.prefix()), before);
         assert_eq!(fs::read(&path).expect("changed receipt"), bytes);
@@ -1476,7 +1480,7 @@ fn promotion_refuses_stale_missing_or_changed_receipts() {
         .commit_with_promotions(vec![app], std::slice::from_ref(&libfoo))
         .expect_err("a missing receipt must be refused");
     assert!(
-        format!("{error:#}").contains("could not be re-read"),
+        error_chain(&error).contains("could not be re-read"),
         "{error:#}"
     );
     assert_eq!(tree(store.prefix()), before);
@@ -1499,7 +1503,7 @@ fn promotion_requires_an_owned_real_keg() {
     let error = store
         .commit_with_promotions(vec![app], std::slice::from_ref(&libfoo))
         .expect_err("a missing keg must be refused");
-    assert!(format!("{error:#}").contains("keg"), "{error:#}");
+    assert!(error_chain(&error).contains("keg"), "{error:#}");
     assert_eq!(fs::read(&receipt_path).expect("receipt"), original_bytes);
     assert!(
         store
@@ -1514,7 +1518,7 @@ fn promotion_requires_an_owned_real_keg() {
     let error = store
         .commit_with_promotions(vec![app], std::slice::from_ref(&libfoo))
         .expect_err("a symlinked keg must be refused");
-    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(error_chain(&error).contains("symlink"), "{error:#}");
     assert_eq!(fs::read(&receipt_path).expect("receipt"), original_bytes);
     assert!(!store.prefix().join(CELLAR).join("app").exists());
 }
@@ -1529,7 +1533,7 @@ fn promotion_rejects_duplicates_overlap_and_already_requested_receipts() {
     let error = store
         .commit_with_promotions(Vec::new(), &[alpha.clone(), alpha.clone()])
         .expect_err("a duplicate promotion must be refused");
-    assert!(format!("{error:#}").contains("more than once"), "{error:#}");
+    assert!(error_chain(&error).contains("more than once"), "{error:#}");
     assert_eq!(tree(store.prefix()), before);
 
     let overlapping = prepare(&store, "alpha", "2.0", &[("alpha-next", true)]);
@@ -1537,7 +1541,7 @@ fn promotion_rejects_duplicates_overlap_and_already_requested_receipts() {
         .commit_with_promotions(vec![overlapping], std::slice::from_ref(&alpha))
         .expect_err("an install/promotion overlap must be refused");
     assert!(
-        format!("{error:#}").contains("install and promote"),
+        error_chain(&error).contains("install and promote"),
         "{error:#}"
     );
     assert_eq!(tree(store.prefix()), before);
@@ -1546,7 +1550,7 @@ fn promotion_rejects_duplicates_overlap_and_already_requested_receipts() {
         .commit_with_promotions(Vec::new(), std::slice::from_ref(&requested))
         .expect_err("an already requested receipt must be refused");
     assert!(
-        format!("{error:#}").contains("already requested"),
+        error_chain(&error).contains("already requested"),
         "{error:#}"
     );
     assert_eq!(tree(store.prefix()), before);
@@ -1569,7 +1573,7 @@ fn promotion_rolls_back_new_paths_and_restores_promoted_receipt_bytes() {
         .expect_err("injected promotion failure");
 
     assert!(
-        format!("{error:#}").contains("injected promotion failure"),
+        error_chain(&error).contains("injected promotion failure"),
         "{error:#}"
     );
     assert_eq!(
@@ -1604,7 +1608,7 @@ fn promotion_keeps_receipts_when_a_new_install_fails() {
         .expect_err("injected install failure");
 
     assert!(
-        format!("{error:#}").contains("injected commit failure"),
+        error_chain(&error).contains("injected commit failure"),
         "{error:#}"
     );
     assert_eq!(tree(store.prefix()), before);
@@ -1639,7 +1643,7 @@ fn promotion_validates_the_projected_graph_before_writing() {
         .expect_err("a mismatched projected pin must fail");
 
     assert!(
-        format!("{error:#}").contains("does not contain"),
+        error_chain(&error).contains("does not contain"),
         "{error:#}"
     );
     assert_eq!(tree(store.prefix()), before);
@@ -1664,7 +1668,7 @@ fn removal_blocks_unselected_dependents_and_allows_a_batch() {
     let error = read_only(&store)
         .remove(std::slice::from_ref(&libfoo))
         .expect_err("an installed dependent must block removal");
-    let message = format!("{error:#}");
+    let message = error_chain(&error);
     assert!(message.contains("'app'"), "{message}");
     assert!(message.contains("libfoo 1.0"), "{message}");
     assert_eq!(tree(&prefix), before);
@@ -1745,7 +1749,7 @@ fn upgrade_retains_a_pinned_old_keg_and_allows_coherent_batches() {
     let error = store
         .upgrade(vec![(app.clone(), absent)])
         .expect_err("an unresolvable new dependency must fail");
-    assert!(format!("{error:#}").contains("'app'"), "{error:#}");
+    assert!(error_chain(&error).contains("'app'"), "{error:#}");
     assert_eq!(store.installed().expect("installed").len(), 2);
 
     // Upgrading both sides in one call keeps the graph coherent.
@@ -1787,25 +1791,25 @@ fn dependency_validation_rejects_bad_pins_and_duplicate_graphs() {
 
     let error = validate_dependencies(std::slice::from_ref(&pinned))
         .expect_err("a missing dependency must fail");
-    let message = format!("{error:#}");
+    let message = error_chain(&error);
     assert!(message.contains("'alpha'"), "{message}");
     assert!(message.contains("'beta 1.0'"), "{message}");
 
     let mut itself = alpha.clone();
     itself.dependencies = vec![dependency(&alpha)];
     let error = validate_dependencies(&[itself]).expect_err("a self dependency must fail");
-    assert!(format!("{error:#}").contains("itself"), "{error:#}");
+    assert!(error_chain(&error).contains("itself"), "{error:#}");
 
     let mut twice = alpha.clone();
     twice.dependencies = vec![dependency(&beta), dependency(&beta)];
     let error =
         validate_dependencies(&[twice, beta.clone()]).expect_err("a repeated dependency must fail");
-    assert!(format!("{error:#}").contains("more than once"), "{error:#}");
+    assert!(error_chain(&error).contains("more than once"), "{error:#}");
 
     let error = validate_dependencies(&[alpha.clone(), alpha.clone()])
         .expect_err("a duplicate package must fail");
     assert!(
-        format!("{error:#}").contains("projected receipt graph"),
+        error_chain(&error).contains("projected receipt graph"),
         "{error:#}"
     );
 
@@ -1923,7 +1927,7 @@ fn links_keg_contained_executable_bin_symlinks_and_rejects_escaping_ones() {
             stage: bad_stage,
         };
         let error = store.commit(vec![bad]).expect_err(label);
-        let message = format!("{error:#}");
+        let message = error_chain(&error);
         assert!(
             message.contains("absolute symlink")
                 || message.contains("escapes the staged keg")
@@ -1963,7 +1967,7 @@ fn keg_only_package_creates_opt_link_without_bin_links_and_cleans_up() {
         .upgrade(vec![(first_receipt.clone(), second)])
         .expect_err("foreign opt link must refuse upgrade");
     assert!(
-        format!("{foreign_err:#}").contains("not a link owned by"),
+        error_chain(&foreign_err).contains("not a link owned by"),
         "{foreign_err:#}"
     );
     fs::remove_file(&opt_link).unwrap();
@@ -2000,10 +2004,10 @@ fn validate_conflicts_rejects_symmetric_and_same_batch_conflicts() {
     alpha.conflicts_with = vec!["beta".into()];
     let beta = receipt("beta", "1.0", true);
     let err = validate_conflicts(&[alpha.clone(), beta.clone()]).expect_err("conflict");
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
     // Symmetric: conflict declared on second item still rejects.
     let err = validate_conflicts(&[beta, alpha]).expect_err("reverse conflict");
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
 
     let mut first = prepare(&store, "first", "1.0", &[("first", true)]);
     first.receipt.conflicts_with = vec!["second".into()];
@@ -2011,7 +2015,7 @@ fn validate_conflicts_rejects_symmetric_and_same_batch_conflicts() {
     let err = store
         .commit(vec![first, second])
         .expect_err("same-batch conflict must fail commit");
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
     assert!(store.installed().expect("installed").is_empty());
 
     let base = install(&store, "base", "1.0", &[("base", true)]);
@@ -2020,7 +2024,7 @@ fn validate_conflicts_rejects_symmetric_and_same_batch_conflicts() {
     let err = store
         .commit(vec![challenger])
         .expect_err("conflict with installed package must fail commit");
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
 
     // Upgrading an existing package to a version that conflicts with another installed package fails.
     let other = install(&store, "other", "1.0", &[("other", true)]);
@@ -2029,7 +2033,7 @@ fn validate_conflicts_rejects_symmetric_and_same_batch_conflicts() {
     let err = store
         .upgrade(vec![(base, base_v2)])
         .expect_err("upgrade introducing conflict must fail");
-    assert!(format!("{err:#}").contains("conflicts with"), "{err:#}");
+    assert!(error_chain(&err).contains("conflicts with"), "{err:#}");
     assert_eq!(store.installed().expect("installed").len(), 2);
     let _ = other;
 }
@@ -2391,7 +2395,7 @@ fn refuses_managed_link_collisions_before_writing() {
     let v = prepare(&store, "tool", "1.0", &[("tool", true)]);
     stage_file(&v, "etc/bash_completion.d/tool", b"own", 0o644);
     let error = store.commit(vec![v]).expect_err("foreign completion");
-    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert!(error_chain(&error).contains("already exists"), "{error:#}");
     assert_eq!(tree(&prefix), before);
     assert!(store.installed().expect("installed").is_empty());
 
@@ -2411,7 +2415,7 @@ fn refuses_managed_link_collisions_before_writing() {
         0o755,
     );
     let error = store.commit(vec![docker]).expect_err("foreign plugin");
-    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert!(error_chain(&error).contains("already exists"), "{error:#}");
     assert_eq!(tree(&prefix), before);
 
     // A foreign zsh function blocks an upgrade and leaves the old version
@@ -2427,7 +2431,7 @@ fn refuses_managed_link_collisions_before_writing() {
     let error = store
         .upgrade(vec![(docs_receipt, v2)])
         .expect_err("foreign zsh function");
-    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert!(error_chain(&error).contains("already exists"), "{error:#}");
     let installed = store.installed().expect("installed");
     assert_eq!(installed.len(), 1);
     assert_eq!(installed[0].version, "1.0");
@@ -2474,7 +2478,7 @@ fn refuses_symlinked_managed_link_ancestors() {
     let docs = prepare(&store, "tool", "1.0", &[("tool", true)]);
     stage_file(&docs, "share/man/man1/tool.1", b"man", 0o644);
     let error = store.commit(vec![docs]).expect_err("symlinked share");
-    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(error_chain(&error).contains("symlink"), "{error:#}");
     assert!(store.installed().expect("installed").is_empty());
     assert!(!outside.join("man").exists());
     fs::remove_file(prefix.join("share")).unwrap();
@@ -2489,7 +2493,7 @@ fn refuses_symlinked_managed_link_ancestors() {
         0o755,
     );
     let error = store.commit(vec![docker]).expect_err("symlinked lib");
-    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(error_chain(&error).contains("symlink"), "{error:#}");
     assert!(!outside.join("docker").exists());
     fs::remove_file(prefix.join("lib")).unwrap();
 
@@ -2499,7 +2503,7 @@ fn refuses_symlinked_managed_link_ancestors() {
     let error = read_only(&store)
         .remove(std::slice::from_ref(&installed))
         .expect_err("removal through symlink");
-    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(error_chain(&error).contains("symlink"), "{error:#}");
     assert_eq!(store.installed().expect("installed").len(), 1);
     assert_eq!(
         fs::read_link(prefix.join(BIN).join("tool")).unwrap(),
@@ -2509,4 +2513,60 @@ fn refuses_symlinked_managed_link_ancestors() {
     read_only(&store)
         .remove(std::slice::from_ref(&installed))
         .expect("remove after unlink");
+}
+
+#[test]
+fn held_lock_is_reported_as_lock_held() {
+    let (_temp, store) = new_store();
+    let _held = InstallLock::acquire(store.prefix()).expect("first lock");
+    let error = InstallLock::acquire(store.prefix())
+        .err()
+        .expect("second lock must fail");
+    match error {
+        StoreError::LockHeld { path, owner } => {
+            assert!(path.ends_with(".brewrs/state/install.lock"), "{path:?}");
+            assert!(owner.contains("pid="), "{owner}");
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+}
+
+#[test]
+fn unsafe_receipt_name_is_reported_as_invalid_package_name() {
+    let error = validate_receipt(&receipt("../evil", "1.0", true)).expect_err("unsafe name");
+    assert!(
+        matches!(&error, StoreError::InvalidPackageName { name } if name == "../evil"),
+        "{error:?}"
+    );
+    assert_eq!(error.to_string(), "refusing invalid package name '../evil'");
+    let error = validate_receipt(&receipt("hello", "../1", true)).expect_err("unsafe version");
+    assert!(
+        matches!(&error, StoreError::InvalidVersion { name, version } if name == "hello" && version == "../1"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn read_only_binding_is_reported_as_read_only() {
+    let (_temp, store) = new_store();
+    let error = read_only(&store).ensure_owned().expect_err("read-only");
+    assert!(matches!(error, StoreError::ReadOnly { .. }), "{error:?}");
+}
+
+#[test]
+fn io_failures_carry_the_action_and_path_as_a_source_chain() {
+    let (temp, _store) = new_store();
+    let missing = temp.path().join("prefix/.brewrs/state/receipts/none.json");
+    let error = read_receipt(&missing).expect_err("missing receipt");
+    assert!(
+        matches!(&error, StoreError::Io { action: "failed to inspect", path, .. } if *path == missing),
+        "{error:?}"
+    );
+    assert_eq!(
+        error_chain(&error),
+        format!(
+            "failed to inspect '{}': No such file or directory (os error 2)",
+            missing.display()
+        )
+    );
 }

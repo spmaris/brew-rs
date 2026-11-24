@@ -222,7 +222,7 @@ pub(super) fn apply_removal(
         Ok(()) => step.done(&format!("Unlinked {count} {noun}")),
         Err(error) => {
             step.fail();
-            return Err(error);
+            return Err(error.into());
         }
     }
     let requested_names: Vec<String> = pending

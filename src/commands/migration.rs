@@ -97,7 +97,7 @@ fn ensure_separated(source: &Path, destination: &Path) -> Result<()> {
     if from.starts_with(&to) || to.starts_with(&from) {
         bail!("The Homebrew source and brewrs destination prefixes must not overlap");
     }
-    store::reject_protected_prefix(destination)
+    Ok(store::reject_protected_prefix(destination)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

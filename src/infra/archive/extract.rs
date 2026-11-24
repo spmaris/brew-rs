@@ -5,9 +5,9 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use tar::EntryType;
 
+use super::error::ArchiveError;
 use super::limits::{
     MAX_DECOMPRESSED_BYTES, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, MAX_LINK_TARGET_BYTES,
     MAX_SYMLINKS,
@@ -42,30 +42,34 @@ pub(super) fn extract<R: Read>(
     out: &Path,
     name: &str,
     version: Option<&str>,
-) -> Result<Vec<PendingSymlink>> {
+) -> Result<Vec<PendingSymlink>, ArchiveError> {
     let mut seen: HashMap<PathBuf, Seen> = HashMap::new();
     let mut directories: HashSet<PathBuf> = HashSet::new();
     let mut raw_symlinks: Vec<RawSymlink> = Vec::new();
     let mut count = 0_usize;
     let mut declared_total = 0_u64;
 
-    let entries = tar
-        .entries()
-        .context("failed to read the bottle archive as tar")?;
+    let entries = tar.entries().map_err(|source| ArchiveError::Stream {
+        action: "read the bottle archive as tar",
+        source,
+    })?;
     for entry in entries {
-        let mut entry = entry.context("failed to read a bottle archive entry")?;
+        let mut entry = entry.map_err(|source| ArchiveError::Stream {
+            action: "read a bottle archive entry",
+            source,
+        })?;
         count = count
             .checked_add(1)
-            .context("bottle archive entry count overflowed")?;
+            .ok_or(ArchiveError::EntryCountOverflow)?;
         if count > MAX_ENTRIES {
-            bail!("bottle archive has more than {MAX_ENTRIES} entries");
+            return Err(ArchiveError::TooManyEntries { limit: MAX_ENTRIES });
         }
 
         let seen_kind = match entry.header().entry_type() {
             EntryType::Regular => Seen::File,
             EntryType::Directory => Seen::Dir,
             EntryType::Symlink => Seen::Symlink,
-            other => bail!("unsupported bottle archive entry type {other:?}"),
+            entry_type => return Err(ArchiveError::UnsupportedEntryType { entry_type }),
         };
         let is_dir = seen_kind == Seen::Dir;
 
@@ -74,10 +78,10 @@ pub(super) fn extract<R: Read>(
             continue;
         };
         if relative.components().count() > MAX_DEPTH {
-            bail!(
-                "bottle archive entry '{}' exceeds the depth limit of {MAX_DEPTH}",
-                relative.display()
-            );
+            return Err(ArchiveError::EntryTooDeep {
+                path: relative,
+                limit: MAX_DEPTH,
+            });
         }
 
         // Vendor Ruby metadata lives in `<name>/<version>/.brew`. It is never
@@ -88,41 +92,31 @@ pub(super) fn extract<R: Read>(
 
         note_directories(&relative, &mut directories);
         if seen.insert(relative.clone(), seen_kind).is_some() {
-            bail!(
-                "bottle archive contains duplicate path '{}'",
-                relative.display()
-            );
+            return Err(ArchiveError::DuplicatePath { path: relative });
         }
 
         check_ancestors(&relative, &seen)?;
 
         if seen_kind == Seen::Symlink {
             if directories.contains(&relative) {
-                bail!(
-                    "bottle archive symlink '{}' is used as an ancestor directory",
-                    relative.display()
-                );
+                return Err(ArchiveError::SymlinkAncestor { path: relative });
             }
             if entry.size() != 0 {
-                bail!(
-                    "bottle archive symlink '{}' declares a nonzero size",
-                    relative.display()
-                );
+                return Err(ArchiveError::SymlinkNonzeroSize { path: relative });
             }
             let Some(target_bytes) = entry.link_name_bytes() else {
-                bail!(
-                    "bottle archive symlink '{}' has no target",
-                    relative.display()
-                );
+                return Err(ArchiveError::SymlinkNoTarget { path: relative });
             };
             if target_bytes.len() > MAX_LINK_TARGET_BYTES {
-                bail!(
-                    "bottle archive symlink '{}' has a target longer than {MAX_LINK_TARGET_BYTES} bytes",
-                    relative.display()
-                );
+                return Err(ArchiveError::SymlinkTargetTooLong {
+                    path: relative,
+                    limit: MAX_LINK_TARGET_BYTES,
+                });
             }
             if raw_symlinks.len() >= MAX_SYMLINKS {
-                bail!("bottle archive has more than {MAX_SYMLINKS} symlinks");
+                return Err(ArchiveError::TooManySymlinks {
+                    limit: MAX_SYMLINKS,
+                });
             }
             raw_symlinks.push(RawSymlink {
                 path: relative,
@@ -140,16 +134,18 @@ pub(super) fn extract<R: Read>(
 
         let size = entry.size();
         if size > MAX_FILE_BYTES {
-            bail!(
-                "bottle archive entry '{}' exceeds the {MAX_FILE_BYTES} byte limit",
-                relative.display()
-            );
+            return Err(ArchiveError::EntryTooLarge {
+                path: relative,
+                limit: MAX_FILE_BYTES,
+            });
         }
         declared_total = declared_total
             .checked_add(size)
-            .context("bottle archive expanded size overflowed")?;
+            .ok_or(ArchiveError::ExpandedSizeOverflow)?;
         if declared_total > MAX_DECOMPRESSED_BYTES {
-            bail!("bottle archive expands beyond the {MAX_DECOMPRESSED_BYTES} byte limit");
+            return Err(ArchiveError::ExpandedTooLarge {
+                limit: MAX_DECOMPRESSED_BYTES,
+            });
         }
 
         if let Some(parent) = relative.parent() {
@@ -163,25 +159,39 @@ pub(super) fn extract<R: Read>(
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&destination).with_context(|| {
-            format!("failed to create extracted file {}", destination.display())
+        let mut file = options
+            .open(&destination)
+            .map_err(|source| ArchiveError::Io {
+                action: "create extracted file",
+                path: destination.clone(),
+                source,
+            })?;
+        let copied = io::copy(&mut entry, &mut file).map_err(|source| ArchiveError::Io {
+            action: "extract file",
+            path: destination.clone(),
+            source,
         })?;
-        let copied = io::copy(&mut entry, &mut file)
-            .with_context(|| format!("failed to extract file {}", destination.display()))?;
         if copied != size {
-            bail!(
-                "bottle archive entry '{}' was truncated: expected {size} bytes, got {copied}",
-                relative.display()
-            );
+            return Err(ArchiveError::EntryTruncated {
+                path: relative,
+                expected: size,
+                actual: copied,
+            });
         }
-        file.flush()
-            .with_context(|| format!("failed to flush extracted file {}", destination.display()))?;
+        file.flush().map_err(|source| ArchiveError::Io {
+            action: "flush extracted file",
+            path: destination.clone(),
+            source,
+        })?;
         drop(file);
 
         let mode = entry
             .header()
             .mode()
-            .with_context(|| format!("failed to read the mode of '{}'", relative.display()))?;
+            .map_err(|source| ArchiveError::ModeRead {
+                path: relative.clone(),
+                source,
+            })?;
         set_mode(&destination, 0o644 | (mode & 0o111))?;
     }
 
@@ -189,10 +199,7 @@ pub(super) fn extract<R: Read>(
     let mut raw_targets = HashMap::with_capacity(raw_symlinks.len());
     for raw in raw_symlinks {
         if directories.contains(&raw.path) {
-            bail!(
-                "bottle archive symlink '{}' is used as an ancestor directory",
-                raw.path.display()
-            );
+            return Err(ArchiveError::SymlinkAncestor { path: raw.path });
         }
         let immediate = parse_symlink_target(&raw.path, &raw.target_bytes)?;
         raw_targets.insert(raw.path.clone(), immediate.clone());

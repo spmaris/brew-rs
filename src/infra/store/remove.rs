@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
+use super::error::{Action, DirFault};
 
 use super::links::{
     LINK_DIRECTORIES, collect_owned_links, existing_link_directories, opt_link_target,
@@ -42,7 +43,7 @@ impl Store {
     /// created for that package and version, including a link left dangling by
     /// a deleted keg member or stale by a non-executable one. Foreign files,
     /// directories, and links are preserved and never followed.
-    pub(crate) fn remove(&self, expected: &[Receipt]) -> Result<()> {
+    pub(crate) fn remove(&self, expected: &[Receipt]) -> Result<(), StoreError> {
         self.remove_inner(expected, None)
     }
 
@@ -51,7 +52,7 @@ impl Store {
         &self,
         expected: &[Receipt],
         fail_after: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         self.verify_owned()?;
         if expected.is_empty() {
             return Ok(());
@@ -66,7 +67,7 @@ impl Store {
     }
 
     /// Check every selected receipt, keg, and CLI link before moving anything.
-    fn plan_removal(&self, expected: &[Receipt]) -> Result<Vec<Removal>> {
+    fn plan_removal(&self, expected: &[Receipt]) -> Result<Vec<Removal>, StoreError> {
         let receipts = receipts_dir(&self.prefix);
         let cellar = cellar_dir(&self.prefix);
         let opt = opt_dir(&self.prefix);
@@ -79,80 +80,97 @@ impl Store {
         for receipt in expected {
             validate_receipt(receipt)?;
             if !names.insert(receipt.name.clone()) {
-                bail!(
-                    "package '{}' appears more than once in one removal",
-                    receipt.name
-                );
+                return Err(StoreError::DuplicatePackage {
+                    action: Action::Remove,
+                    name: receipt.name.to_string(),
+                });
             }
 
             let receipt_path = receipts.join(format!("{}.json", receipt.name));
-            let current = existing_receipt(&receipt_path)?.with_context(|| {
-                format!(
-                    "refusing to remove '{} {}': its receipt '{}' no longer exists",
-                    receipt.name,
-                    receipt.version,
-                    receipt_path.display()
-                )
-            })?;
+            let current =
+                existing_receipt(&receipt_path)?.ok_or_else(|| StoreError::ReceiptGone {
+                    action: Action::Remove,
+                    name: receipt.name.clone(),
+                    version: receipt.version.clone(),
+                    path: receipt_path.clone(),
+                })?;
             if current != *receipt {
-                bail!(
-                    "refusing to remove '{} {}': the installed receipt now records {} {}; re-read the installed packages and try again",
-                    receipt.name,
-                    receipt.version,
-                    current.name,
-                    current.version
-                );
+                return Err(StoreError::ReceiptChanged {
+                    action: Action::Remove,
+                    name: receipt.name.to_string(),
+                    version: receipt.version.to_string(),
+                    current_name: current.name.to_string(),
+                    current_version: current.version.to_string(),
+                });
             }
 
             let package = cellar.join(&receipt.name);
             match fs::symlink_metadata(&package) {
-                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                    "refusing to remove '{}': '{}' is a symlink",
-                    receipt.name,
-                    package.display()
-                ),
-                Ok(metadata) if !metadata.is_dir() => bail!(
-                    "refusing to remove '{}': '{}' is not a directory",
-                    receipt.name,
-                    package.display()
-                ),
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::Symlink,
+                    });
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::NotDirectory,
+                    });
+                }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                    "refusing to remove '{} {}': '{}' is missing; remove it manually",
-                    receipt.name,
-                    receipt.version,
-                    package.display()
-                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(StoreError::PackageDirectory {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: package.to_path_buf(),
+                        fault: DirFault::Missing,
+                    });
+                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", package.display()));
+                    return Err(StoreError::io("failed to inspect", &package)(error));
                 }
             }
 
             let keg = package.join(&receipt.version);
             match fs::symlink_metadata(&keg) {
-                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                    "refusing to remove '{} {}': '{}' is a symlink",
-                    receipt.name,
-                    receipt.version,
-                    keg.display()
-                ),
-                Ok(metadata) if !metadata.is_dir() => bail!(
-                    "refusing to remove '{} {}': '{}' is not a directory",
-                    receipt.name,
-                    receipt.version,
-                    keg.display()
-                ),
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(StoreError::Keg {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::Symlink,
+                    });
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(StoreError::Keg {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::NotDirectory,
+                    });
+                }
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                    "refusing to remove '{} {}': its keg '{}' is missing; remove it manually",
-                    receipt.name,
-                    receipt.version,
-                    keg.display()
-                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(StoreError::Keg {
+                        action: Action::Remove,
+                        name: receipt.name.to_string(),
+                        version: receipt.version.to_string(),
+                        path: keg.to_path_buf(),
+                        fault: DirFault::Missing,
+                    });
+                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to inspect '{}'", keg.display()));
+                    return Err(StoreError::io("failed to inspect", &keg)(error));
                 }
             }
 
@@ -174,11 +192,10 @@ impl Store {
             }
             for link in &links {
                 if !links_seen.insert(link.path.clone()) {
-                    bail!(
-                        "refusing to remove '{}': more than one selected package claims the link '{}'",
-                        receipt.name,
-                        link.path.display()
-                    );
+                    return Err(StoreError::LinkClaimedTwice {
+                        name: receipt.name.to_string(),
+                        path: link.path.to_path_buf(),
+                    });
                 }
             }
             if has_opt {
@@ -186,16 +203,14 @@ impl Store {
                 let opt_target = opt_link_target(&receipt.name, &receipt.version);
                 match fs::symlink_metadata(&opt_path) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        let actual = fs::read_link(&opt_path).with_context(|| {
-                            format!("failed to read link '{}'", opt_path.display())
-                        })?;
+                        let actual = fs::read_link(&opt_path)
+                            .map_err(StoreError::io("failed to read link", &opt_path))?;
                         if actual.as_os_str() == opt_target.as_os_str() {
                             if !links_seen.insert(opt_path.clone()) {
-                                bail!(
-                                    "refusing to remove '{}': more than one selected package claims the link '{}'",
-                                    receipt.name,
-                                    opt_path.display()
-                                );
+                                return Err(StoreError::LinkClaimedTwice {
+                                    name: receipt.name.to_string(),
+                                    path: opt_path.to_path_buf(),
+                                });
                             }
                             links.push(OwnedLink {
                                 path: opt_path,
@@ -206,9 +221,7 @@ impl Store {
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("failed to inspect '{}'", opt_path.display())
-                        });
+                        return Err(StoreError::io("failed to inspect", &opt_path)(error));
                     }
                 }
             }
@@ -247,17 +260,19 @@ impl Store {
     }
 
     /// Move preflighted paths into a private quarantine, rolling back on error.
-    fn apply_removal(&self, removals: Vec<Removal>, fail_after: Option<usize>) -> Result<()> {
+    fn apply_removal(
+        &self,
+        removals: Vec<Removal>,
+        fail_after: Option<usize>,
+    ) -> Result<(), StoreError> {
         let stages = stages_dir(&self.prefix);
         let quarantine = tempfile::Builder::new()
             .prefix("remove-")
             .tempdir_in(&stages)
-            .with_context(|| {
-                format!(
-                    "failed to create a removal quarantine below '{}'",
-                    stages.display()
-                )
-            })?;
+            .map_err(StoreError::io(
+                "failed to create a removal quarantine below",
+                &stages,
+            ))?;
 
         let mut steps = Vec::new();
         for removal in removals {
@@ -288,10 +303,14 @@ impl Store {
         }
 
         let mut applied = Vec::new();
-        let outcome = (|| -> Result<()> {
+        let outcome = (|| -> Result<(), StoreError> {
             for (index, step) in steps.iter().enumerate() {
                 if fail_after == Some(index) {
-                    bail!("injected removal failure before move {index}");
+                    return Err(StoreError::InjectedFailure {
+                        what: "removal",
+                        unit: "move",
+                        index,
+                    });
                 }
                 if matches!(&step.kind, StepKind::Prune) {
                     prune_package_dir(step, &mut applied)?;
@@ -331,11 +350,11 @@ impl Store {
                     // Keep the quarantine: dropping it would delete paths that
                     // are still needed for a manual rollback.
                     let kept = quarantine.keep();
-                    Err(error.context(format!(
-                        "rollback was incomplete: {}; the quarantined paths were kept in '{}'",
-                        issues.join("; "),
-                        kept.display()
-                    )))
+                    Err(StoreError::RemovalRollbackIncomplete {
+                        issues,
+                        kept,
+                        source: Box::new(error),
+                    })
                 }
             }
         }

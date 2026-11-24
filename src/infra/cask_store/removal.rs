@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context, Result, bail};
+use super::CaskStoreError;
 
 use super::support::{
     is_cross_device, read_cask_receipt, safe_prefix_join_existing_no_symlinks,
@@ -19,7 +19,7 @@ use crate::infra::store::{COUNTER, Store, monotonic_nonce};
 pub(super) fn plan_cask_removals(
     store: &Store,
     expected: &[CaskReceipt],
-) -> Result<Vec<CaskRemovalPlan>> {
+) -> Result<Vec<CaskRemovalPlan>, CaskStoreError> {
     let prefix = store.prefix();
     let state_dir_path = casks_state_dir(prefix);
     let mut seen = HashSet::new();
@@ -28,58 +28,55 @@ pub(super) fn plan_cask_removals(
     for receipt in expected {
         validate_cask_receipt(receipt)?;
         if !seen.insert(receipt.token.as_str()) {
-            bail!(
-                "cask '{}' appears more than once in removal list",
-                receipt.token
-            );
+            return Err(CaskStoreError::DuplicateInRemoval {
+                token: receipt.token.to_string(),
+            });
         }
 
         let receipt_path = state_dir_path.join(format!("{}.json", receipt.token));
-        let current = read_cask_receipt(&receipt_path).with_context(|| {
-            format!(
-                "refusing to remove cask '{} {}': receipt '{}' could not be read",
-                receipt.token,
-                receipt.version,
-                receipt_path.display()
-            )
+        let current = read_cask_receipt(&receipt_path).map_err(|source| {
+            CaskStoreError::ReceiptUnreadable {
+                token: receipt.token.clone(),
+                version: receipt.version.clone(),
+                path: receipt_path.clone(),
+                source: Box::new(source),
+            }
         })?;
         if current != *receipt {
-            bail!(
-                "refusing to remove cask '{} {}': receipt changed on disk",
-                receipt.token,
-                receipt.version
-            );
+            return Err(CaskStoreError::ReceiptChanged {
+                token: receipt.token.to_string(),
+                version: receipt.version.to_string(),
+            });
         }
 
         let mut steps = vec![CaskRemovalStep::Receipt(receipt_path)];
 
         for link in &receipt.links {
             let link_path = safe_prefix_join_existing_no_symlinks(prefix, &link.dest)?;
-            let meta = fs::symlink_metadata(&link_path).with_context(|| {
-                format!(
-                    "refusing to remove cask '{}': owned symlink '{}' is missing",
-                    receipt.token,
-                    link_path.display()
-                )
+            let meta = fs::symlink_metadata(&link_path).map_err(|source| {
+                CaskStoreError::OwnedSymlinkMissing {
+                    token: receipt.token.clone(),
+                    path: link_path.clone(),
+                    source,
+                }
             })?;
             if !meta.file_type().is_symlink() {
-                bail!(
-                    "refusing to remove cask '{}': '{}' is no longer a symlink",
-                    receipt.token,
-                    link_path.display()
-                );
+                return Err(CaskStoreError::NoLongerSymlink {
+                    token: receipt.token.to_string(),
+                    path: link_path.to_path_buf(),
+                });
             }
-            let actual_target = fs::read_link(&link_path).with_context(|| {
-                format!("failed to read cask symlink '{}'", link_path.display())
-            })?;
+            let actual_target = fs::read_link(&link_path).map_err(CaskStoreError::io(
+                "failed to read cask symlink",
+                &link_path,
+            ))?;
             if actual_target != Path::new(&link.target) {
-                bail!(
-                    "refusing to remove cask '{}': symlink '{}' points to '{}' instead of '{}'",
-                    receipt.token,
-                    link_path.display(),
-                    actual_target.display(),
-                    link.target
-                );
+                return Err(CaskStoreError::SymlinkRetargeted {
+                    token: receipt.token.to_string(),
+                    path: link_path.to_path_buf(),
+                    actual: actual_target.to_path_buf(),
+                    expected: link.target.to_string(),
+                });
             }
             steps.push(CaskRemovalStep::Link {
                 path: link_path,
@@ -89,12 +86,12 @@ pub(super) fn plan_cask_removals(
 
         for wrapper in &receipt.wrappers {
             let wrapper_path = safe_prefix_join_existing_no_symlinks(prefix, &wrapper.dest)?;
-            verify_regular_file_sha256(&wrapper_path, &wrapper.sha256).with_context(|| {
-                format!(
-                    "refusing to remove cask '{}': command_wrapper '{}' was modified or removed",
-                    receipt.token,
-                    wrapper_path.display()
-                )
+            verify_regular_file_sha256(&wrapper_path, &wrapper.sha256).map_err(|source| {
+                CaskStoreError::WrapperModified {
+                    token: receipt.token.clone(),
+                    path: wrapper_path.clone(),
+                    source: Box::new(source),
+                }
             })?;
             steps.push(CaskRemovalStep::Wrapper {
                 path: wrapper_path,
@@ -104,29 +101,29 @@ pub(super) fn plan_cask_removals(
 
         for app in &receipt.apps {
             let Some(parent) = app.path.parent() else {
-                bail!("invalid app path '{}' in receipt", app.path.display());
+                return Err(CaskStoreError::InvalidAppPath {
+                    path: app.path.to_path_buf(),
+                });
             };
             let parent_meta = fs::symlink_metadata(parent)
-                .with_context(|| format!("failed to inspect appdir '{}'", parent.display()))?;
+                .map_err(CaskStoreError::io("failed to inspect appdir", &parent))?;
             if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
-                bail!(
-                    "appdir '{}' is no longer a real directory",
-                    parent.display()
-                );
+                return Err(CaskStoreError::AppdirChanged {
+                    path: parent.to_path_buf(),
+                });
             }
-            let app_meta = fs::symlink_metadata(&app.path).with_context(|| {
-                format!(
-                    "refusing to remove cask '{}': app bundle '{}' is missing",
-                    receipt.token,
-                    app.path.display()
-                )
+            let app_meta = fs::symlink_metadata(&app.path).map_err(|source| {
+                CaskStoreError::AppBundleMissing {
+                    token: receipt.token.clone(),
+                    path: app.path.clone(),
+                    source,
+                }
             })?;
             if app_meta.file_type().is_symlink() || !app_meta.is_dir() {
-                bail!(
-                    "refusing to remove cask '{}': '{}' is not a real .app directory",
-                    receipt.token,
-                    app.path.display()
-                );
+                return Err(CaskStoreError::NotAppDirectory {
+                    token: receipt.token.to_string(),
+                    path: app.path.to_path_buf(),
+                });
             }
             steps.push(CaskRemovalStep::AppDir(app.path.clone()));
         }
@@ -135,19 +132,18 @@ pub(super) fn plan_cask_removals(
         let mut prune_pkg = None;
         if !receipt.caskroom_files.is_empty() {
             let ver_dir = pkg_dir.join(&receipt.version);
-            let meta = fs::symlink_metadata(&ver_dir).with_context(|| {
-                format!(
-                    "refusing to remove cask '{}': Caskroom version '{}' is missing",
-                    receipt.token,
-                    ver_dir.display()
-                )
+            let meta = fs::symlink_metadata(&ver_dir).map_err(|source| {
+                CaskStoreError::CaskroomVersionMissing {
+                    token: receipt.token.clone(),
+                    path: ver_dir.clone(),
+                    source,
+                }
             })?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
-                bail!(
-                    "refusing to remove cask '{}': '{}' is not a real directory",
-                    receipt.token,
-                    ver_dir.display()
-                );
+                return Err(CaskStoreError::NotRealDirectory {
+                    token: receipt.token.to_string(),
+                    path: ver_dir.to_path_buf(),
+                });
             }
             steps.push(CaskRemovalStep::CaskroomVersionDir(ver_dir));
             prune_pkg = Some(pkg_dir);
@@ -162,7 +158,7 @@ pub(super) fn apply_removals(
     plans: &[CaskRemovalPlan],
     quarantine: &Path,
     parked: &mut Vec<ParkedEntry>,
-) -> Result<()> {
+) -> Result<(), CaskStoreError> {
     for plan in plans {
         for step in &plan.steps {
             match step {
@@ -173,11 +169,16 @@ pub(super) fn apply_removals(
                     path,
                     expected_target,
                 } => {
-                    let meta = fs::symlink_metadata(path)?;
+                    let meta = fs::symlink_metadata(path)
+                        .map_err(CaskStoreError::io("failed to inspect", path))?;
                     if !meta.file_type().is_symlink()
-                        || fs::read_link(path)? != Path::new(expected_target)
+                        || fs::read_link(path)
+                            .map_err(CaskStoreError::io("failed to read link", path))?
+                            != Path::new(expected_target)
                     {
-                        bail!("cask symlink '{}' changed before removal", path.display());
+                        return Err(CaskStoreError::SymlinkChanged {
+                            path: path.to_path_buf(),
+                        });
                     }
                     park_same_fs_or_sibling(path, quarantine, parked, false)?;
                 }
@@ -189,12 +190,12 @@ pub(super) fn apply_removals(
                     park_same_fs_or_sibling(path, quarantine, parked, false)?;
                 }
                 CaskRemovalStep::CaskroomVersionDir(path) | CaskRemovalStep::AppDir(path) => {
-                    let meta = fs::symlink_metadata(path)?;
+                    let meta = fs::symlink_metadata(path)
+                        .map_err(CaskStoreError::io("failed to inspect", path))?;
                     if meta.file_type().is_symlink() || !meta.is_dir() {
-                        bail!(
-                            "cask directory '{}' is no longer a real directory",
-                            path.display()
-                        );
+                        return Err(CaskStoreError::DirectoryChanged {
+                            path: path.to_path_buf(),
+                        });
                     }
                     park_same_fs_or_sibling(path, quarantine, parked, true)?;
                 }
@@ -214,7 +215,7 @@ fn park_same_fs_or_sibling(
     quarantine: &Path,
     parked: &mut Vec<ParkedEntry>,
     allow_cross_device_sibling: bool,
-) -> Result<()> {
+) -> Result<(), CaskStoreError> {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let qdest = quarantine.join(format!("item-{seq}"));
     match fs::rename(source, &qdest) {
@@ -226,20 +227,16 @@ fn park_same_fs_or_sibling(
             Ok(())
         }
         Err(err) if allow_cross_device_sibling && is_cross_device(&err) => {
-            let parent = source
-                .parent()
-                .context("app bundle path has no parent directory")?;
+            let parent = source.parent().ok_or(CaskStoreError::AppBundleNoParent)?;
             let sibling = parent.join(format!(
                 ".brewrs-parked-{}-{}-{seq}",
                 std::process::id(),
                 monotonic_nonce()
             ));
-            fs::rename(source, &sibling).with_context(|| {
-                format!(
-                    "failed to move '{}' to temporary removal path '{}'",
-                    source.display(),
-                    sibling.display()
-                )
+            fs::rename(source, &sibling).map_err(|error| CaskStoreError::MoveToSibling {
+                from: source.to_path_buf(),
+                to: sibling.clone(),
+                source: error,
             })?;
             parked.push(ParkedEntry::CrossDeviceSibling {
                 source: source.to_path_buf(),
@@ -247,11 +244,9 @@ fn park_same_fs_or_sibling(
             });
             Ok(())
         }
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "failed to quarantine '{}' during cask removal",
-                source.display()
-            )
+        Err(err) => Err(CaskStoreError::Quarantine {
+            path: source.to_path_buf(),
+            source: err,
         }),
     }
 }

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use reqwest::header::LOCATION;
 use reqwest::{Client, Response, StatusCode, Url};
 
@@ -19,6 +19,9 @@ use crate::domain::validate::{
 };
 use crate::infra::cache::NATIVE_CASK_DIR;
 
+mod error;
+
+use self::error::CaskDownloadError;
 use super::download::{
     build_verified_client, ensure_isolated_cache_dir, request_timeout, reuse_cached_bottle,
     stage_bottle,
@@ -39,7 +42,7 @@ const MAX_REDIRECTS: usize = 10;
 /// are refused.
 pub(crate) async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf> {
     if !is_lower_hex_digest(sha256) {
-        bail!("refusing to fetch cask payload: sha256 must be 64 lowercase hexadecimal characters");
+        return Err(CaskDownloadError::BadDigest.into());
     }
     let initial = validate_cask_url(url)?;
     let directory = ensure_isolated_cache_dir(config, NATIVE_CASK_DIR, "native cask")?;
@@ -63,8 +66,14 @@ async fn request_cask_payload(client: &Client, initial: Url, config: &Config) ->
         let response =
             tokio::time::timeout(request_timeout(config), client.get(current.clone()).send())
                 .await
-                .with_context(|| format!("timed out requesting cask payload from {current}"))?
-                .with_context(|| format!("failed to request cask payload from {current}"))?;
+                .map_err(|source| CaskDownloadError::RequestTimedOut {
+                    url: current.to_string(),
+                    source,
+                })?
+                .map_err(|source| CaskDownloadError::Request {
+                    url: current.to_string(),
+                    source,
+                })?;
 
         match response.status() {
             StatusCode::OK => return Ok(response),
@@ -75,33 +84,42 @@ async fn request_cask_payload(client: &Client, initial: Url, config: &Config) ->
             | StatusCode::PERMANENT_REDIRECT => {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
-                    bail!("refusing to follow more than {MAX_REDIRECTS} cask redirects");
+                    return Err(CaskDownloadError::TooManyRedirects.into());
                 }
                 let location = response
                     .headers()
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
-                    .context("cask download redirect did not include a valid Location header")?;
+                    .ok_or(CaskDownloadError::MissingLocation)?;
                 current = resolve_cask_redirect(&current, location)?;
             }
-            status => bail!("cask download failed with HTTP {status} from {current}"),
+            status => {
+                return Err(CaskDownloadError::HttpStatus {
+                    status,
+                    url: current.to_string(),
+                }
+                .into());
+            }
         }
     }
 }
 
 fn resolve_cask_redirect(base: &Url, location: &str) -> Result<Url> {
     if location.is_empty() {
-        bail!("refusing empty cask redirect Location header");
+        return Err(CaskDownloadError::EmptyLocation.into());
     }
     if location.len() > MAX_REDIRECT_URL_BYTES {
-        bail!("refusing cask redirect: Location header exceeds {MAX_REDIRECT_URL_BYTES} bytes");
+        return Err(CaskDownloadError::LocationTooLong.into());
     }
     if location.chars().any(|ch| ch.is_control()) {
-        bail!("refusing cask redirect: Location header contains control characters");
+        return Err(CaskDownloadError::LocationControlCharacters.into());
     }
     let target = base
         .join(location)
-        .with_context(|| format!("cask redirect has an invalid Location header: {location}"))?;
+        .map_err(|source| CaskDownloadError::InvalidLocation {
+            location: location.to_owned(),
+            source,
+        })?;
     validate_cask_url_with_limit(target.as_str(), MAX_REDIRECT_URL_BYTES, "cask redirect URL")
 }
 

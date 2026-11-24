@@ -218,7 +218,7 @@ fn real_shape() -> Vec<Fixture<'static>> {
     ]
 }
 
-fn unpack_fixture(staged: &Staged) -> Result<()> {
+fn unpack_fixture(staged: &Staged) -> Result<(), ArchiveError> {
     unpack(&staged.archive, &staged.out, NAME, VERSION, &staged.digest)
 }
 
@@ -1178,4 +1178,62 @@ fn extracts_bounded_chained_and_directory_symlinks() {
     let error =
         unpack_fixture(&stage(&gzipped(&deep_chain))).expect_err("over-deep chain must fail");
     assert!(format!("{error:#}").contains("depth limit"), "{error:#}");
+}
+
+#[test]
+fn path_traversal_is_a_typed_error() {
+    let bytes = raw_gzipped(&[RawEntry {
+        path: b"hello/2.12.1/../../escape",
+        kind: EntryType::Regular,
+        size: 1,
+        mode: 0o644,
+        data: b"x",
+    }]);
+    let staged = stage(&bytes);
+    let error = unpack_fixture(&staged).expect_err("traversal must fail");
+    assert!(
+        matches!(&error, ArchiveError::PathNotNormalized { path } if path.contains("..")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn symlink_escape_is_a_typed_error() {
+    let entries = [
+        Fixture {
+            path: "hello/2.12.1/lib/real",
+            kind: FixtureKind::File,
+            data: b"x",
+            mode: 0o644,
+        },
+        Fixture {
+            path: "hello/2.12.1/lib/link",
+            kind: FixtureKind::Symlink("../../escape"),
+            data: b"",
+            mode: 0o777,
+        },
+    ];
+    let staged = stage(&gzipped(&entries));
+    let error = unpack_fixture(&staged).expect_err("escaping link must fail");
+    assert!(
+        matches!(&error, ArchiveError::SymlinkEscapesRoot { link } if link.ends_with("lib/link")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn oversized_entry_is_a_typed_error() {
+    let bytes = raw_gzipped(&[RawEntry {
+        path: b"hello/2.12.1/huge",
+        kind: EntryType::Regular,
+        size: MAX_FILE_BYTES + 1,
+        mode: 0o644,
+        data: b"",
+    }]);
+    let staged = stage(&bytes);
+    let error = unpack_fixture(&staged).expect_err("oversized entry must fail");
+    assert!(
+        matches!(&error, ArchiveError::EntryTooLarge { limit, .. } if *limit == MAX_FILE_BYTES),
+        "{error:?}"
+    );
 }

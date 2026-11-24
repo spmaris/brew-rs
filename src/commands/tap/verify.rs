@@ -80,7 +80,11 @@ pub(super) fn verify_installed_state(prefix: &Path, receipt: &TapReceipt) -> Res
 pub(super) fn verify_installed_artifact(prefix: &Path, receipt: &TapReceipt) -> Result<u64> {
     verify_installed_state(prefix, receipt)?;
     let executable = prefix.join(&receipt.keg).join("bin").join(&receipt.bin);
-    verify_artifact(&executable, &receipt.artifact_sha256, &receipt.architecture)
+    Ok(verify_artifact(
+        &executable,
+        &receipt.artifact_sha256,
+        &receipt.architecture,
+    )?)
 }
 
 pub(super) fn verify_removal_state(prefix: &Path, receipt: &TapReceipt) -> Result<()> {

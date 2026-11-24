@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
 
 use super::LOCK_FILE;
 use super::paths::{monotonic_nonce, state_dir};
@@ -16,7 +16,7 @@ pub(crate) struct InstallLock {
 }
 
 impl InstallLock {
-    pub(crate) fn acquire(prefix: &Path) -> Result<Self> {
+    pub(crate) fn acquire(prefix: &Path) -> Result<Self, StoreError> {
         let path = state_dir(prefix).join(LOCK_FILE);
         let token = format!("pid={} nonce={}\n", std::process::id(), monotonic_nonce());
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -26,22 +26,18 @@ impl InstallLock {
                     .and_then(|()| file.sync_all())
                 {
                     let _ = fs::remove_file(&path);
-                    return Err(error)
-                        .with_context(|| format!("failed to write lock '{}'", path.display()));
+                    return Err(StoreError::io("failed to write lock", &path)(error));
                 }
                 Ok(Self { path, token })
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let owner = describe_lock(&path);
-                bail!(
-                    "another brewrs install holds the lock '{}' ({owner}); if no brewrs process is running, the lock is stale: remove '{}' and retry",
-                    path.display(),
-                    path.display()
-                )
+                Err(StoreError::LockHeld {
+                    path: path.to_path_buf(),
+                    owner,
+                })
             }
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to create lock '{}'", path.display()))
-            }
+            Err(error) => Err(StoreError::io("failed to create lock", &path)(error)),
         }
     }
 }

@@ -1,11 +1,10 @@
-use anyhow::{Context, Result, bail};
-
 use crate::domain::validate::is_lower_hex_digest;
 
 use super::consts::{
     BOTTLE_PATH_PREFIX, GHCR_HOST, GHCR_ORIGIN, MAX_REDIRECT_URL_BYTES, MAX_REPOSITORY_SEGMENTS,
     MAX_URL_BYTES,
 };
+use super::error::{DownloadError, UnsafeUrl};
 
 /// A validated bottle location.
 pub(super) struct BottleSource {
@@ -25,62 +24,68 @@ impl BottleSource {
 }
 
 /// Parse and strictly validate a GHCR bottle blob URL.
-pub(super) fn parse_bottle_url(url: &str, sha256: &str) -> Result<BottleSource> {
+pub(super) fn parse_bottle_url(url: &str, sha256: &str) -> Result<BottleSource, UnsafeUrl> {
     if !is_lower_hex_digest(sha256) {
-        bail!("refusing to fetch a bottle: sha256 must be 64 lowercase hexadecimal characters");
+        return Err(UnsafeUrl::BadDigest);
     }
     if url.len() > MAX_URL_BYTES {
-        bail!("refusing to fetch a bottle: URL exceeds {MAX_URL_BYTES} bytes");
+        return Err(UnsafeUrl::TooLong);
     }
     if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        bail!("refusing to fetch a bottle: URL contains whitespace or control characters");
+        return Err(UnsafeUrl::ControlCharacters);
     }
 
     // Requiring this exact prefix also rejects ports, userinfo, trailing-dot
     // hosts, and look-alike hosts such as `ghcr.io.evil.example`.
     let Some(path) = url.strip_prefix(GHCR_ORIGIN) else {
-        bail!("refusing to fetch a bottle: URL must start with {GHCR_ORIGIN}/");
+        return Err(UnsafeUrl::WrongOrigin {
+            origin: GHCR_ORIGIN,
+        });
     };
     if !path.starts_with('/') {
-        bail!("refusing to fetch a bottle: URL must be on the {GHCR_HOST} origin");
+        return Err(UnsafeUrl::WrongHost { host: GHCR_HOST });
     }
     if path.contains('?') || path.contains('#') {
-        bail!("refusing to fetch a bottle: URL must not contain a query or fragment");
+        return Err(UnsafeUrl::QueryOrFragment);
     }
     if path.contains('%') {
-        bail!("refusing to fetch a bottle: URL must not contain percent-encoding");
+        return Err(UnsafeUrl::PercentEncoding);
     }
     if path.contains('\\') {
-        bail!("refusing to fetch a bottle: URL must not contain backslashes");
+        return Err(UnsafeUrl::Backslash);
     }
 
     let Some(rest) = path.strip_prefix(BOTTLE_PATH_PREFIX) else {
-        bail!("refusing to fetch a bottle: expected a {BOTTLE_PATH_PREFIX}... path");
+        return Err(UnsafeUrl::WrongPrefix {
+            prefix: BOTTLE_PATH_PREFIX,
+        });
     };
     let segments: Vec<&str> = rest.split('/').collect();
     if segments.len() < 3 {
-        bail!("refusing to fetch a bottle: expected <repository>/blobs/sha256:<digest>");
+        return Err(UnsafeUrl::TooFewSegments);
     }
 
     let digest_segment = segments[segments.len() - 1];
     let blob_segment = segments[segments.len() - 2];
     if blob_segment != "blobs" {
-        bail!("refusing to fetch a bottle: URL is not a blob download path");
+        return Err(UnsafeUrl::NotBlobPath);
     }
     let Some(url_digest) = digest_segment.strip_prefix("sha256:") else {
-        bail!("refusing to fetch a bottle: blob path must end in sha256:<digest>");
+        return Err(UnsafeUrl::NoDigestSegment);
     };
     if url_digest != sha256 {
-        bail!("refusing to fetch a bottle: URL digest does not match the requested sha256");
+        return Err(UnsafeUrl::DigestMismatch);
     }
 
     let repository_segments = &segments[..segments.len() - 2];
     if repository_segments.is_empty() || repository_segments.len() > MAX_REPOSITORY_SEGMENTS {
-        bail!("refusing to fetch a bottle: unexpected repository path depth");
+        return Err(UnsafeUrl::RepositoryDepth);
     }
     for segment in repository_segments {
         if !is_valid_repository_segment(segment) {
-            bail!("refusing to fetch a bottle: invalid repository segment '{segment}'");
+            return Err(UnsafeUrl::InvalidSegment {
+                segment: (*segment).to_owned(),
+            });
         }
     }
 
@@ -118,22 +123,24 @@ pub(super) fn is_ghcr_url(url: &str) -> bool {
 }
 
 /// Resolve and validate one redirect hop.
-pub(super) fn resolve_redirect(base: &str, location: &str) -> Result<String> {
+pub(super) fn resolve_redirect(base: &str, location: &str) -> Result<String, DownloadError> {
     if location.len() > MAX_REDIRECT_URL_BYTES {
-        bail!("refusing to follow a bottle redirect: Location header is too long");
+        return Err(DownloadError::RedirectLocationTooLong);
     }
-    let base = reqwest::Url::parse(base).context("failed to parse the bottle request URL")?;
+    let base = reqwest::Url::parse(base).map_err(DownloadError::ParseRequestUrl)?;
     let target = base
         .join(location)
-        .with_context(|| format!("bottle redirect has an invalid Location header: {location}"))?;
+        .map_err(|source| DownloadError::InvalidLocation {
+            location: location.to_owned(),
+            source,
+        })?;
     if target.fragment().is_some() {
-        bail!("refusing to follow a bottle redirect with a fragment");
+        return Err(DownloadError::RedirectFragment);
     }
     if !is_allowed_redirect(&target) {
-        bail!(
-            "refusing to follow a bottle redirect to '{}': not an allowed GitHub container host",
-            target
-        );
+        return Err(DownloadError::RedirectHostNotAllowed {
+            target: target.to_string(),
+        });
     }
     Ok(target.to_string())
 }

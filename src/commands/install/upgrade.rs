@@ -158,7 +158,7 @@ pub(crate) async fn upgrade(
             Ok(()) => step.done(&format!("Relocated {relocate_count} {noun}")),
             Err(error) => {
                 step.fail();
-                return Err(error);
+                return Err(error.into());
             }
         }
     } else {
@@ -173,7 +173,7 @@ pub(crate) async fn upgrade(
         Ok(()) => step.done("Replaced old versions"),
         Err(error) => {
             step.fail();
-            return Err(error);
+            return Err(error.into());
         }
     }
     formatter.note(&format!(

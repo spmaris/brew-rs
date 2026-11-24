@@ -2,9 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result, bail};
-
 use super::super::paths::Paths;
+use super::error::TextError;
 use super::general::rewrite_markers_in_line;
 use super::{FIXED_CELLAR, MARKER, contains};
 
@@ -35,7 +34,7 @@ const PC_PATH_VARIABLES: &[&str] = &[
 
 /// Rewrite all Homebrew placeholders in pkg-config files (`lib/pkgconfig/*.pc`
 /// and `share/pkgconfig/*.pc`), preserving existing quoting rules.
-pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String> {
+pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String, TextError> {
     let mut assignments = HashMap::new();
     let mut seen = HashSet::new();
     let mut replacements = 0usize;
@@ -43,7 +42,7 @@ pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String
 
     for line in text.split_inclusive('\n') {
         if line.contains(FIXED_CELLAR) || line.contains("/opt/homebrew/") {
-            bail!("Fixed /opt/homebrew path in a pkg-config file is unsupported");
+            return Err(TextError::PcFixedPath);
         }
         if contains(line.as_bytes(), MARKER.as_bytes()) {
             if line.trim_start().starts_with('#') {
@@ -55,7 +54,9 @@ pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String
             } else {
                 let (lhs_eq_ws, name, value) = parse_pc_assignment(line)?;
                 if !seen.insert(name.to_owned()) {
-                    bail!("duplicate pkg-config variable {name:?} carries a Homebrew placeholder");
+                    return Err(TextError::PcDuplicateVariable {
+                        name: name.to_owned(),
+                    });
                 }
                 if value.is_empty()
                     || value.chars().any(char::is_whitespace)
@@ -63,7 +64,10 @@ pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String
                         .bytes()
                         .any(|byte| matches!(byte, b'"' | b'\'' | b'`' | b'\\' | b'#'))
                 {
-                    bail!("Unsupported literal path {value:?} in pkg-config variable {name:?}");
+                    return Err(TextError::PcUnsupportedLiteral {
+                        value: value.to_owned(),
+                        name: name.to_owned(),
+                    });
                 }
                 let allow_dollar = value.contains('$');
                 let mapped = rewrite_markers_in_line(value, paths)?;
@@ -81,7 +85,7 @@ pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String
     }
 
     if replacements == 0 {
-        bail!("Homebrew marker did not occur in a supported pkg-config context");
+        return Err(TextError::PcNoMarkerContext);
     }
 
     let space_variables = space_bearing_variables(&assignments, &seen);
@@ -98,7 +102,7 @@ pub(super) fn rewrite_pkg_config(text: &str, paths: &Paths<'_>) -> Result<String
 
 /// Rewrite literal marker paths inside a pkg-config `Libs*`/`Cflags*` line,
 /// quoting any `-L`/`-I` token whose mapped path introduces spaces.
-fn rewrite_pc_field_markers(line: &str, paths: &Paths<'_>) -> Result<String> {
+fn rewrite_pc_field_markers(line: &str, paths: &Paths<'_>) -> Result<String, TextError> {
     let (body, has_newline) = match line.strip_suffix('\n') {
         Some(body) => (body, true),
         None => (line, false),
@@ -273,16 +277,16 @@ fn quote_pc_token(token: &str, space_variables: &HashSet<String>) -> Option<Stri
 }
 
 /// Split one `lhs = rhs` pkg-config line, preserving `=` and surrounding spaces.
-fn parse_pc_assignment(line: &str) -> Result<(&str, &str, &str)> {
-    let body = line
-        .strip_suffix('\n')
-        .context("pkg-config line does not end with a newline")?;
+fn parse_pc_assignment(line: &str) -> Result<(&str, &str, &str), TextError> {
+    let body = line.strip_suffix('\n').ok_or(TextError::PcMissingNewline)?;
     let Some((raw_lhs, raw_rhs)) = body.split_once('=') else {
-        bail!("Homebrew placeholder outside a pkg-config variable assignment");
+        return Err(TextError::PcOutsideAssignment);
     };
     let name = raw_lhs.trim_end_matches(' ');
     if !valid_pc_name(name) {
-        bail!("Unsupported pkg-config variable name {name:?}");
+        return Err(TextError::PcUnsupportedName {
+            name: name.to_owned(),
+        });
     }
     let rhs = raw_rhs.trim_start_matches(' ');
     let lhs_eq_ws = &body[..body.len() - rhs.len()];
@@ -290,7 +294,7 @@ fn parse_pc_assignment(line: &str) -> Result<(&str, &str, &str)> {
 }
 
 /// A pkg-config value is literal, but it must remain a single safe line.
-fn validate_pc_mapped_value(value: &str, allow_dollar: bool) -> Result<()> {
+fn validate_pc_mapped_value(value: &str, allow_dollar: bool) -> Result<(), TextError> {
     if value.is_empty()
         || !value.starts_with('/')
         || value.starts_with(' ')
@@ -302,7 +306,9 @@ fn validate_pc_mapped_value(value: &str, allow_dollar: bool) -> Result<()> {
                 || (!allow_dollar && byte == b'$')
         })
     {
-        bail!("Mapped pkg-config path {value:?} cannot be represented literally");
+        return Err(TextError::PcUnrepresentable {
+            value: value.to_owned(),
+        });
     }
     Ok(())
 }

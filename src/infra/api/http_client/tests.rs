@@ -1,4 +1,6 @@
+use super::super::error::classify_parts;
 use super::*;
+use crate::domain::plan_error::ApiFailure;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -30,15 +32,21 @@ fn direct_client() -> HttpClient {
 async fn not_found_retains_http_status() {
     let url = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
     let error = direct_client()
+        .get_json::<serde_json::Value>(&url)
+        .await
+        .unwrap_err();
+    let ApiError::Status(source) = &error else {
+        panic!("expected a status error, got {error:?}");
+    };
+    assert_eq!(source.status(), Some(reqwest::StatusCode::NOT_FOUND));
+    assert!(error.is_not_found());
+    // The compatibility wrapper keeps the typed status on the anyhow chain.
+    let url = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+    let error = direct_client()
         .fetch_json::<serde_json::Value>(&url)
         .await
         .unwrap_err();
-    assert_eq!(
-        error
-            .downcast_ref::<reqwest::Error>()
-            .and_then(reqwest::Error::status),
-        Some(reqwest::StatusCode::NOT_FOUND)
-    );
+    assert!(is_not_found(&error));
 }
 
 #[tokio::test]
@@ -48,7 +56,7 @@ async fn streams_chunked_json() {
     )
     .await;
     assert_eq!(
-        direct_client().fetch_json::<Vec<u32>>(&url).await.unwrap(),
+        direct_client().get_json::<Vec<u32>>(&url).await.unwrap(),
         vec![1, 2]
     );
 }
@@ -57,23 +65,24 @@ async fn streams_chunked_json() {
 async fn rejects_excessive_declared_length_before_reading_body() {
     let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 200000000\r\n\r\n").await;
     let error = direct_client()
-        .fetch_json::<serde_json::Value>(&url)
+        .get_json::<serde_json::Value>(&url)
         .await
         .unwrap_err();
+    assert!(matches!(error, ApiError::ResponseTooLarge));
     assert!(error.to_string().contains("response limit"));
 }
 
 #[tokio::test]
 async fn classifies_not_found_and_server_errors() {
     let url = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
-    let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
-    assert_eq!(classify(&error), Some(ApiFailure::NotFound));
+    let error = direct_client().get_json::<u8>(&url).await.unwrap_err();
+    assert_eq!(error.failure(), Some(ApiFailure::NotFound));
     let url = serve(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
-    let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
-    assert_eq!(classify(&error), Some(ApiFailure::Server(503)));
+    let error = direct_client().get_json::<u8>(&url).await.unwrap_err();
+    assert_eq!(error.failure(), Some(ApiFailure::Server(503)));
     let url = serve(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
-    let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
-    assert_eq!(classify(&error), None);
+    let error = direct_client().get_json::<u8>(&url).await.unwrap_err();
+    assert_eq!(error.failure(), None);
 }
 
 #[tokio::test]
@@ -82,15 +91,17 @@ async fn classifies_connection_failure_as_unreachable() {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let error = direct_client()
-        .fetch_json::<u8>(&format!("http://{address}/metadata"))
+        .get_json::<u8>(&format!("http://{address}/metadata"))
         .await
         .unwrap_err();
-    assert_eq!(classify(&error), Some(ApiFailure::Unreachable));
+    assert!(matches!(error, ApiError::Send(_)));
+    assert_eq!(error.failure(), Some(ApiFailure::Unreachable));
 }
 
 #[test]
 fn classification_ignores_other_failures() {
     assert_eq!(classify_parts(Some(400), true), None);
     assert_eq!(classify_parts(None, false), None);
-    assert_eq!(classify(&anyhow::anyhow!("boom")), None);
+    assert_eq!(ApiError::ResponseTooLarge.failure(), None);
+    assert!(!is_not_found(&anyhow::anyhow!("boom")));
 }

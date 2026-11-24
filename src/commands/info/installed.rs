@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::commands::install::prefix_path;
 use crate::domain::cask_plan::{CaskVersionOrder, compare_cask_versions};
+use crate::infra::api::error::error_chain;
 use crate::infra::store::Store;
 
 use super::status::with_revision;
@@ -22,11 +23,11 @@ pub(super) fn read_installed(prefix: Option<&Path>, name: &str) -> Installed {
     };
     let store = match Store::open(&path, false) {
         Ok(store) => store,
-        Err(error) => return Installed::Unknown(format!("{error:#}")),
+        Err(error) => return Installed::Unknown(error_chain(&error)),
     };
     let receipts = match store.installed() {
         Ok(receipts) => receipts,
-        Err(error) => return Installed::Unknown(format!("{error:#}")),
+        Err(error) => return Installed::Unknown(error_chain(&error)),
     };
     match receipts.into_iter().find(|receipt| receipt.name == name) {
         Some(receipt) => Installed::Present {
@@ -81,11 +82,11 @@ pub(super) fn read_installed_cask(prefix: Option<&Path>, token: &str) -> Install
     };
     let store = match Store::open(&path, false) {
         Ok(store) => store,
-        Err(error) => return InstalledCask::Unknown(format!("{error:#}")),
+        Err(error) => return InstalledCask::Unknown(error_chain(&error)),
     };
     let receipts = match crate::infra::cask_store::installed(&store) {
         Ok(receipts) => receipts,
-        Err(error) => return InstalledCask::Unknown(format!("{error:#}")),
+        Err(error) => return InstalledCask::Unknown(error_chain(&error)),
     };
     match receipts.into_iter().find(|receipt| receipt.token == token) {
         Some(receipt) => InstalledCask::Present {

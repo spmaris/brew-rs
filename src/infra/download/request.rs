@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, LOCATION};
 use reqwest::{Client, Response, StatusCode};
 
@@ -9,15 +8,19 @@ use crate::config::Config;
 use super::consts::{
     GHCR_SERVICE, GHCR_TOKEN_ENDPOINT, MAX_REDIRECTS, MAX_TOKEN_BYTES, MAX_TOKEN_LEN,
 };
+use super::error::DownloadError;
 use super::url::{BottleSource, is_ghcr_url, resolve_redirect};
 
 /// Build the HTTP client used for GHCR requests.
-pub(super) fn build_client(config: &Config) -> Result<Client> {
+pub(super) fn build_client(config: &Config) -> Result<Client, DownloadError> {
     build_verified_client(config, "bottle")
 }
 
 /// Build an HTTPS-only, manual-redirect HTTP client respecting proxy and agent settings.
-pub(crate) fn build_verified_client(config: &Config, label: &str) -> Result<Client> {
+pub(crate) fn build_verified_client(
+    config: &Config,
+    label: &'static str,
+) -> Result<Client, DownloadError> {
     let mut builder = Client::builder()
         // Redirects are followed manually so every hop can be validated before
         // connecting or forwarding headers.
@@ -34,7 +37,7 @@ pub(crate) fn build_verified_client(config: &Config, label: &str) -> Result<Clie
 
     builder
         .build()
-        .with_context(|| format!("failed to build the {label} HTTP client"))
+        .map_err(|source| DownloadError::BuildClient { label, source })
 }
 
 /// Download the bottle blob, handling a public GHCR pull token and CDN redirects.
@@ -42,7 +45,7 @@ pub(super) async fn request_bottle(
     client: &Client,
     source: &BottleSource,
     config: &Config,
-) -> Result<Response> {
+) -> Result<Response, DownloadError> {
     let mut url = source.url.clone();
     let mut redirects = 0_usize;
     let mut token: Option<String> = None;
@@ -60,14 +63,20 @@ pub(super) async fn request_bottle(
 
         let response = tokio::time::timeout(request_timeout(config), request.send())
             .await
-            .with_context(|| format!("timed out requesting bottle from {url}"))?
-            .with_context(|| format!("failed to request bottle from {url}"))?;
+            .map_err(|source| DownloadError::RequestTimedOut {
+                url: url.clone(),
+                source,
+            })?
+            .map_err(|source| DownloadError::Request {
+                url: url.clone(),
+                source,
+            })?;
 
         match response.status() {
             StatusCode::OK => return Ok(response),
             StatusCode::UNAUTHORIZED => {
                 if token_attempted || !is_ghcr_url(&url) {
-                    bail!("GHCR rejected the bottle request with HTTP 401 Unauthorized");
+                    return Err(DownloadError::Unauthorized);
                 }
                 token_attempted = true;
                 // The fixed endpoint and the minimal repository scope are used
@@ -82,16 +91,16 @@ pub(super) async fn request_bottle(
             | StatusCode::PERMANENT_REDIRECT => {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
-                    bail!("refusing to follow more than {MAX_REDIRECTS} bottle redirects");
+                    return Err(DownloadError::TooManyRedirects);
                 }
                 let location = response
                     .headers()
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
-                    .context("bottle redirect did not include a valid Location header")?;
+                    .ok_or(DownloadError::MissingLocation)?;
                 url = resolve_redirect(&url, location)?;
             }
-            status => bail!("bottle download failed with HTTP {status}"),
+            status => return Err(DownloadError::HttpStatus(status)),
         }
     }
 }
@@ -101,9 +110,8 @@ pub(super) async fn request_pull_token(
     client: &Client,
     scope: &str,
     config: &Config,
-) -> Result<String> {
-    let mut url = reqwest::Url::parse(GHCR_TOKEN_ENDPOINT)
-        .context("failed to parse the built-in GHCR token endpoint")?;
+) -> Result<String, DownloadError> {
+    let mut url = reqwest::Url::parse(GHCR_TOKEN_ENDPOINT).map_err(DownloadError::TokenEndpoint)?;
     url.query_pairs_mut()
         .append_pair("service", GHCR_SERVICE)
         .append_pair("scope", scope);
@@ -113,14 +121,11 @@ pub(super) async fn request_pull_token(
         client.get(url).header(ACCEPT, "application/json").send(),
     )
     .await
-    .context("timed out requesting a GHCR pull token")?
-    .context("failed to request a GHCR pull token")?;
+    .map_err(DownloadError::TokenRequestTimedOut)?
+    .map_err(DownloadError::TokenRequest)?;
 
     if response.status() != StatusCode::OK {
-        bail!(
-            "GHCR pull token request failed with HTTP {}",
-            response.status()
-        );
+        return Err(DownloadError::TokenStatus(response.status()));
     }
 
     let mut response = response;
@@ -128,13 +133,13 @@ pub(super) async fn request_pull_token(
     loop {
         let chunk = tokio::time::timeout(chunk_timeout(config), response.chunk())
             .await
-            .context("timed out reading the GHCR pull token response")?
-            .context("failed to read the GHCR pull token response")?;
+            .map_err(DownloadError::TokenReadTimedOut)?
+            .map_err(DownloadError::TokenRead)?;
         let Some(chunk) = chunk else {
             break;
         };
         if body.len() + chunk.len() > MAX_TOKEN_BYTES {
-            bail!("GHCR pull token response exceeded {MAX_TOKEN_BYTES} bytes");
+            return Err(DownloadError::TokenTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -148,18 +153,18 @@ pub(super) async fn request_pull_token(
     }
 
     let payload: TokenResponse =
-        serde_json::from_slice(&body).context("failed to parse the GHCR pull token response")?;
+        serde_json::from_slice(&body).map_err(DownloadError::TokenParse)?;
     let token = payload
         .token
         .or(payload.access_token)
-        .context("GHCR pull token response contained no token")?;
+        .ok_or(DownloadError::TokenMissing)?;
 
     // Keep the value header-safe: no whitespace, separators, or control bytes.
     if token.is_empty()
         || token.len() > MAX_TOKEN_LEN
         || !token.bytes().all(|b| b.is_ascii_graphic())
     {
-        bail!("GHCR returned an unusable pull token");
+        return Err(DownloadError::TokenUnusable);
     }
     Ok(token)
 }

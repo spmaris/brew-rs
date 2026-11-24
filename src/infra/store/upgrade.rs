@@ -7,7 +7,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use super::StoreError;
+use super::error::Action;
 
 use super::commit::rollback;
 use super::lock::InstallLock;
@@ -38,7 +39,7 @@ impl Store {
     ///
     /// Like commits and removals, upgrades are not crash-atomic; see the module
     /// documentation for the files an interrupted upgrade can leave behind.
-    pub(crate) fn upgrade(&self, packages: Vec<(Receipt, Prepared)>) -> Result<()> {
+    pub(crate) fn upgrade(&self, packages: Vec<(Receipt, Prepared)>) -> Result<(), StoreError> {
         self.upgrade_inner(packages, None)
     }
 
@@ -47,7 +48,7 @@ impl Store {
         &self,
         packages: Vec<(Receipt, Prepared)>,
         fail_after: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<(), StoreError> {
         self.ensure_owned()?;
         if packages.is_empty() {
             return Ok(());
@@ -63,20 +64,22 @@ impl Store {
 
     /// Quarantine the preflighted old paths, apply the replacements, and undo
     /// both sides if the install fails.
-    fn apply_upgrade(&self, upgrades: Vec<Upgrade>, fail_after: Option<usize>) -> Result<()> {
+    fn apply_upgrade(
+        &self,
+        upgrades: Vec<Upgrade>,
+        fail_after: Option<usize>,
+    ) -> Result<(), StoreError> {
         let stages = stages_dir(&self.prefix);
         let quarantine = tempfile::Builder::new()
             .prefix("upgrade-")
             .tempdir_in(&stages)
-            .with_context(|| {
-                format!(
-                    "failed to create an upgrade quarantine below '{}'",
-                    stages.display()
-                )
-            })?;
+            .map_err(StoreError::io(
+                "failed to create an upgrade quarantine below",
+                &stages,
+            ))?;
 
         let mut moved = Vec::new();
-        let move_outcome = (|| -> Result<()> {
+        let move_outcome = (|| -> Result<(), StoreError> {
             let mut index = 0usize;
             for upgrade in &upgrades {
                 if upgrade.retain {
@@ -183,8 +186,8 @@ fn finish_upgrade(
     quarantine: tempfile::TempDir,
     applied: &[Applied],
     moved: &[AppliedChange],
-    error: anyhow::Error,
-) -> Result<()> {
+    error: StoreError,
+) -> Result<(), StoreError> {
     let mut issues = rollback(applied);
     issues.extend(rollback_removal(moved));
     if issues.is_empty() {
@@ -192,11 +195,11 @@ fn finish_upgrade(
         Err(error)
     } else {
         let kept = quarantine.keep();
-        Err(error.context(format!(
-            "rollback was incomplete: {}; the quarantined old paths were kept in '{}'",
-            issues.join("; "),
-            kept.display()
-        )))
+        Err(StoreError::UpgradeRollbackIncomplete {
+            issues,
+            kept,
+            source: Box::new(error),
+        })
     }
 }
 
@@ -213,22 +216,24 @@ fn retain_receipt(
     version: &str,
     source: &Path,
     applied: &mut Vec<AppliedChange>,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     let metadata = match fs::symlink_metadata(source) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-            "refusing to retain '{}': it disappeared after preflight",
-            source.display()
-        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(StoreError::Disappeared {
+                action: Action::Retain,
+                path: source.to_path_buf(),
+            });
+        }
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect '{}'", source.display()));
+            return Err(StoreError::io("failed to inspect", &source)(error));
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "refusing to retain '{}': it is no longer a regular receipt",
-            source.display()
-        );
+        return Err(StoreError::NoLongerRegularReceipt {
+            action: Action::Retain,
+            path: source.to_path_buf(),
+        });
     }
 
     // The retained root may not exist yet (an initialized prefix from before
@@ -239,22 +244,22 @@ fn retain_receipt(
     ensure_directory(&package_dir, true)?;
     let parked = package_dir.join(format!("{version}.json"));
     match fs::symlink_metadata(&parked) {
-        Ok(_) => bail!(
-            "refusing to retain '{} {}': '{}' already exists; remove the stale retained record manually",
-            name,
-            version,
-            parked.display()
-        ),
+        Ok(_) => {
+            return Err(StoreError::RetainedRecordExists {
+                name: name.to_string(),
+                version: version.to_string(),
+                path: parked.to_path_buf(),
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect '{}'", parked.display()));
+            return Err(StoreError::io("failed to inspect", &parked)(error));
         }
     }
-    fs::rename(source, &parked).with_context(|| {
-        format!(
-            "failed to move the receipt of '{} {}' into the retained records",
-            name, version
-        )
+    fs::rename(source, &parked).map_err(|source| StoreError::RetainMove {
+        name: name.to_string(),
+        version: version.to_string(),
+        source,
     })?;
     sync_directory(&package_dir);
     sync_directory(&retained_dir(prefix));

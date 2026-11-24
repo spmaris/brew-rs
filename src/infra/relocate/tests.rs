@@ -34,7 +34,7 @@ fn rejected_relocation_never_publishes_the_keg_or_receipt() {
             needs_relocation: true,
         }],
     );
-    assert!(format!("{:#}", result.unwrap_err()).contains("opaque.dat"));
+    assert!(format!("{:#}", anyhow::Error::new(result.unwrap_err())).contains("opaque.dat"));
     assert!(store.installed().unwrap().is_empty());
     assert!(!prefix.join("Cellar/ripgrep").exists());
     drop(package);

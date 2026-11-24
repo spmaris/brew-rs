@@ -1,5 +1,6 @@
 use super::cache::verify_file_digest_bounded;
 use super::consts::BOTTLE_DIR_NAME;
+use super::error::UnsafeUrl;
 use super::stage::StagedBottle;
 use super::url::{is_allowed_redirect, is_ghcr_url, resolve_redirect};
 use super::*;
@@ -237,6 +238,7 @@ fn rejects_a_cached_bottle_above_the_size_limit() {
 
     let error = verify_file_digest_bounded(&path, DIGEST, FIXTURE.len() as u64 - 1)
         .expect_err("oversized bottle must be refused");
+    assert!(matches!(error, DownloadError::CachedBottleTooLarge { .. }));
     assert!(format!("{error:#}").contains("byte limit"));
     assert!(
         path.exists(),
@@ -299,6 +301,10 @@ fn fetch_rejects_bad_urls_before_touching_the_cache() {
         ))
         .expect_err("non-GHCR URL must be refused");
 
+    assert!(matches!(
+        error,
+        DownloadError::UnsafeUrl(UnsafeUrl::WrongOrigin { .. })
+    ));
     assert!(format!("{error:#}").contains("ghcr.io"));
     assert!(
         !temp.path().join(BOTTLE_DIR_NAME).exists(),
@@ -354,8 +360,38 @@ fn refuses_a_symlinked_cached_bottle() {
     symlink(&outside, &path).expect("symlink cache entry");
 
     assert!(
-        reuse_cached_bottle(&path, DIGEST).is_err(),
+        matches!(
+            reuse_cached_bottle(&path, DIGEST),
+            Err(DownloadError::CachedBottleSymlink { .. })
+        ),
         "a symlinked cached bottle must be refused, not followed"
     );
     assert!(outside.exists(), "the symlink target must be untouched");
+}
+
+#[test]
+fn checksum_mismatch_reports_expected_and_actual_digests() {
+    let temp = tempdir().expect("temporary directory");
+    let path = temp.path().join(format!("{DIGEST}{BOTTLE_SUFFIX}"));
+    fs::write(&path, b"corrupt").expect("write corrupt fixture");
+
+    let error = verify_file_digest(&path, DIGEST).expect_err("corrupt bottle must not verify");
+    let DownloadError::CachedChecksumMismatch {
+        path: reported,
+        expected,
+        actual,
+    } = &error
+    else {
+        panic!("expected a checksum mismatch, got {error:?}");
+    };
+    assert_eq!(reported, &path);
+    assert_eq!(expected, DIGEST);
+    assert_ne!(actual, DIGEST);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "SHA-256 mismatch for '{}': expected {DIGEST}, got {actual}",
+            path.display()
+        )
+    );
 }

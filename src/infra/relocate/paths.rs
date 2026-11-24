@@ -2,9 +2,11 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-
 use crate::infra::store::Receipt;
+
+mod error;
+
+pub(crate) use error::PathsError;
 
 const CELLAR: &str = "@@HOMEBREW_CELLAR@@/";
 const OPT: &str = "@@HOMEBREW_PREFIX@@/opt/";
@@ -27,18 +29,14 @@ pub(super) struct Paths<'a> {
 }
 
 impl<'a> Paths<'a> {
-    pub(super) fn new(prefix: &'a Path, receipt: &'a Receipt) -> Result<Self> {
-        let prefix = prefix
-            .to_str()
-            .context("Bottle relocation requires a UTF-8 prefix")?;
+    pub(super) fn new(prefix: &'a Path, receipt: &'a Receipt) -> Result<Self, PathsError> {
+        let prefix = prefix.to_str().ok_or(PathsError::PrefixNotUtf8)?;
         if !prefix.starts_with('/')
             || prefix[1..]
                 .split('/')
                 .any(|part| !safe_component(part, true))
         {
-            bail!(
-                "Bottle relocation requires a normalized absolute prefix with safe path characters"
-            );
+            return Err(PathsError::PrefixNotNormalized);
         }
         Ok(Self { prefix, receipt })
     }
@@ -48,22 +46,28 @@ impl<'a> Paths<'a> {
     }
 
     /// Parse an `@rpath/<member>` dependency reference into its normalized keg-relative suffix.
-    pub(super) fn rpath_member(path: &str) -> Result<Option<&str>> {
+    pub(super) fn rpath_member(path: &str) -> Result<Option<&str>, PathsError> {
         let Some(member) = path.strip_prefix("@rpath/") else {
             return Ok(None);
         };
         if member.is_empty() || !safe_relative(member) {
-            bail!("Unsafe @rpath library path {path:?}");
+            return Err(PathsError::UnsafeRpathLibrary {
+                path: path.to_owned(),
+            });
         }
         Ok(Some(member))
     }
 
     /// Resolve an `LC_RPATH` entry for a Mach-O image at keg-relative `image_rel`.
-    pub(super) fn rpath_path(&self, path: &str, image_rel: &Path) -> Result<RpathTarget> {
+    pub(super) fn rpath_path(
+        &self,
+        path: &str,
+        image_rel: &Path,
+    ) -> Result<RpathTarget, PathsError> {
         if path.starts_with(CELLAR) || path.starts_with(OPT) {
             let mapped = self
                 .keg_path(path)?
-                .context("Unsupported Cellar or opt LC_RPATH")?;
+                .ok_or(PathsError::UnsupportedCellarRpath)?;
             return Ok(RpathTarget::KegDir(mapped));
         }
         if path == "@loader_path" || path.starts_with("@loader_path/") {
@@ -82,15 +86,23 @@ impl<'a> Paths<'a> {
             if stack.len() == 1 && stack[0] == "lib" {
                 return Ok(RpathTarget::PrefixLib(format!("{}/lib", self.prefix)));
             }
-            bail!("Unsupported @loader_path LC_RPATH {path:?}");
+            return Err(PathsError::UnsupportedLoaderRpath {
+                path: path.to_owned(),
+            });
         }
-        bail!("Unsupported LC_RPATH {path:?}");
+        Err(PathsError::UnsupportedRpath {
+            path: path.to_owned(),
+        })
     }
 
     /// A path read from a supported `LC_ID_DYLIB` or dependent-dylib load
     /// command. Refuse `@rpath/` (handled by caller against `LC_RPATH`), other
     /// dyld variables, and arbitrary absolute paths.
-    pub(super) fn macho_path(&self, path: &str, image_rel: &Path) -> Result<Option<String>> {
+    pub(super) fn macho_path(
+        &self,
+        path: &str,
+        image_rel: &Path,
+    ) -> Result<Option<String>, PathsError> {
         if let Some(path) = path
             .strip_prefix("/usr/lib/")
             .or_else(|| path.strip_prefix("/System/Library/"))
@@ -98,7 +110,7 @@ impl<'a> Paths<'a> {
             if safe_relative(path) {
                 return Ok(None);
             }
-            bail!("Unsafe system library path in bottle");
+            return Err(PathsError::UnsafeSystemLibrary);
         }
         if path.starts_with("@loader_path/") {
             let stack = self.resolve_loader_path(path, image_rel)?;
@@ -109,24 +121,26 @@ impl<'a> Paths<'a> {
             {
                 return Ok(Some(format!("{}/{}", self.prefix, stack.join("/"))));
             }
-            bail!("Mach-O @loader_path {path:?} must resolve to a member inside the same keg");
+            return Err(PathsError::LoaderPathOutsideKeg {
+                path: path.to_owned(),
+            });
         }
         let destination = self.keg_path(path)?;
         if destination.is_none() {
-            bail!(
-                "Unsupported Mach-O path {path:?}: expected a pinned keg or macOS system library"
-            );
+            return Err(PathsError::UnsupportedMachoPath {
+                path: path.to_owned(),
+            });
         }
         Ok(destination)
     }
 
     /// Lexically resolve `@loader_path` or `@loader_path/<rel>` relative to
     /// `Cellar/<name>/<version>/<image_rel.parent()>`.
-    fn resolve_loader_path(&self, raw: &str, image_rel: &Path) -> Result<Vec<String>> {
+    fn resolve_loader_path(&self, raw: &str, image_rel: &Path) -> Result<Vec<String>, PathsError> {
         if !safe_component(&self.receipt.name, false)
             || !safe_component(&self.receipt.version, false)
         {
-            bail!("Invalid keg identity in relocation plan");
+            return Err(PathsError::InvalidKegIdentity);
         }
         let mut stack = vec![
             "Cellar".to_owned(),
@@ -136,16 +150,15 @@ impl<'a> Paths<'a> {
         if let Some(parent) = image_rel.parent() {
             for component in parent.components() {
                 let std::path::Component::Normal(part) = component else {
-                    bail!(
-                        "Unsupported relative path for Mach-O image {}",
-                        image_rel.display()
-                    );
+                    return Err(PathsError::UnsupportedImagePath {
+                        path: image_rel.to_path_buf(),
+                    });
                 };
-                let part = part
-                    .to_str()
-                    .context("Mach-O image path is not valid UTF-8")?;
+                let part = part.to_str().ok_or(PathsError::ImagePathNotUtf8)?;
                 if !safe_component(part, false) {
-                    bail!("Unsafe Mach-O image path component {part:?}");
+                    return Err(PathsError::UnsafeImageComponent {
+                        part: part.to_owned(),
+                    });
                 }
                 stack.push(part.to_owned());
             }
@@ -156,28 +169,37 @@ impl<'a> Paths<'a> {
         } else {
             Some(
                 raw.strip_prefix("@loader_path/")
-                    .context("Expected @loader_path prefix")?,
+                    .ok_or(PathsError::MissingLoaderPrefix)?,
             )
         };
         let mut seen_normal = false;
         if let Some(rest) = rest {
             for seg in rest.split('/') {
                 if seg.is_empty() {
-                    bail!("Empty path segment in @loader_path reference {raw:?}");
+                    return Err(PathsError::EmptyLoaderSegment {
+                        raw: raw.to_owned(),
+                    });
                 }
                 match seg {
                     "." => {}
                     ".." => {
                         if seen_normal {
-                            bail!("Unsafe '..' after normal component in {raw:?}");
+                            return Err(PathsError::LoaderParentAfterNormal {
+                                raw: raw.to_owned(),
+                            });
                         }
                         if stack.pop().is_none() {
-                            bail!("Mach-O @loader_path {raw:?} escapes the prefix");
+                            return Err(PathsError::LoaderEscapesPrefix {
+                                raw: raw.to_owned(),
+                            });
                         }
                     }
                     other => {
                         if !safe_component(other, false) {
-                            bail!("Unsafe component {other:?} in @loader_path {raw:?}");
+                            return Err(PathsError::UnsafeLoaderComponent {
+                                component: other.to_owned(),
+                                raw: raw.to_owned(),
+                            });
                         }
                         seen_normal = true;
                         stack.push(other.to_owned());
@@ -186,17 +208,19 @@ impl<'a> Paths<'a> {
             }
         }
         if stack.is_empty() {
-            bail!("Mach-O @loader_path {raw:?} resolves to the prefix root");
+            return Err(PathsError::LoaderResolvesToRoot {
+                raw: raw.to_owned(),
+            });
         }
         Ok(stack)
     }
 
     /// Map complete kegs or members (e.g. a `.pc` variable or load path).
-    pub(super) fn keg_path(&self, path: &str) -> Result<Option<String>> {
+    pub(super) fn keg_path(&self, path: &str) -> Result<Option<String>, PathsError> {
         let (name, original_version, suffix) = if let Some(rest) = path.strip_prefix(CELLAR) {
             let (name, rest) = rest
                 .split_once('/')
-                .context("Missing version in Cellar path")?;
+                .ok_or(PathsError::MissingCellarVersion)?;
             let (version, suffix) = split_member(rest)?;
             (name, Some(version), suffix)
         } else if let Some(rest) = path.strip_prefix(OPT) {
@@ -213,15 +237,21 @@ impl<'a> Paths<'a> {
                 .iter()
                 .find(|dependency| dependency.name == name)
                 .map(|dependency| dependency.version.as_str())
-                .with_context(|| format!("Bottle references undeclared keg {name:?}"))?
+                .ok_or_else(|| PathsError::UndeclaredKeg {
+                    name: name.to_owned(),
+                })?
         };
         if !safe_component(name, false) || !safe_component(version, false) {
-            bail!("Invalid keg identity in relocation plan");
+            return Err(PathsError::InvalidKegIdentity);
         }
         if let Some(original) = original_version
             && original != version
         {
-            bail!("Bottle requires {name} {original:?}, but the transaction pins {version:?}");
+            return Err(PathsError::VersionMismatch {
+                name: name.to_owned(),
+                original: original.to_owned(),
+                pinned: version.to_owned(),
+            });
         }
         if let Some(suffix) = suffix {
             return Ok(Some(format!(
@@ -233,10 +263,10 @@ impl<'a> Paths<'a> {
     }
 }
 
-fn split_member(path: &str) -> Result<(&str, Option<&str>)> {
+fn split_member(path: &str) -> Result<(&str, Option<&str>), PathsError> {
     match path.split_once('/') {
         Some((head, suffix)) if safe_relative(suffix) => Ok((head, Some(suffix))),
-        Some(_) => bail!("Unsafe keg member path in bottle"),
+        Some(_) => Err(PathsError::UnsafeKegMember),
         None => Ok((path, None)),
     }
 }

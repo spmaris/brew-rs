@@ -1,6 +1,6 @@
 //! The audited `bin/pcre2-config` handler.
 
-use anyhow::{Context, Result, bail};
+use super::error::TextError;
 
 use super::super::paths::Paths;
 use super::mapping::{
@@ -94,12 +94,12 @@ const UNSAFE_ECHOES: &[&str] = &[
 ];
 
 /// Rewrite the upstream pcre2-config script without touching unknown lines.
-pub(super) fn rewrite_pcre2_config(text: &str, paths: &Paths<'_>) -> Result<String> {
+pub(super) fn rewrite_pcre2_config(text: &str, paths: &Paths<'_>) -> Result<String, TextError> {
     if !text.starts_with("#!/bin/sh\n") {
-        bail!("pcre2-config must start with the upstream #!/bin/sh line");
+        return Err(TextError::Pcre2MissingShebang);
     }
     if !text.is_ascii() {
-        bail!("pcre2-config contains non-ASCII bytes");
+        return Err(TextError::Pcre2NonAscii);
     }
 
     let mut out = String::with_capacity(text.len() + 256);
@@ -118,10 +118,14 @@ pub(super) fn rewrite_pcre2_config(text: &str, paths: &Paths<'_>) -> Result<Stri
             out.push_str(replacement);
         } else {
             if UNSAFE_TESTS.iter().any(|needle| line.contains(needle)) {
-                bail!("Unsupported pcre2-config test line {line:?}");
+                return Err(TextError::Pcre2UnsupportedTestLine {
+                    line: line.to_owned(),
+                });
             }
             if UNSAFE_ECHOES.iter().any(|needle| line.contains(needle)) {
-                bail!("Unsupported pcre2-config echo line {line:?}");
+                return Err(TextError::Pcre2UnsupportedEchoLine {
+                    line: line.to_owned(),
+                });
             }
             out.push_str(line);
         }
@@ -129,7 +133,7 @@ pub(super) fn rewrite_pcre2_config(text: &str, paths: &Paths<'_>) -> Result<Stri
 
     state.validate()?;
     if out.contains("/opt/homebrew/") {
-        bail!("pcre2-config still contains a fixed /opt/homebrew path");
+        return Err(TextError::Pcre2FixedPathRemains);
     }
     Ok(out)
 }
@@ -139,14 +143,16 @@ fn rewrite_config_marker_line(
     line: &str,
     paths: &Paths<'_>,
     state: &mut ConfigState,
-) -> Result<String> {
+) -> Result<String, TextError> {
     let body = line
         .strip_suffix('\n')
-        .context("pcre2-config line does not end with a newline")?;
+        .ok_or(TextError::Pcre2MissingNewline)?;
 
     if let Some(value) = body.strip_prefix("prefix=") {
         if state.prefix_assignment {
-            bail!("duplicate pcre2-config prefix assignment");
+            return Err(TextError::Pcre2Duplicate {
+                what: "prefix assignment",
+            });
         }
         let mapped = map_complete_keg_root(paths, value)?;
         state.prefix_assignment = true;
@@ -158,7 +164,9 @@ fn rewrite_config_marker_line(
         .and_then(|value| value.strip_suffix("\" in"))
     {
         if state.case_word {
-            bail!("duplicate pcre2-config libS case word");
+            return Err(TextError::Pcre2Duplicate {
+                what: "libS case word",
+            });
         }
         let mapped = map_keg(
             paths,
@@ -173,7 +181,9 @@ fn rewrite_config_marker_line(
         .and_then(|value| value.strip_suffix('"'))
     {
         if state.libs_assignment {
-            bail!("duplicate pcre2-config libS assignment");
+            return Err(TextError::Pcre2Duplicate {
+                what: "libS assignment",
+            });
         }
         let mapped = map_keg(
             paths,
@@ -183,7 +193,9 @@ fn rewrite_config_marker_line(
         return Ok(format!("  libS={}\n", shell_quote(&format!("-L{mapped}"))?));
     }
 
-    bail!("Unsupported Homebrew placeholder in pcre2-config line {body:?}");
+    Err(TextError::Pcre2UnsupportedMarkerLine {
+        body: body.to_owned(),
+    })
 }
 
 /// The two fixed `libR` lines pcre2-config is allowed to contain.
@@ -191,17 +203,19 @@ fn rewrite_config_fixed_line(
     line: &str,
     paths: &Paths<'_>,
     state: &mut ConfigState,
-) -> Result<String> {
+) -> Result<String, TextError> {
     let body = line
         .strip_suffix('\n')
-        .context("pcre2-config line does not end with a newline")?;
+        .ok_or(TextError::Pcre2MissingNewline)?;
 
     if let Some(value) = body
         .strip_prefix("  libR=\" -R")
         .and_then(|value| value.strip_suffix('"'))
     {
         if state.sunos_lib_r {
-            bail!("duplicate pcre2-config *SunOS* libR assignment");
+            return Err(TextError::Pcre2Duplicate {
+                what: "*SunOS* libR assignment",
+            });
         }
         let mapped = map_fixed_cellar(paths, value)?;
         state.sunos_lib_r = true;
@@ -216,7 +230,9 @@ fn rewrite_config_fixed_line(
         .and_then(|value| value.strip_suffix('"'))
     {
         if state.bsd_lib_r {
-            bail!("duplicate pcre2-config *BSD* libR assignment");
+            return Err(TextError::Pcre2Duplicate {
+                what: "*BSD* libR assignment",
+            });
         }
         let mapped = map_fixed_cellar(paths, value)?;
         state.bsd_lib_r = true;
@@ -226,7 +242,9 @@ fn rewrite_config_fixed_line(
         ));
     }
 
-    bail!("Unsupported fixed /opt/homebrew path in pcre2-config line {body:?}");
+    Err(TextError::Pcre2UnsupportedFixedLine {
+        body: body.to_owned(),
+    })
 }
 
 /// Match one audited upstream `test ${prefix}/include` line.
@@ -263,7 +281,7 @@ struct ConfigState {
 }
 
 impl ConfigState {
-    fn mark_echo(&mut self, kind: EchoKind) -> Result<()> {
+    fn mark_echo(&mut self, kind: EchoKind) -> Result<(), TextError> {
         let slot = match kind {
             EchoKind::Prefix => &mut self.prefix_echo,
             EchoKind::ExecPrefix => &mut self.exec_prefix_echo,
@@ -275,39 +293,55 @@ impl ConfigState {
             EchoKind::Libs32 => &mut self.libs32_echo,
         };
         if *slot {
-            bail!("duplicate pcre2-config echo line");
+            return Err(TextError::Pcre2Duplicate { what: "echo line" });
         }
         *slot = true;
         Ok(())
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<(), TextError> {
         if !self.prefix_assignment {
-            bail!("pcre2-config is missing its pinned prefix assignment");
+            return Err(TextError::Pcre2Missing {
+                what: "pinned prefix assignment",
+            });
         }
         if !self.case_word {
-            bail!("pcre2-config is missing its libS case word");
+            return Err(TextError::Pcre2Missing {
+                what: "libS case word",
+            });
         }
         if !self.libs_assignment {
-            bail!("pcre2-config is missing its libS assignment");
+            return Err(TextError::Pcre2Missing {
+                what: "libS assignment",
+            });
         }
         if !self.prefix_echo {
-            bail!("pcre2-config is missing its --prefix echo");
+            return Err(TextError::Pcre2Missing {
+                what: "--prefix echo",
+            });
         }
         if !self.exec_prefix_echo {
-            bail!("pcre2-config is missing its --exec-prefix echo");
+            return Err(TextError::Pcre2Missing {
+                what: "--exec-prefix echo",
+            });
         }
         if !self.cflags_test {
-            bail!("pcre2-config is missing its --cflags test");
+            return Err(TextError::Pcre2Missing {
+                what: "--cflags test",
+            });
         }
         if !self.cflags_echo {
-            bail!("pcre2-config is missing its --cflags echo");
+            return Err(TextError::Pcre2Missing {
+                what: "--cflags echo",
+            });
         }
         if !self.libs8_echo {
-            bail!("pcre2-config is missing its --libs8 echo");
+            return Err(TextError::Pcre2Missing {
+                what: "--libs8 echo",
+            });
         }
         if self.sunos_lib_r != self.bsd_lib_r {
-            bail!("pcre2-config has only one of its two fixed-prefix libR branches");
+            return Err(TextError::Pcre2LibRBranches);
         }
         Ok(())
     }

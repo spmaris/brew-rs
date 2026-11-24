@@ -202,7 +202,9 @@ fn failure(relative: &str, input: &[u8], receipt: &Receipt) -> String {
     let paths = Paths::new(Path::new(SPACE_PREFIX), receipt).unwrap();
     format!(
         "{:#}",
-        rewrite(Path::new(relative), input, &paths).expect_err("fixture must be rejected")
+        anyhow::Error::new(
+            rewrite(Path::new(relative), input, &paths).expect_err("fixture must be rejected")
+        )
     )
 }
 

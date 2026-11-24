@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Result;
 use std::cell::Cell;
 
 use tempfile::tempdir;
@@ -33,7 +34,8 @@ fn age_file(path: &Path, age: Duration) -> Result<()> {
 
 fn write_example(path: &Path, names: &[&str]) -> Result<()> {
     let items: Vec<Formula> = names.iter().map(|name| formula(name)).collect();
-    write_atomic(path, &items)
+    write_atomic(path, &items)?;
+    Ok(())
 }
 
 fn read_names(path: &Path) -> Result<Vec<String>> {
@@ -59,7 +61,7 @@ async fn fresh_cache_is_used_without_fetching() -> Result<()> {
     let calls = Cell::new(0);
     let catalog = load_catalog(&path, CachePolicy::PreferFresh, || {
         calls.set(calls.get() + 1);
-        async { Err::<Vec<Formula>, _>(anyhow::anyhow!("network must not be used")) }
+        async { Err::<Vec<Formula>, _>(ApiError::ResponseTooLarge) }
     })
     .await?;
 
@@ -95,7 +97,7 @@ async fn expired_cache_is_used_when_the_network_fails() -> Result<()> {
     age_file(&path, Duration::from_secs(25 * 3600))?;
 
     let catalog = load_catalog(&path, CachePolicy::PreferFresh, || async {
-        Err::<Vec<Formula>, _>(anyhow::anyhow!("network down"))
+        Err::<Vec<Formula>, _>(ApiError::ResponseTooLarge)
     })
     .await?;
 
@@ -149,6 +151,7 @@ async fn offline_without_cache_is_an_error() -> Result<()> {
     .await
     .unwrap_err();
 
+    assert!(matches!(error, ApiError::NoCachedCatalog { .. }));
     assert!(error.to_string().contains("--offline"));
     Ok(())
 }
@@ -289,6 +292,7 @@ async fn clean_refuses_a_symlinked_catalogs_directory() -> Result<()> {
     std::os::unix::fs::symlink(outside.path(), &link)?;
 
     let error = clean_catalogs(&config, true).await.unwrap_err();
+    assert!(matches!(error, ApiError::CacheDirSymlink { .. }));
     assert!(error.to_string().contains("symlinked"));
     Ok(())
 }
