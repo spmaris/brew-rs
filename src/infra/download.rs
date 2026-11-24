@@ -22,6 +22,7 @@ mod url;
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::domain::progress::DownloadProgress;
 
 pub(super) use cache::{ensure_isolated_cache_dir, reuse_cached_bottle, verify_file_digest};
 pub(crate) use error::DownloadError;
@@ -32,6 +33,29 @@ use cache::bottle_cache_dir;
 use consts::BOTTLE_SUFFIX;
 use request::{build_client, request_bottle};
 use url::parse_bottle_url;
+
+/// A verified payload on disk and where it came from.
+#[derive(Debug)]
+pub(crate) struct Fetched {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) cached: bool,
+}
+
+/// Size of a verified cache entry.
+pub(super) fn cached_fetch(path: PathBuf) -> Result<Fetched, DownloadError> {
+    let bytes = std::fs::metadata(&path)
+        .map_err(|source| DownloadError::InspectCachedBottle {
+            path: path.clone(),
+            source,
+        })?
+        .len();
+    Ok(Fetched {
+        path,
+        bytes,
+        cached: true,
+    })
+}
 
 /// Fetch an official Homebrew bottle into the native bottle cache.
 ///
@@ -45,7 +69,15 @@ use url::parse_bottle_url;
 /// URL with no credentials, port, query, fragment, percent-encoding, or path
 /// traversal segments, and `sha256` must be exactly 64 lowercase hexadecimal
 /// characters equal to the digest embedded in `url`.
-pub async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf, DownloadError> {
+///
+/// `progress` sees `start`/`advance`/`finish` only for a real download, never
+/// for a cache hit.
+pub(crate) async fn fetch(
+    config: &Config,
+    url: &str,
+    sha256: &str,
+    progress: &dyn DownloadProgress,
+) -> Result<Fetched, DownloadError> {
     let source = parse_bottle_url(url, sha256)?;
     let directory = bottle_cache_dir(config)?;
     let destination = directory.join(format!("{}{BOTTLE_SUFFIX}", source.digest));
@@ -53,13 +85,25 @@ pub async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf, 
     // Validate the cache entry before creating a client so a verified file can
     // be served entirely offline.
     if let Some(cached) = reuse_cached_bottle(&destination, &source.digest)? {
-        return Ok(cached);
+        return cached_fetch(cached);
     }
 
     let client = build_client(config)?;
     let response = request_bottle(&client, &source, config).await?;
-    stage_bottle(&directory, &destination, &source.digest, response, config).await?;
-    Ok(destination)
+    let bytes = stage_bottle(
+        &directory,
+        &destination,
+        &source.digest,
+        response,
+        config,
+        progress,
+    )
+    .await?;
+    Ok(Fetched {
+        path: destination,
+        bytes,
+        cached: false,
+    })
 }
 
 #[cfg(test)]

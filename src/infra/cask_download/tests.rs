@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::progress::NoProgress;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -55,16 +56,28 @@ fn fetch_serves_verified_cache_hit_offline_and_rejects_bad_cache() {
         .build()
         .expect("runtime");
     let hit = rt
-        .block_on(fetch(&config, "https://example.com/app.dmg", DIGEST))
+        .block_on(fetch(
+            &config,
+            "https://example.com/app.dmg",
+            DIGEST,
+            &NoProgress,
+        ))
         .expect("cache hit");
-    assert_eq!(hit, path);
+    assert_eq!(hit.path, path);
+    assert!(hit.cached);
+    assert_eq!(hit.bytes, FIXTURE.len() as u64);
 
     // Corrupt cached regular file should fail offline verification when removed,
     // and reject unsafe URLs before touching cache.
     let bad_digest = "b".repeat(64);
     assert!(
-        rt.block_on(fetch(&config, "http://example.com/app.dmg", &bad_digest))
-            .is_err()
+        rt.block_on(fetch(
+            &config,
+            "http://example.com/app.dmg",
+            &bad_digest,
+            &NoProgress,
+        ))
+        .is_err()
     );
 }
 
@@ -89,6 +102,7 @@ fn fetch_refuses_symlinked_cache_dir_or_entry() {
             &test_config(&cache),
             "https://example.com/app.dmg",
             DIGEST,
+            &NoProgress,
         ))
         .unwrap_err();
     assert!(format!("{err:#}").contains("symlink"));
@@ -108,6 +122,7 @@ fn fetch_refuses_symlinked_cache_dir_or_entry() {
             &test_config(&real_cache),
             "https://example.com/app.dmg",
             DIGEST,
+            &NoProgress,
         ))
         .unwrap_err();
     assert!(format!("{err:#}").contains("symlink"));

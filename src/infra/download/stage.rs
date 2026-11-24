@@ -8,6 +8,7 @@ use reqwest::Response;
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::domain::progress::DownloadProgress;
 
 use super::consts::MAX_BOTTLE_BYTES;
 use super::error::DownloadError;
@@ -20,13 +21,15 @@ pub(crate) async fn stage_bottle(
     digest: &str,
     response: Response,
     config: &Config,
-) -> Result<(), DownloadError> {
+    progress: &dyn DownloadProgress,
+) -> Result<u64, DownloadError> {
     if let Some(length) = response.content_length()
         && length > MAX_BOTTLE_BYTES
     {
         return Err(DownloadError::BottleTooLarge);
     }
     ensure_destination_is_not_symlink(destination)?;
+    progress.start(response.content_length());
 
     let mut staged = StagedBottle::create(directory, digest)?;
     let mut hasher = Sha256::new();
@@ -51,6 +54,7 @@ pub(crate) async fn stage_bottle(
         staged
             .write_all(&chunk)
             .map_err(DownloadError::WriteStaged)?;
+        progress.advance(chunk.len() as u64);
     }
 
     if total == 0 {
@@ -66,7 +70,8 @@ pub(crate) async fn stage_bottle(
 
     staged.commit(destination)?;
     sync_directory(directory);
-    Ok(())
+    progress.finish();
+    Ok(total)
 }
 
 /// A uniquely named staging file that removes itself unless committed.

@@ -7,12 +7,11 @@
 //! connecting. Payloads are hashed while streaming and only promoted into the
 //! cache on an exact SHA-256 match.
 
-use std::path::PathBuf;
-
 use reqwest::header::LOCATION;
 use reqwest::{Client, Response, StatusCode, Url};
 
 use crate::config::Config;
+use crate::domain::progress::DownloadProgress;
 use crate::domain::validate::{
     is_lower_hex_digest, validate_cask_url, validate_cask_url_with_limit,
 };
@@ -22,8 +21,8 @@ mod error;
 
 pub(crate) use self::error::CaskDownloadError;
 use super::download::{
-    build_verified_client, ensure_isolated_cache_dir, request_timeout, reuse_cached_bottle,
-    stage_bottle,
+    Fetched, build_verified_client, cached_fetch, ensure_isolated_cache_dir, request_timeout,
+    reuse_cached_bottle, stage_bottle,
 };
 
 /// File extension used for verified cached cask payloads.
@@ -43,7 +42,8 @@ pub(crate) async fn fetch(
     config: &Config,
     url: &str,
     sha256: &str,
-) -> Result<PathBuf, CaskDownloadError> {
+    progress: &dyn DownloadProgress,
+) -> Result<Fetched, CaskDownloadError> {
     if !is_lower_hex_digest(sha256) {
         return Err(CaskDownloadError::BadDigest);
     }
@@ -52,13 +52,17 @@ pub(crate) async fn fetch(
     let destination = directory.join(format!("{sha256}{CASK_CACHE_SUFFIX}"));
 
     if let Some(cached) = reuse_cached_bottle(&destination, sha256)? {
-        return Ok(cached);
+        return Ok(cached_fetch(cached)?);
     }
 
     let client = build_verified_client(config, "cask")?;
     let response = request_cask_payload(&client, initial, config).await?;
-    stage_bottle(&directory, &destination, sha256, response, config).await?;
-    Ok(destination)
+    let bytes = stage_bottle(&directory, &destination, sha256, response, config, progress).await?;
+    Ok(Fetched {
+        path: destination,
+        bytes,
+        cached: false,
+    })
 }
 
 async fn request_cask_payload(

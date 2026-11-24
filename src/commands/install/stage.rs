@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::domain::plan::{PackageSource, PlannedFormula};
+use crate::domain::progress::DownloadProgress;
+use crate::infra::download::Fetched;
 use crate::infra::store::{Dependency, Prepared, Receipt, Store};
 use crate::infra::{archive, download, portable_fetch};
 
@@ -14,12 +16,13 @@ use super::shellenv::posix_quote;
 pub(in crate::commands) async fn fetch_formula(
     config: &Config,
     formula: &PlannedFormula,
-) -> Result<PathBuf> {
+    progress: &dyn DownloadProgress,
+) -> Result<Fetched> {
     let download = match formula.source {
-        PackageSource::Upstream => portable_fetch::fetch(config, formula)
+        PackageSource::Upstream => portable_fetch::fetch(config, formula, progress)
             .await
             .map_err(anyhow::Error::from),
-        PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256)
+        PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256, progress)
             .await
             .map_err(anyhow::Error::from),
     };

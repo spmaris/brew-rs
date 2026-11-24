@@ -20,7 +20,7 @@ use super::remove::removal_plan;
 use super::sources::validate_sources;
 use super::stage::{Candidate, fetch_formula, receipt_for, stage_formula};
 use super::{confirm, prefix_path};
-use crate::ui::text::short_digest;
+use crate::ui::text::{downloaded_text, short_digest};
 
 /// One planned upgrade: the installed receipt, its replacement receipt, and the
 /// planned formula that supplies the replacement bottle.
@@ -113,10 +113,16 @@ pub(crate) async fn upgrade(
         let name = change.formula.name.clone();
         let version = change.formula.version.clone();
         let step = steps.start(&format!("Downloading {name} {version}"));
-        let bottle = match fetch_formula(config, &change.formula).await {
-            Ok(bottle) => {
-                step.done(&format!("Downloaded {name} {version} (checksum verified)"));
-                bottle
+        let progress = step.download_progress(&name);
+        let bottle = match fetch_formula(config, &change.formula, &progress).await {
+            Ok(fetched) => {
+                step.done(&downloaded_text(
+                    &name,
+                    &version,
+                    fetched.bytes,
+                    fetched.cached,
+                ));
+                fetched.path
             }
             Err(error) => {
                 step.fail();

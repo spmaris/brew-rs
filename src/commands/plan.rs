@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use super::install;
 use crate::domain::plan::{self, Memoized, PackageSource, PlannedFormula, ResolveError};
+use crate::domain::progress::NoProgress;
 use crate::infra::api::catalog_cache;
 use crate::infra::formula_source::HttpFormulaSource;
 use crate::infra::hint_probe::SystemHintProbe;
@@ -112,7 +113,9 @@ pub async fn run(
 
     io::stdout().flush()?;
     for (index, package) in plan.iter().enumerate() {
-        let path = install::fetch_formula(config, package).await?;
+        let path = install::fetch_formula(config, package, &NoProgress)
+            .await?
+            .path;
         if log::log_enabled!(log::Level::Info) {
             log::info!("Verified bottle: {}", path.display());
         }

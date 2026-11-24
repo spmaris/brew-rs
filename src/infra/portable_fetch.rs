@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::plan::PlannedFormula;
 use crate::domain::portable::{PortableError, artifact_for};
+use crate::domain::progress::DownloadProgress;
 use crate::infra::archive::ArchiveError;
 use crate::infra::cask_download::CaskDownloadError;
+use crate::infra::download::Fetched;
 use crate::infra::tap_artifact::TapArtifactError;
 use crate::infra::{archive, cask_download, tap_artifact};
 
@@ -52,9 +54,10 @@ impl PortableFetchError {
 pub(crate) async fn fetch(
     config: &crate::config::Config,
     formula: &PlannedFormula,
-) -> Result<PathBuf, PortableFetchError> {
+    progress: &dyn DownloadProgress,
+) -> Result<Fetched, PortableFetchError> {
     let (_, _, artifact) = artifact_for(formula)?;
-    Ok(cask_download::fetch(config, &artifact.url, &artifact.sha256).await?)
+    Ok(cask_download::fetch(config, &artifact.url, &artifact.sha256, progress).await?)
 }
 
 pub(crate) fn stage(

@@ -13,6 +13,7 @@ use crate::infra::platform::default_target;
 use crate::infra::store::{Store, reject_protected_prefix};
 use crate::infra::{cask_download, cask_store};
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::text::downloaded_text;
 use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::labels::commit_labels;
@@ -163,13 +164,16 @@ pub(crate) async fn install(
     let mut downloaded = Vec::with_capacity(pending.len());
     for cask in &pending {
         let step = steps.start(&format!("Downloading {} {}", cask.token, cask.version));
-        match cask_download::fetch(config, &cask.url, &cask.sha256).await {
-            Ok(path) => {
-                step.done(&format!(
-                    "Downloaded {} {} (checksum verified)",
-                    cask.token, cask.version
+        let progress = step.download_progress(&cask.token);
+        match cask_download::fetch(config, &cask.url, &cask.sha256, &progress).await {
+            Ok(fetched) => {
+                step.done(&downloaded_text(
+                    &cask.token,
+                    &cask.version,
+                    fetched.bytes,
+                    fetched.cached,
                 ));
-                downloaded.push((cask, path));
+                downloaded.push((cask, fetched.path));
             }
             Err(error) => {
                 step.fail();

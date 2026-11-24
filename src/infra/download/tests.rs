@@ -4,9 +4,72 @@ use super::error::UnsafeUrl;
 use super::stage::StagedBottle;
 use super::url::{is_allowed_redirect, is_ghcr_url, resolve_redirect};
 use super::*;
+use crate::domain::progress::{DownloadProgress, NoProgress};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use tempfile::tempdir;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Event {
+    Start(Option<u64>),
+    Advance(u64),
+    Finish,
+}
+
+#[derive(Default)]
+struct RecordingProgress(Mutex<Vec<Event>>);
+
+impl RecordingProgress {
+    fn record(&self, event: Event) {
+        self.0.lock().expect("progress log").push(event);
+    }
+
+    fn events(&self) -> Vec<Event> {
+        std::mem::take(&mut *self.0.lock().expect("progress log"))
+    }
+}
+
+impl DownloadProgress for RecordingProgress {
+    fn start(&self, total: Option<u64>) {
+        self.record(Event::Start(total));
+    }
+    fn advance(&self, bytes: u64) {
+        self.record(Event::Advance(bytes));
+    }
+    fn finish(&self) {
+        self.record(Event::Finish);
+    }
+}
+
+/// Serve `body` once over plain HTTP and return a response for it.
+async fn local_response(body: &'static [u8]) -> reqwest::Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.expect("head");
+        // Two writes so the client sees more than one chunk.
+        let (first, second) = body.split_at(body.len() / 2);
+        socket.write_all(first).await.expect("first half");
+        socket.flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        socket.write_all(second).await.expect("second half");
+    });
+    reqwest::get(format!("http://{address}/"))
+        .await
+        .expect("local response")
+}
 
 /// SHA-256 of `FIXTURE`.
 const DIGEST: &str = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
@@ -298,6 +361,7 @@ fn fetch_rejects_bad_urls_before_touching_the_cache() {
             &config,
             "https://example.com/v2/homebrew/core/wget/blobs/sha256/x",
             DIGEST,
+            &NoProgress,
         ))
         .expect_err("non-GHCR URL must be refused");
 
@@ -320,14 +384,21 @@ fn fetch_serves_a_verified_cache_hit_offline() {
     let path = directory.join(format!("{DIGEST}{BOTTLE_SUFFIX}"));
     fs::write(&path, FIXTURE).expect("write fixture");
 
+    let progress = RecordingProgress::default();
     let fetched = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime")
-        .block_on(fetch(&config, &bottle_url(DIGEST), DIGEST))
+        .block_on(fetch(&config, &bottle_url(DIGEST), DIGEST, &progress))
         .expect("cache hit");
 
-    assert_eq!(fetched, path);
+    assert_eq!(fetched.path, path);
+    assert!(fetched.cached);
+    assert_eq!(fetched.bytes, FIXTURE.len() as u64);
+    assert!(
+        progress.events().is_empty(),
+        "a cache hit must not report progress"
+    );
 }
 
 #[cfg(unix)]
@@ -394,4 +465,60 @@ fn checksum_mismatch_reports_expected_and_actual_digests() {
             path.display()
         )
     );
+}
+
+#[tokio::test]
+async fn stage_reports_start_advance_and_one_finish() {
+    let temp = tempdir().expect("temporary directory");
+    let destination = temp.path().join(format!("{DIGEST}{BOTTLE_SUFFIX}"));
+    let progress = RecordingProgress::default();
+
+    let bytes = stage_bottle(
+        temp.path(),
+        &destination,
+        DIGEST,
+        local_response(FIXTURE).await,
+        &Config::default(),
+        &progress,
+    )
+    .await
+    .expect("stage bottle");
+
+    assert_eq!(bytes, FIXTURE.len() as u64);
+    let events = progress.events();
+    assert_eq!(
+        events.first(),
+        Some(&Event::Start(Some(FIXTURE.len() as u64)))
+    );
+    assert_eq!(events.last(), Some(&Event::Finish));
+    assert_eq!(events.iter().filter(|e| **e == Event::Finish).count(), 1);
+    let advanced: u64 = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Advance(bytes) => Some(*bytes),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(advanced, FIXTURE.len() as u64);
+}
+
+#[tokio::test]
+async fn stage_does_not_finish_when_the_checksum_fails() {
+    let temp = tempdir().expect("temporary directory");
+    let destination = temp.path().join(format!("{DIGEST}{BOTTLE_SUFFIX}"));
+    let progress = RecordingProgress::default();
+
+    let error = stage_bottle(
+        temp.path(),
+        &destination,
+        &"b".repeat(64),
+        local_response(FIXTURE).await,
+        &Config::default(),
+        &progress,
+    )
+    .await
+    .expect_err("wrong digest");
+
+    assert!(matches!(error, DownloadError::ChecksumMismatch { .. }));
+    assert!(!progress.events().contains(&Event::Finish));
 }

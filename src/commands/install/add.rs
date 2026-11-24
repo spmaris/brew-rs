@@ -10,6 +10,7 @@ use crate::infra::platform::default_target;
 use crate::infra::relocate;
 use crate::infra::store::{Receipt, Store, reject_protected_prefix};
 use crate::ui::table::{Row, Section, display_path};
+use crate::ui::text::downloaded_text;
 use crate::ui::{DnfStyleFormatter, phrases};
 
 use super::format::{
@@ -211,13 +212,16 @@ pub(crate) async fn install(
     for candidate in pending {
         let formula = candidate.formula;
         let step = steps.start(&format!("Downloading {} {}", formula.name, formula.version));
-        match fetch_formula(config, formula).await {
-            Ok(bottle) => {
-                step.done(&format!(
-                    "Downloaded {} {} (checksum verified)",
-                    formula.name, formula.version
+        let progress = step.download_progress(&formula.name);
+        match fetch_formula(config, formula, &progress).await {
+            Ok(fetched) => {
+                step.done(&downloaded_text(
+                    &formula.name,
+                    &formula.version,
+                    fetched.bytes,
+                    fetched.cached,
                 ));
-                downloaded.push((candidate, bottle));
+                downloaded.push((candidate, fetched.path));
             }
             Err(error) => {
                 step.fail();

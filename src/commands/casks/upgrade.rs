@@ -19,7 +19,7 @@ use crate::ui::{DnfStyleFormatter, phrases};
 use super::add::resolve;
 use super::labels::replace_labels;
 use super::stage::{preview_receipt_for, stage_cask};
-use crate::ui::text::short_digest;
+use crate::ui::text::{downloaded_text, short_digest};
 
 pub(crate) async fn upgrade(
     config: &Config,
@@ -87,13 +87,16 @@ pub(crate) async fn upgrade(
             "Downloading {} {}",
             planned.token, planned.version
         ));
-        match cask_download::fetch(config, &planned.url, &planned.sha256).await {
-            Ok(download_path) => {
-                step.done(&format!(
-                    "Downloaded {} {} (checksum verified)",
-                    planned.token, planned.version
+        let progress = step.download_progress(&planned.token);
+        match cask_download::fetch(config, &planned.url, &planned.sha256, &progress).await {
+            Ok(fetched) => {
+                step.done(&downloaded_text(
+                    &planned.token,
+                    &planned.version,
+                    fetched.bytes,
+                    fetched.cached,
                 ));
-                downloaded.push((change, download_path));
+                downloaded.push((change, fetched.path));
             }
             Err(error) => {
                 step.fail();

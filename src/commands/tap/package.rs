@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::commands::install::{confirm, prefix_path};
 use crate::config::Config;
+use crate::domain::progress::NoProgress;
 use crate::domain::tap_manifest::{TapReceipt, parse_qualified};
 use crate::infra::store::{InstallLock, Store, reject_protected_prefix, stages_dir};
 use crate::infra::tap_artifact::stage_verified;
@@ -76,15 +77,20 @@ pub(crate) async fn install(
         return Ok(());
     }
 
-    let cached =
-        crate::infra::cask_download::fetch(config, &plan.artifact_url, &plan.artifact_sha256)
-            .await
-            .with_context(|| {
-                format!(
-                    "Could not fetch the pinned artifact for '{}' from {}",
-                    plan.qualified, plan.artifact_url
-                )
-            })?;
+    let cached = crate::infra::cask_download::fetch(
+        config,
+        &plan.artifact_url,
+        &plan.artifact_sha256,
+        &NoProgress,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Could not fetch the pinned artifact for '{}' from {}",
+            plan.qualified, plan.artifact_url
+        )
+    })?
+    .path;
 
     let _lock = InstallLock::acquire(&path)?;
     let store = Store::open_existing(&path)?;
