@@ -4,11 +4,20 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (for example, v0.1.0)
+        required: true
+        type: string
 
 permissions: {}
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -20,15 +29,19 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: '1.97.1'
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: Verify release tag and runner
         shell: bash
         run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Expected a version tag such as v0.1.0.' >&2
+            exit 1
+          fi
           test "$(uname -m)" = arm64
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
@@ -41,8 +54,8 @@ jobs:
       - name: Package and verify executable
         shell: bash
         run: |
-          asset="brewrs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
-          expected="brewrs ${GITHUB_REF_NAME#v}"
+          asset="brewrs-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
+          expected="brewrs ${RELEASE_TAG#v}"
           test "$(target/release/brewrs --version)" = "$expected"
           /usr/bin/codesign --verify target/release/brewrs
           mkdir -p target/release-assets
@@ -83,7 +96,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          asset="brewrs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+          asset="brewrs-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
           sha256sum -c "$asset.sha256"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "brewrs $GITHUB_REF_NAME" \
-            --generate-notes "$asset" "$asset.sha256"
+          if [[ "$RELEASE_TAG" == v0.1.0 ]]; then
+            notes=$(printf '%s\n' \
+              'First release of brewrs, a native Rust package manager for macOS. No Homebrew installation required.' \
+              '' \
+              '- Install supported formulae, casks, and declarative tap packages into a separate prefix, with SHA-256 verification.' \
+              '- Preview changes, preserve pinned dependencies during upgrades, and audit an existing Homebrew install.' \
+              '- Download includes the Apple Silicon CLI and MIT license; the SHA-256 checksum is a separate asset.')
+            release_notes=(--notes "$notes")
+          else
+            release_notes=(--generate-notes)
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --title "brewrs $RELEASE_TAG" \
+            "${release_notes[@]}" "$asset" "$asset.sha256"
