@@ -202,7 +202,7 @@ fn tap_add_list_plan_and_untap_are_offline_and_read_only() {
     assert_success(&add);
     assert!(sandbox.tap_dir().join("tap.json").is_file());
     assert!(sandbox.tap_dir().join("manifest.toml").is_file());
-    assert!(stdout(&add).contains("No artifact was downloaded or executed"));
+    assert!(stderr(&add).contains("No artifact was downloaded or executed"));
     assert!(sandbox.brew_invocations().is_empty());
 
     let list = sandbox.run(&["tap", "list"]);
@@ -216,7 +216,7 @@ fn tap_add_list_plan_and_untap_are_offline_and_read_only() {
 
     let plan = sandbox.run(&["tap", "plan", "pproenca/tap/agent-tui"]);
     assert_success(&plan);
-    let planned = stdout(&plan);
+    let planned = stderr(&plan);
     assert!(planned.contains("agent-tui-darwin"));
     assert!(
         planned.contains("0daed495a2d90acce7a720cd5ef94c7613c54b1277bffc7466b998f3edf023b5")
@@ -227,7 +227,7 @@ fn tap_add_list_plan_and_untap_are_offline_and_read_only() {
 
     let dry_run = sandbox.run(&["tap", "install", "pproenca/tap/agent-tui", "--dry-run"]);
     assert_success(&dry_run);
-    assert!(stdout(&dry_run).contains("1 change planned. No packages changed."));
+    assert!(stderr(&dry_run).contains("Dry run: 1 change planned, nothing applied."));
     assert!(
         !sandbox.home.join(".cache/brew-rs/native-casks").exists(),
         "a dry run must not create the download cache"

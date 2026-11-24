@@ -81,6 +81,59 @@ pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+/// How a Homebrew API request failed, for user-facing error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiFailure {
+    NotFound,
+    Unreachable,
+    Server(u16),
+}
+
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "formulae.brew.sh has no such entry (HTTP 404)"),
+            Self::Unreachable => write!(
+                f,
+                "Could not reach formulae.brew.sh. Check your network connection."
+            ),
+            Self::Server(code) => write!(
+                f,
+                "formulae.brew.sh returned an error (HTTP {code}). Try again later."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApiFailure {}
+
+fn classify_parts(status: Option<u16>, transport_failure: bool) -> Option<ApiFailure> {
+    match status {
+        Some(404) => Some(ApiFailure::NotFound),
+        Some(code) if (500..600).contains(&code) => Some(ApiFailure::Server(code)),
+        Some(_) => None,
+        None => transport_failure.then_some(ApiFailure::Unreachable),
+    }
+}
+
+/// Classify an API error chain as not-found, unreachable, or a 5xx response.
+/// Other failures (4xx, malformed bodies, ...) return `None`.
+pub(crate) fn classify(error: &anyhow::Error) -> Option<ApiFailure> {
+    error.chain().find_map(|cause| {
+        if let Some(failure) = cause.downcast_ref::<ApiFailure>() {
+            return Some(*failure);
+        }
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return Some(ApiFailure::Unreachable);
+        }
+        let error = cause.downcast_ref::<reqwest::Error>()?;
+        classify_parts(
+            error.status().map(|status| status.as_u16()),
+            error.is_connect() || error.is_timeout() || error.is_request(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +196,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("response limit"));
+    }
+
+    #[tokio::test]
+    async fn classifies_not_found_and_server_errors() {
+        let url = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+        let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
+        assert_eq!(classify(&error), Some(ApiFailure::NotFound));
+        let url = serve(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
+        let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
+        assert_eq!(classify(&error), Some(ApiFailure::Server(503)));
+        let url = serve(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+        let error = direct_client().fetch_json::<u8>(&url).await.unwrap_err();
+        assert_eq!(classify(&error), None);
+    }
+
+    #[tokio::test]
+    async fn classifies_connection_failure_as_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = direct_client()
+            .fetch_json::<u8>(&format!("http://{address}/metadata"))
+            .await
+            .unwrap_err();
+        assert_eq!(classify(&error), Some(ApiFailure::Unreachable));
+    }
+
+    #[test]
+    fn classification_ignores_other_failures() {
+        assert_eq!(classify_parts(Some(400), true), None);
+        assert_eq!(classify_parts(None, false), None);
+        assert_eq!(classify(&anyhow::anyhow!("boom")), None);
     }
 }

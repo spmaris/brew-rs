@@ -918,15 +918,15 @@ pub(super) fn parse_hdiutil_mount_point(plist: &str) -> Result<PathBuf> {
     while let Some(idx) = plist[search_from..].find(key) {
         let after_key = &plist[search_from + idx + key.len()..];
         let trimmed = after_key.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("<string>") {
-            if let Some(end) = rest.find("</string>") {
-                let decoded = decode_xml_entities(&rest[..end])?;
-                let path = PathBuf::from(&decoded);
-                if path.is_absolute() && !decoded.contains('\0') {
-                    return Ok(path);
-                }
-                bail!("invalid mount-point path in hdiutil plist: '{decoded}'");
+        if let Some(rest) = trimmed.strip_prefix("<string>")
+            && let Some(end) = rest.find("</string>")
+        {
+            let decoded = decode_xml_entities(&rest[..end])?;
+            let path = PathBuf::from(&decoded);
+            if path.is_absolute() && !decoded.contains('\0') {
+                return Ok(path);
             }
+            bail!("invalid mount-point path in hdiutil plist: '{decoded}'");
         }
         search_from += idx + key.len();
     }
@@ -1085,10 +1085,11 @@ fn validate_archive_entry_path(raw: &str, allow_trailing_slash: bool) -> Result<
     if trimmed.contains('\0') || trimmed.contains('\\') || trimmed.starts_with('/') {
         bail!("archive contains unsafe entry path '{raw}'");
     }
-    if let Some(first_byte) = trimmed.as_bytes().get(1) {
-        if *first_byte == b':' && trimmed.as_bytes()[0].is_ascii_alphabetic() {
-            bail!("archive contains Windows drive path '{raw}'");
-        }
+    if let Some(first_byte) = trimmed.as_bytes().get(1)
+        && *first_byte == b':'
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+    {
+        bail!("archive contains Windows drive path '{raw}'");
     }
     let mut depth = 0_usize;
     for comp in Path::new(trimmed).components() {

@@ -586,10 +586,10 @@ pub(super) async fn stage_bottle(
     response: Response,
     config: &Config,
 ) -> Result<()> {
-    if let Some(length) = response.content_length() {
-        if length > MAX_BOTTLE_BYTES {
-            bail!("refusing to download a bottle larger than the {MAX_BOTTLE_BYTES} byte limit");
-        }
+    if let Some(length) = response.content_length()
+        && length > MAX_BOTTLE_BYTES
+    {
+        bail!("refusing to download a bottle larger than the {MAX_BOTTLE_BYTES} byte limit");
     }
     ensure_destination_is_not_symlink(destination)?;
 
@@ -746,13 +746,13 @@ fn ensure_destination_is_not_symlink(path: &Path) -> Result<()> {
 /// Best-effort directory flush after an atomic publish.
 fn sync_directory(directory: &Path) {
     #[cfg(unix)]
-    if let Ok(handle) = File::open(directory) {
-        if let Err(error) = handle.sync_all() {
-            log::debug!(
-                "failed to flush the native bottle directory {}: {error}",
-                directory.display()
-            );
-        }
+    if let Ok(handle) = File::open(directory)
+        && let Err(error) = handle.sync_all()
+    {
+        log::debug!(
+            "failed to flush the native bottle directory {}: {error}",
+            directory.display()
+        );
     }
     #[cfg(not(unix))]
     let _ = directory;

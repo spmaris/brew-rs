@@ -132,14 +132,16 @@ pub async fn handle_search(
         return Ok(());
     }
 
-    println!(
-        "{}",
-        formatter.header(&format!("Search results for '{query}'"))
-    );
-
     let headers = table_headers(verbose);
     let rows = table_rows(&hits, verbose);
-    println!("{}", formatter.table(&headers, &rows));
+    println!(
+        "{}",
+        formatter.table(
+            &format!("Search results for '{query}' ({})", rows.len()),
+            &headers,
+            &rows
+        )
+    );
 
     Ok(())
 }

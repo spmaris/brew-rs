@@ -243,23 +243,19 @@ impl CaskSource for HttpCaskSource {
         match self.http.fetch_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error) {
-                    if let Some(config) = &self.alias_config {
-                        if let Ok(Some(canonical)) =
-                            catalog_cache::resolve_cask_old_token(config, token).await
-                        {
-                            if !canonical.contains('/')
-                                && validate_cask_identifier(&canonical, "cask old_token").is_ok()
-                            {
-                                let alias_url = format!("{API_BASE}/cask/{canonical}.json");
-                                return self.http.fetch_json(&alias_url).await.with_context(|| {
+                if is_not_found(&error)
+                    && let Some(config) = &self.alias_config
+                    && let Ok(Some(canonical)) =
+                        catalog_cache::resolve_cask_old_token(config, token).await
+                    && !canonical.contains('/')
+                    && validate_cask_identifier(&canonical, "cask old_token").is_ok()
+                {
+                    let alias_url = format!("{API_BASE}/cask/{canonical}.json");
+                    return self.http.fetch_json(&alias_url).await.with_context(|| {
                                     format!(
                                         "failed to fetch cask '{canonical}' (resolved from '{token}') from {alias_url}"
                                     )
                                 });
-                            }
-                        }
-                    }
                 }
                 Err(error).with_context(|| format!("failed to fetch cask '{token}' from {url}"))
             }
@@ -462,19 +458,18 @@ fn review_container(value: &Value, blockers: &mut Vec<String>) -> ContainerHint 
         Value::Null => ContainerHint::Auto,
         Value::Object(map) if map.is_empty() => ContainerHint::Auto,
         Value::Object(map) => {
-            if map.len() == 1 {
-                if let Some(kind) = map.get("type").and_then(Value::as_str) {
-                    return match kind {
-                        "naked" => ContainerHint::Naked,
-                        "zip" => ContainerHint::Zip,
-                        "dmg" => ContainerHint::Dmg,
-                        other => {
-                            blockers
-                                .push(format!("declares an unsupported container type '{other}'"));
-                            ContainerHint::Auto
-                        }
-                    };
-                }
+            if map.len() == 1
+                && let Some(kind) = map.get("type").and_then(Value::as_str)
+            {
+                return match kind {
+                    "naked" => ContainerHint::Naked,
+                    "zip" => ContainerHint::Zip,
+                    "dmg" => ContainerHint::Dmg,
+                    other => {
+                        blockers.push(format!("declares an unsupported container type '{other}'"));
+                        ContainerHint::Auto
+                    }
+                };
             }
             blockers.push("declares an unsupported container configuration".into());
             ContainerHint::Auto
@@ -685,19 +680,18 @@ fn review_artifacts(
             blockers.push("declares malformed artifact metadata".into());
             return Vec::new();
         };
-        if let Some(app_val) = obj.get("app") {
-            if let Some(artifact) = parse_app_artifact(app_val, obj, blockers) {
-                if let PlannedCaskArtifact::App {
-                    ref bundle_name, ..
-                } = artifact
-                {
-                    if !declared_bundles.insert(bundle_name.clone()) {
-                        blockers.push(format!("declares duplicate app bundle '{bundle_name}'"));
-                        return Vec::new();
-                    }
-                }
-                apps.push(artifact);
+        if let Some(app_val) = obj.get("app")
+            && let Some(artifact) = parse_app_artifact(app_val, obj, blockers)
+        {
+            if let PlannedCaskArtifact::App {
+                ref bundle_name, ..
+            } = artifact
+                && !declared_bundles.insert(bundle_name.clone())
+            {
+                blockers.push(format!("declares duplicate app bundle '{bundle_name}'"));
+                return Vec::new();
             }
+            apps.push(artifact);
         }
     }
 
@@ -758,12 +752,10 @@ fn review_artifacts(
                     if let PlannedCaskArtifact::PrefixLink {
                         ref relative_dest, ..
                     } = artifact
+                        && !seen_prefix_dests.insert(relative_dest.clone())
                     {
-                        if !seen_prefix_dests.insert(relative_dest.clone()) {
-                            blockers
-                                .push(format!("declares duplicate destination '{relative_dest}'"));
-                            return Vec::new();
-                        }
+                        blockers.push(format!("declares duplicate destination '{relative_dest}'"));
+                        return Vec::new();
                     }
                     artifacts.push(artifact);
                 }
@@ -845,11 +837,11 @@ fn parse_app_artifact(
                 blockers.push("declares an unsupported app target path".into());
                 return None;
             }
-            if let Some(ref inner) = inner_bundle {
-                if inner != name {
-                    blockers.push("declares conflicting app target names".into());
-                    return None;
-                }
+            if let Some(ref inner) = inner_bundle
+                && inner != name
+            {
+                blockers.push("declares conflicting app target names".into());
+                return None;
             }
             name.to_string()
         }

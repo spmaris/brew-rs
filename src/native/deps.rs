@@ -148,7 +148,14 @@ async fn forward_deps(config: &Config, package: &str, tree: bool) -> Result<()> 
             .iter()
             .map(|dependency| vec![dependency.clone()])
             .collect();
-        println!("\n{}", formatter.table(&["Dependency"], &rows));
+        println!(
+            "\n{}",
+            formatter.table(
+                &format!("Dependencies ({})", rows.len()),
+                &["Dependency"],
+                &rows
+            )
+        );
         return Ok(());
     }
 
@@ -249,9 +256,9 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
                 {
                     "Retained"
                 } else if dependent.requested {
-                    "Requested"
+                    "requested"
                 } else {
-                    "Dependency"
+                    "dependency"
                 };
                 vec![
                     dependent.name.clone(),
@@ -263,7 +270,11 @@ fn reverse_deps(config: &Config, prefix: Option<&Path>, package: &str, tree: boo
             .collect();
         println!(
             "{}",
-            formatter.table(&["Dependent", "Version", "Pinned digest", "Reason"], &rows)
+            formatter.table(
+                "Dependents",
+                &["Dependent", "Version", "Pinned digest", "Reason"],
+                &rows
+            )
         );
     }
     Ok(())
@@ -282,17 +293,16 @@ impl FormulaSource for HttpFormulaSource {
         match self.http.fetch_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error) {
-                    if let Ok(Some(canonical)) =
+                if is_not_found(&error)
+                    && let Ok(Some(canonical)) =
                         catalog_cache::resolve_formula_alias(&self.config, name).await
-                    {
-                        if !canonical.contains('/') && plan::parse_target(&canonical).is_ok() {
-                            let alias_url = format!("{API_BASE}/formula/{canonical}.json");
-                            return self.http.fetch_json(&alias_url).await.with_context(|| {
-                                format!("failed to fetch formula metadata from {alias_url}")
-                            });
-                        }
-                    }
+                    && !canonical.contains('/')
+                    && plan::parse_target(&canonical).is_ok()
+                {
+                    let alias_url = format!("{API_BASE}/formula/{canonical}.json");
+                    return self.http.fetch_json(&alias_url).await.with_context(|| {
+                        format!("failed to fetch formula metadata from {alias_url}")
+                    });
                 }
                 Err(error).with_context(|| format!("failed to fetch formula metadata from {url}"))
             }
@@ -1277,6 +1287,7 @@ mod tests {
 
     fn receipt(name: &str, version: &str, requested: bool, pins: &[(&str, &str, &str)]) -> Receipt {
         Receipt {
+            source: Default::default(),
             name: name.to_string(),
             version: version.to_string(),
             version_scheme: 0,

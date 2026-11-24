@@ -1147,6 +1147,7 @@ Cflags: -I${includedir}"#,
 
     fn receipt(name: &str, version: &str, dependencies: &[(&str, &str)]) -> Receipt {
         Receipt {
+            source: Default::default(),
             name: name.into(),
             version: version.into(),
             version_scheme: 0,

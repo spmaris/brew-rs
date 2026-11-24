@@ -299,6 +299,25 @@ pub(super) struct Dependency {
     pub sha256: String,
 }
 
+/// The source used for installation and retained for future upgrades.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSource {
+    #[default]
+    Homebrew,
+    Upstream,
+}
+
+impl PackageSource {
+    /// Human-readable name used in user-facing messages.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Homebrew => "Homebrew",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
 /// The durable record of one installed package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Receipt {
@@ -306,6 +325,8 @@ pub(super) struct Receipt {
     pub version: String,
     #[serde(default)]
     pub version_scheme: u32,
+    #[serde(default)]
+    pub source: PackageSource,
     pub sha256: String,
     pub requested: bool,
     #[serde(default)]
@@ -1040,10 +1061,10 @@ impl Store {
                         AppliedChange::RetainedReceipt(_) => continue,
                         AppliedChange::Pruned(directory) => directory,
                     };
-                    if let Some(parent) = source.parent() {
-                        if flushed.insert(parent.to_path_buf()) {
-                            sync_directory(parent);
-                        }
+                    if let Some(parent) = source.parent()
+                        && flushed.insert(parent.to_path_buf())
+                    {
+                        sync_directory(parent);
                     }
                 }
                 if let Err(error) = quarantine.close() {
@@ -1205,14 +1226,14 @@ impl Store {
             // version that is both active and retained, or a retained keg that
             // is not a real directory fails closed: only the active keg and
             // recorded retained kegs may survive this upgrade.
-            if let Some(versions) = retained_by_name.get(old.name.as_str()) {
-                if versions.contains_key(old.version.as_str()) {
-                    bail!(
-                        "refusing to upgrade '{}': the active version {} also has a retained record; remove the stale retained record manually",
-                        old.name,
-                        old.version
-                    );
-                }
+            if let Some(versions) = retained_by_name.get(old.name.as_str())
+                && versions.contains_key(old.version.as_str())
+            {
+                bail!(
+                    "refusing to upgrade '{}': the active version {} also has a retained record; remove the stale retained record manually",
+                    old.name,
+                    old.version
+                );
             }
             for entry in fs::read_dir(&package)
                 .with_context(|| format!("failed to read '{}'", package.display()))?
@@ -2318,13 +2339,13 @@ fn rollback(applied: &[Applied]) -> Vec<String> {
         }
 
         for directory in record.link_dirs_created.iter().rev() {
-            if let Err(error) = fs::remove_dir(directory) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    issues.push(format!(
-                        "failed to remove new link directory '{}': {error}",
-                        directory.display()
-                    ));
-                }
+            if let Err(error) = fs::remove_dir(directory)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                issues.push(format!(
+                    "failed to remove new link directory '{}': {error}",
+                    directory.display()
+                ));
             }
         }
 
@@ -2795,10 +2816,10 @@ fn collect_owned_links(
         if !is_safe_bin_name(&member) {
             continue;
         }
-        if let Some(prefix) = root.member_prefix {
-            if !member.starts_with(prefix) {
-                continue;
-            }
+        if let Some(prefix) = root.member_prefix
+            && !member.starts_with(prefix)
+        {
+            continue;
         }
         let path = entry.path();
         let target = keg_link_target(name, version, root.subdir, &member);
@@ -3019,10 +3040,10 @@ fn staged_members(stage: &Path, root: &LinkDirectory) -> Result<Vec<String>> {
         if !is_safe_bin_name(&name) {
             continue;
         }
-        if let Some(prefix) = root.member_prefix {
-            if !name.starts_with(prefix) {
-                continue;
-            }
+        if let Some(prefix) = root.member_prefix
+            && !name.starts_with(prefix)
+        {
+            continue;
         }
         let entry_path = entry.path();
         let file_type = entry
@@ -3089,12 +3110,12 @@ fn link_directory(
         directory.push(component);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                "refusing '{}': a brewrs-managed path may not be a symlink",
+                "refusing '{}': a brewrs path may not be a symlink",
                 directory.display()
             ),
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => bail!(
-                "refusing '{}': a brewrs-managed path must be a directory",
+                "refusing '{}': a brewrs path must be a directory",
                 directory.display()
             ),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -3171,7 +3192,7 @@ pub(super) fn is_safe_package_name(name: &str) -> bool {
         })
 }
 
-fn is_safe_version(version: &str) -> bool {
+pub(super) fn is_safe_version(version: &str) -> bool {
     if version.is_empty() || version.len() > MAX_VERSION_LEN || version.contains("..") {
         return false;
     }
@@ -3637,10 +3658,10 @@ impl Drop for InstallLock {
             Ok(metadata) if metadata.is_file() => {}
             _ => return,
         }
-        if let Ok(contents) = fs::read(&self.path) {
-            if contents == self.token.as_bytes() {
-                let _ = fs::remove_file(&self.path);
-            }
+        if let Ok(contents) = fs::read(&self.path)
+            && contents == self.token.as_bytes()
+        {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -3742,12 +3763,12 @@ fn create_marker(prefix: &Path) -> Result<()> {
 pub(super) fn ensure_directory(path: &Path, create: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing '{}': a brewrs-managed path may not be a symlink",
+            "refusing '{}': a brewrs path may not be a symlink",
             path.display()
         ),
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => bail!(
-            "refusing '{}': a brewrs-managed path must be a directory",
+            "refusing '{}': a brewrs path must be a directory",
             path.display()
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -3771,12 +3792,12 @@ pub(super) fn ensure_directory(path: &Path, create: bool) -> Result<()> {
 pub(super) fn check_optional_directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing '{}': a brewrs-managed path may not be a symlink",
+            "refusing '{}': a brewrs path may not be a symlink",
             path.display()
         ),
         Ok(metadata) if metadata.is_dir() => Ok(true),
         Ok(_) => bail!(
-            "refusing '{}': a brewrs-managed path must be a directory",
+            "refusing '{}': a brewrs path must be a directory",
             path.display()
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -3890,10 +3911,10 @@ fn append_tail(base: &mut PathBuf, tail: &[&OsStr]) {
 
 pub(super) fn sync_directory(directory: &Path) {
     #[cfg(unix)]
-    if let Ok(handle) = File::open(directory) {
-        if let Err(error) = handle.sync_all() {
-            log::debug!("failed to flush '{}': {error}", directory.display());
-        }
+    if let Ok(handle) = File::open(directory)
+        && let Err(error) = handle.sync_all()
+    {
+        log::debug!("failed to flush '{}': {error}", directory.display());
     }
     #[cfg(not(unix))]
     let _ = directory;
@@ -3960,6 +3981,7 @@ mod tests {
 
     fn receipt(name: &str, version: &str, requested: bool) -> Receipt {
         Receipt {
+            source: Default::default(),
             name: name.into(),
             version: version.into(),
             version_scheme: 0,
@@ -5148,6 +5170,24 @@ mod tests {
             "a complete rollback drops the quarantine"
         );
         assert!(!prefix.join(META).join(STATE).join(LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn receipt_without_source_deserializes_as_homebrew() {
+        let old = serde_json::json!({
+            "name": "legacy",
+            "version": "1.0",
+            "sha256": digest(),
+            "requested": true,
+        });
+        let receipt: Receipt = serde_json::from_value(old).expect("old receipt");
+        assert_eq!(receipt.source, PackageSource::Homebrew);
+        let mut upstream = receipt;
+        upstream.source = PackageSource::Upstream;
+        let text = serde_json::to_string(&upstream).unwrap();
+        assert!(text.contains("\"source\":\"upstream\""));
+        let round: Receipt = serde_json::from_str(&text).unwrap();
+        assert_eq!(round.source, PackageSource::Upstream);
     }
 
     #[test]

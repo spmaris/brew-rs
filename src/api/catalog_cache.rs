@@ -59,19 +59,17 @@ pub fn find_formula_alias(formulae: &[Formula], query: &str) -> Option<String> {
         formulae,
         |formula| formula.name.as_str(),
         |formula| formula.aliases.iter().any(|alias| alias == query),
-    ) {
-        if name != query {
-            return Some(name);
-        }
+    ) && name != query
+    {
+        return Some(name);
     }
     if let Some(name) = unique_match(
         formulae,
         |formula| formula.name.as_str(),
         |formula| formula.oldnames.iter().any(|old| old == query),
-    ) {
-        if name != query {
-            return Some(name);
-        }
+    ) && name != query
+    {
+        return Some(name);
     }
     None
 }
@@ -108,6 +106,16 @@ where
         }
     }
     matched.map(str::to_owned)
+}
+
+/// Names from the on-disk formula catalog, if one exists and parses. Never
+/// touches the network and ignores the cache's age.
+pub fn cached_formula_names(config: &Config) -> Option<Vec<String>> {
+    let path = catalogs_dir(config).join(FORMULAE_FILE);
+    match read_cached::<Vec<Formula>>(&path) {
+        Ok(Cached::Hit { items, .. }) => Some(items.into_iter().map(|f| f.name).collect()),
+        _ => None,
+    }
 }
 
 /// Resolve an alias or old name using the cached formula catalog, refreshing

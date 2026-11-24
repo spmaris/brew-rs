@@ -588,7 +588,11 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
         println!();
         println!(
             "{}",
-            ui.table(&["Service", "Version", "Preview", "Brewrs state"], &rows)
+            ui.table(
+                &format!("Services ({})", rows.len()),
+                &["Service", "Version", "Preview", "Brewrs state"],
+                &rows
+            )
         );
     }
     println!(
@@ -1178,6 +1182,7 @@ mod tests {
         }
         let installed = vec![
             Receipt {
+                source: Default::default(),
                 name: "colima".into(),
                 version: "0.10.3".into(),
                 version_scheme: 0,
@@ -1192,6 +1197,7 @@ mod tests {
                 }],
             },
             Receipt {
+                source: Default::default(),
                 name: "lima".into(),
                 version: "2.3.0".into(),
                 version_scheme: 0,

@@ -218,10 +218,10 @@ impl<'a> Paths<'a> {
         if !safe_component(name, false) || !safe_component(version, false) {
             bail!("Invalid keg identity in relocation plan");
         }
-        if let Some(original) = original_version {
-            if original != version {
-                bail!("Bottle requires {name} {original:?}, but the transaction pins {version:?}");
-            }
+        if let Some(original) = original_version
+            && original != version
+        {
+            bail!("Bottle requires {name} {original:?}, but the transaction pins {version:?}");
         }
         if let Some(suffix) = suffix {
             return Ok(Some(format!(
@@ -261,6 +261,7 @@ mod tests {
 
     fn receipt() -> Receipt {
         Receipt {
+            source: Default::default(),
             name: "ripgrep".into(),
             version: "16.0.0".into(),
             version_scheme: 0,
@@ -367,6 +368,7 @@ mod tests {
     #[test]
     fn resolves_rpaths_loader_paths_and_rpath_members() {
         let sqlite_receipt = Receipt {
+            source: Default::default(),
             name: "sqlite".into(),
             version: "3.54.1".into(),
             version_scheme: 0,
@@ -388,6 +390,7 @@ mod tests {
         );
 
         let zstd_receipt = Receipt {
+            source: Default::default(),
             name: "zstd".into(),
             version: "1.5.7_1".into(),
             version_scheme: 0,
@@ -412,6 +415,7 @@ mod tests {
         );
 
         let luajit_receipt = Receipt {
+            source: Default::default(),
             name: "luajit".into(),
             version: "2.1.1795119671".into(),
             version_scheme: 0,
@@ -455,6 +459,7 @@ mod tests {
         );
 
         let icu_receipt = Receipt {
+            source: Default::default(),
             name: "icu4c@79".into(),
             version: "79.1".into(),
             version_scheme: 0,

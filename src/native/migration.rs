@@ -398,8 +398,8 @@ fn format_assessment(assessment: &Assessment) -> (&'static str, String) {
 
 fn intention(requested: Option<bool>) -> &'static str {
     match requested {
-        Some(true) => "Requested",
-        Some(false) => "Dependency",
+        Some(true) => "requested",
+        Some(false) => "dependency",
         None => "Unknown",
     }
 }
@@ -426,12 +426,20 @@ fn clean(data: &str) -> String {
 }
 
 fn section(ui: &DnfStyleFormatter, title: &str, headers: &[&str], rows: &Rows) {
-    println!("\n{}", ui.section(title));
+    println!();
     if rows.is_empty() {
+        println!("{}", ui.section(title));
         println!("None observed.");
-    } else {
-        println!("{}", ui.table(headers, rows));
+        return;
     }
+    // Plain output has no panel title, so keep the section heading.
+    if !ui.boxed() {
+        println!("{}", ui.section(title));
+    }
+    println!(
+        "{}",
+        ui.table(&format!("{title} ({})", rows.len()), headers, rows)
+    );
 }
 
 #[cfg(test)]
@@ -440,11 +448,13 @@ mod tests {
 
     fn formula(name: &str, requested: bool, install_blockers: Vec<&'static str>) -> PlannedFormula {
         PlannedFormula {
+            source: Default::default(),
             name: name.into(),
             version: "1.2".into(),
             version_scheme: Some(0),
             keg_only: false,
             has_service: false,
+            caveats: None,
             conflicts_with: Vec::new(),
             requested,
             dependencies: Vec::new(),

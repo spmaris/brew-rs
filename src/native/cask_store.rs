@@ -633,12 +633,11 @@ fn rollback_applied(applied: &[AppliedCask]) -> Vec<String> {
             }
         }
 
-        if let Some(ref ver) = record.caskroom_ver {
-            if ver.exists() {
-                if let Err(err) = fs::remove_dir_all(ver) {
-                    issues.push(format!("failed to remove '{}': {err}", ver.display()));
-                }
-            }
+        if let Some(ref ver) = record.caskroom_ver
+            && ver.exists()
+            && let Err(err) = fs::remove_dir_all(ver)
+        {
+            issues.push(format!("failed to remove '{}': {err}", ver.display()));
         }
         if record.caskroom_pkg_created {
             let _ = fs::remove_dir(&record.caskroom_pkg);
@@ -882,10 +881,10 @@ fn apply_removals(
                 }
             }
         }
-        if let Some(ref pkg_dir) = plan.prune_pkg {
-            if let Ok(()) = fs::remove_dir(pkg_dir) {
-                parked.push(ParkedEntry::PrunedDir(pkg_dir.clone()));
-            }
+        if let Some(ref pkg_dir) = plan.prune_pkg
+            && let Ok(()) = fs::remove_dir(pkg_dir)
+        {
+            parked.push(ParkedEntry::PrunedDir(pkg_dir.clone()));
         }
     }
     Ok(())
@@ -1479,6 +1478,7 @@ mod tests {
         let mut formula_conflict = list[0].clone();
         formula_conflict.conflicts_with_formulae = vec!["node".into()];
         let f_receipt = Receipt {
+            source: Default::default(),
             name: "node".into(),
             version: "1.0".into(),
             version_scheme: 0,

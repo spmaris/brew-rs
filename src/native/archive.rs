@@ -86,7 +86,23 @@ pub(super) fn unpack(
     validate_digest(sha256)?;
     validate_name(name)?;
     validate_version(version)?;
+    unpack_layout(archive, out, name, Some(version), sha256)
+}
 
+/// Extract a verified standalone release rooted at one exact directory.
+pub(super) fn unpack_release(archive: &Path, out: &Path, root: &str, sha256: &str) -> Result<()> {
+    validate_digest(sha256)?;
+    validate_name(root)?;
+    unpack_layout(archive, out, root, None, sha256)
+}
+
+fn unpack_layout(
+    archive: &Path,
+    out: &Path,
+    name: &str,
+    version: Option<&str>,
+    sha256: &str,
+) -> Result<()> {
     let out_metadata = fs::symlink_metadata(out)
         .with_context(|| format!("failed to inspect staging directory {}", out.display()))?;
     if !out_metadata.file_type().is_dir() {
@@ -264,7 +280,7 @@ fn extract<R: Read>(
     tar: &mut tar::Archive<R>,
     out: &Path,
     name: &str,
-    version: &str,
+    version: Option<&str>,
 ) -> Result<Vec<PendingSymlink>> {
     let mut seen: HashMap<PathBuf, Seen> = HashMap::new();
     let mut directories: HashSet<PathBuf> = HashSet::new();
@@ -692,10 +708,10 @@ fn validate_symlink_chain(
 /// Create the deferred symlinks after all regular entries are in place.
 fn materialize_symlinks(out: &Path, symlinks: &[PendingSymlink]) -> Result<()> {
     for link in symlinks {
-        if let Some(parent) = link.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                create_directories(out, parent)?;
-            }
+        if let Some(parent) = link.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            create_directories(out, parent)?;
         }
         let destination = out.join(&link.path);
         if fs::symlink_metadata(&destination).is_ok() {
@@ -757,7 +773,12 @@ fn relative_link_target(link: &Path, target: &Path) -> PathBuf {
 ///
 /// `None` is returned for the redundant `<name>` and `<name>/<version>`
 /// directory entries, which are allowed as ancestors but not materialized.
-fn relative_path(bytes: &[u8], name: &str, version: &str, is_dir: bool) -> Result<Option<PathBuf>> {
+fn relative_path(
+    bytes: &[u8],
+    name: &str,
+    version: Option<&str>,
+    is_dir: bool,
+) -> Result<Option<PathBuf>> {
     let trailing_slash = bytes.ends_with(b"/");
     let bytes = if trailing_slash {
         &bytes[..bytes.len() - 1]
@@ -800,36 +821,25 @@ fn relative_path(bytes: &[u8], name: &str, version: &str, is_dir: bool) -> Resul
     if components[0] != name {
         bail!("bottle archive path '{path}' is outside '{name}/'");
     }
-    match components.len() {
-        1 => {
-            if !is_dir {
-                bail!("bottle archive path '{path}' is outside the version directory");
-            }
-            Ok(None)
+    let root_depth = if let Some(version) = version {
+        if components.len() > 1 && components[1] != version {
+            bail!("bottle archive path '{path}' is outside '{name}/{version}/'");
         }
-        2 => {
-            if components[1] != version {
-                bail!("bottle archive path '{path}' is outside '{name}/{version}/'");
-            }
-            if !is_dir {
-                bail!("bottle archive path '{path}' is not a directory");
-            }
-            Ok(None)
+        2
+    } else {
+        1
+    };
+    if components.len() <= root_depth {
+        if !is_dir {
+            bail!("bottle archive path '{path}' is not a directory");
         }
-        _ => {
-            if components[1] != version {
-                bail!("bottle archive path '{path}' is outside '{name}/{version}/'");
-            }
-            if trailing_slash && !is_dir {
-                bail!("bottle archive file path '{path}' ends with a slash");
-            }
-            let mut relative = PathBuf::new();
-            for component in &components[2..] {
-                relative.push(component);
-            }
-            Ok(Some(relative))
-        }
+        return Ok(None);
     }
+    if trailing_slash && !is_dir {
+        bail!("bottle archive file path '{path}' ends with a slash");
+    }
+    let relative = components[root_depth..].iter().collect();
+    Ok(Some(relative))
 }
 
 /// Reject an entry nested under a path that was already extracted as a file,

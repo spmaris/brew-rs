@@ -78,8 +78,11 @@ use crate::api::catalog_cache;
 use crate::api::http_client::{HttpClient, is_not_found};
 use crate::config::Config;
 
+use super::not_found;
+use super::store::PackageSource;
+
 /// Official Homebrew formula API base.
-const API_BASE: &str = "https://formulae.brew.sh/api";
+pub(super) const API_BASE: &str = "https://formulae.brew.sh/api";
 /// Tap supported by this planner.
 const CORE_TAP: &str = "homebrew/core";
 /// Host that serves official Homebrew bottles.
@@ -195,6 +198,15 @@ const BLOCKER_REQUIREMENTS_VERSION: &str =
 const BLOCKER_REQUIREMENTS_ARCH: &str =
     "requires a different CPU architecture than the host bottle tag";
 
+/// The `--source` choice of `install`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SourceFlag {
+    /// Resolve through Homebrew (the default).
+    Homebrew,
+    /// Install the reviewed official upstream build from the bundled catalog.
+    Upstream,
+}
+
 /// One formula in a native install plan.
 ///
 /// `name` is the canonical API name, `version` is the stable version with the
@@ -211,6 +223,7 @@ pub struct PlannedFormula {
     pub version_scheme: Option<u32>,
     pub keg_only: bool,
     pub has_service: bool,
+    pub caveats: Option<String>,
     pub conflicts_with: Vec<String>,
     pub requested: bool,
     pub dependencies: Vec<String>,
@@ -218,6 +231,8 @@ pub struct PlannedFormula {
     pub sha256: String,
     pub cellar: String,
     pub install_blockers: Vec<&'static str>,
+    /// Where the artifact comes from; routing never inspects `cellar` for this.
+    pub source: PackageSource,
 }
 
 /// Build a native install plan for `targets` on host tag `tag`.
@@ -242,7 +257,10 @@ pub async fn resolve(
         http: HttpClient::new(config)?,
         alias_config: Some(config.clone()),
     };
-    resolve_with(&source, targets, tag).await
+    match resolve_with(&source, targets, tag).await {
+        Ok(plan) => Ok(plan),
+        Err(error) => Err(not_found::add_hints_online(error, config).await),
+    }
 }
 
 /// A read-only audit reuses metadata across independently resolved formulae.
@@ -321,23 +339,21 @@ impl FormulaSource for HttpFormulaSource {
         match self.http.fetch_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error) {
-                    if let Some(config) = &self.alias_config {
-                        if let Ok(Some(canonical)) =
-                            catalog_cache::resolve_formula_alias(config, name).await
-                        {
-                            if validate_formula_name(&canonical, "alias target").is_ok() {
-                                let alias_url = format!("{API_BASE}/formula/{canonical}.json");
-                                return self.http.fetch_json(&alias_url).await.with_context(|| {
-                                    format!(
-                                        "failed to fetch formula '{canonical}' (resolved from alias '{name}') from {alias_url}"
-                                    )
-                                });
-                            }
-                        }
-                    }
+                if is_not_found(&error)
+                    && let Some(config) = &self.alias_config
+                    && let Ok(Some(canonical)) =
+                        catalog_cache::resolve_formula_alias(config, name).await
+                    && validate_formula_name(&canonical, "alias target").is_ok()
+                {
+                    let alias_url = format!("{API_BASE}/formula/{canonical}.json");
+                    return self.http.fetch_json(&alias_url).await.with_context(|| {
+                        format!(
+                            "failed to fetch formula '{canonical}' (resolved from alias '{name}')"
+                        )
+                    });
                 }
-                Err(error).with_context(|| format!("failed to fetch formula '{name}' from {url}"))
+                log::debug!("GET {url} failed: {error:#}");
+                Err(error).with_context(|| format!("failed to fetch formula '{name}'"))
             }
         }
     }
@@ -477,8 +493,16 @@ async fn resolve_with<S: FormulaSource>(
 
     // Parse and validate every target before doing any I/O.
     let mut requested_names = Vec::with_capacity(targets.len());
+    // Tap qualifier of each tap-qualified target, and the formula that listed
+    // each dependency, for error messages.
+    let mut target_taps: HashMap<String, String> = HashMap::new();
+    let mut dependency_parents: HashMap<String, String> = HashMap::new();
     for target in targets {
-        requested_names.push(parse_target(target)?.to_string());
+        let name = parse_target(target)?.to_string();
+        if let Some((tap, _)) = target.rsplit_once('/') {
+            target_taps.insert(name.clone(), tap.to_string());
+        }
+        requested_names.push(name);
     }
 
     // Graph discovery. `canonical_for` maps every name that was requested
@@ -500,17 +524,24 @@ async fn resolve_with<S: FormulaSource>(
             continue;
         }
 
-        let response = source
-            .fetch(&requested)
-            .await
-            .with_context(|| format!("while resolving '{requested}'"))?;
-        let (canonical, node) = build_node(response, tag)?;
-        if let Some(existing) = canonical_for.get(&canonical) {
-            if existing != &canonical {
-                bail!(
-                    "inconsistent formula metadata: '{canonical}' was already resolved as '{existing}'"
-                );
+        let response = match source.fetch(&requested).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(not_found::from_fetch_error(
+                    error,
+                    &requested,
+                    target_taps.get(&requested).map(String::as_str),
+                    dependency_parents.get(&requested).map(String::as_str),
+                ));
             }
+        };
+        let (canonical, node) = build_node(response, tag)?;
+        if let Some(existing) = canonical_for.get(&canonical)
+            && existing != &canonical
+        {
+            bail!(
+                "inconsistent formula metadata: '{canonical}' was already resolved as '{existing}'"
+            );
         }
         // Map the canonical name to itself so a request for it does not fetch
         // the same payload twice, then map the requested name.
@@ -526,6 +557,7 @@ async fn resolve_with<S: FormulaSource>(
                     if enqueued.len() > MAX_REQUESTS {
                         bail!("install plan exceeds the {MAX_REQUESTS}-request limit");
                     }
+                    dependency_parents.insert(dependency.clone(), canonical.clone());
                     queue.push_back(dependency.clone());
                 }
             }
@@ -685,6 +717,7 @@ fn build_node(response: FormulaResponse, tag: &str) -> Result<(String, FormulaNo
             version_scheme: response.version_scheme,
             keg_only,
             has_service,
+            caveats: response.caveats.clone(),
             conflicts_with,
             dependencies,
             url,
@@ -797,6 +830,7 @@ fn topological_order(
                         version_scheme: node.version_scheme,
                         keg_only: node.keg_only,
                         has_service: node.has_service,
+                        caveats: node.caveats.clone(),
                         conflicts_with: node.conflicts_with.clone(),
                         requested: requested.contains(&name),
                         dependencies,
@@ -804,6 +838,7 @@ fn topological_order(
                         sha256: node.sha256.clone(),
                         cellar: node.cellar.clone(),
                         install_blockers: node.install_blockers.clone(),
+                        source: PackageSource::Homebrew,
                     });
                 }
             }
@@ -846,6 +881,7 @@ struct FormulaNode {
     version_scheme: Option<u32>,
     keg_only: bool,
     has_service: bool,
+    caveats: Option<String>,
     conflicts_with: Vec<String>,
     dependencies: Vec<String>,
     url: String,
@@ -1092,10 +1128,10 @@ fn is_valid_optional_macos_service(service: &Value, tag: &str) -> bool {
     if !service.contains_key("run") && !service.contains_key("name") {
         return false;
     }
-    if let Some(run) = service.get("run") {
-        if !is_valid_service_run(run) {
-            return false;
-        }
+    if let Some(run) = service.get("run")
+        && !is_valid_service_run(run)
+    {
+        return false;
     }
     true
 }
@@ -1223,10 +1259,10 @@ fn review_requirement(requirement: &Value, tag: &str) -> Option<&'static str> {
             let Some(host) = macos_version_for_tag(tag) else {
                 return Some(BLOCKER_REQUIREMENTS_PLATFORM);
             };
-            if let Some(required) = required {
-                if host < required {
-                    return Some(BLOCKER_REQUIREMENTS_VERSION);
-                }
+            if let Some(required) = required
+                && host < required
+            {
+                return Some(BLOCKER_REQUIREMENTS_VERSION);
             }
             None
         }
@@ -1488,6 +1524,8 @@ struct FormulaResponse {
     post_install_defined: Option<bool>,
     keg_only: Option<bool>,
     #[serde(default)]
+    caveats: Option<String>,
+    #[serde(default)]
     recommended_dependencies: Vec<String>,
     #[serde(default)]
     uses_from_macos: Vec<serde_json::Value>,
@@ -1584,6 +1622,47 @@ mod tests {
         assert_eq!(
             *source.source.names.borrow(),
             ["first", "shared", "second", "missing"]
+        );
+    }
+
+    /// Reports every name outside `docs` as an API 404.
+    struct NotFoundSource(FixtureSource);
+
+    impl FormulaSource for NotFoundSource {
+        async fn fetch(&self, name: &str) -> Result<FormulaResponse> {
+            if self.0.docs.contains_key(name) {
+                self.0.fetch(name).await
+            } else {
+                Err(anyhow::Error::new(
+                    crate::api::http_client::ApiFailure::NotFound,
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_target_and_missing_dependency_render_differently() {
+        let source = NotFoundSource(FixtureSource::new(vec![(
+            "parent",
+            formula_json("parent", "1.0", 0, &["ghost"]),
+        )]));
+        let error = resolve_with(&source, &["tail".into()], TAG)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{error:#}"), "No Homebrew formula named 'tail'.");
+        let error = resolve_with(&source, &["homebrew/core/tail".into()], TAG)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "No formula named 'tail' in tap homebrew/core."
+        );
+        let error = resolve_with(&source, &["parent".into()], TAG)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Homebrew metadata for 'parent' lists dependency 'ghost', which does not exist."
         );
     }
 

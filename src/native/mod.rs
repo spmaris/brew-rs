@@ -11,7 +11,9 @@ pub(crate) mod install;
 mod macho_relocate;
 pub(crate) mod migration;
 mod migration_inventory;
+mod not_found;
 mod plan;
+mod portable;
 mod relocate;
 mod relocation_paths;
 mod relocation_text;
@@ -46,12 +48,14 @@ pub async fn run(
                 package.name.clone(),
                 package.version.clone(),
                 if package.requested {
-                    "Requested"
+                    "requested"
                 } else {
-                    "Dependency"
+                    "dependency"
                 }
                 .into(),
-                if package.cellar == ":any_skip_relocation" {
+                if package.source == store::PackageSource::Upstream {
+                    "Upstream release"
+                } else if package.cellar == ":any_skip_relocation" {
                     "Portable"
                 } else if package.cellar == ":any" {
                     "Relocation needed"
@@ -62,34 +66,36 @@ pub async fn run(
             ]
         })
         .collect();
-    println!(
-        "{}  {}",
-        ui.section(if fetch {
+    let rendered = ui.table_with_summary(
+        if fetch {
             "Bottle fetch"
         } else {
             "Install plan"
-        }),
-        ui.info(&tag)
+        },
+        &["Package", "Version", "Reason", "Bottle"],
+        &rows,
+        &[("Target", tag.clone())],
     );
-    println!(
-        "{}",
-        ui.table(&["Package", "Version", "Reason", "Bottle"], &rows)
-    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
     if !fetch {
-        println!("\n{} formulae planned. No packages changed.", plan.len());
+        println!(
+            "\n{} {} planned, nothing applied.",
+            plan.len(),
+            if plan.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            }
+        );
         return Ok(());
     }
 
     io::stdout().flush()?;
     for (index, package) in plan.iter().enumerate() {
-        let path = download::fetch(config, &package.url, &package.sha256)
-            .await
-            .with_context(|| {
-                format!(
-                    "Could not fetch the bottle for {} {}",
-                    package.name, package.version
-                )
-            })?;
+        let path = install::fetch_formula(config, package).await?;
         if log::log_enabled!(log::Level::Info) {
             log::info!("Verified bottle: {}", path.display());
         }

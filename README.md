@@ -23,7 +23,7 @@ Add `~/.local/bin` to your `PATH` if needed. Building `brewrs` requires Rust; us
 
 ### Build from source
 
-With [Rust](https://rustup.rs/) 1.85 or newer and the Apple Command Line Tools on macOS, install directly from GitHub:
+With [Rust](https://rustup.rs/) 1.88 or newer and the Apple Command Line Tools on macOS, install directly from GitHub:
 
 ```sh
 cargo install --git https://github.com/spmaris/brew-rs.git --locked
@@ -108,6 +108,10 @@ Native formula removal is offline and only acts on the selected prefix's receipt
 Native upgrade stages verified replacements before changing installed files, compares Homebrew's `version_scheme` ahead of numeric dotted versions (including optional `_revision`), and rejects unknown version schemes, downgrades, and changed bottles at an equal version. Failed applies attempt to restore the previous installation; a crash during replacement may still require manual recovery. The old `--legacy` adapter has been removed. brewrs never invokes `brew` and does not adopt or manage an existing Homebrew installation.
 
 `info` and per-package `analytics` read formula or cask metadata from the official repository. Forward `deps` reports declared formula runtime dependencies, even for formulae that can't be installed natively. `deps --reverse` uses only the installed dependency receipts in the selected brewrs prefix and works offline.
+
+## Upstream builds (`--source upstream`)
+
+A bare name always resolves to Homebrew. When a requested formula (or one of its dependencies) can't be installed from Homebrew and a reviewed official upstream release exists in the bundled catalog, the error gains a hint such as `brewrs install --source upstream neovim`. Nothing is ever installed from upstream automatically. `--source upstream` installs only catalog entries (by name or alias) with an artifact for your architecture, verified against a pinned SHA-256, and never queries Homebrew for them. `--source homebrew` is the default. The receipt records the source: upgrades follow it, switching requires uninstalling first, and an upstream build never satisfies a Homebrew dependency.
 
 ## Declarative third-party taps
 

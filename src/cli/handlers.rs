@@ -59,7 +59,6 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
         cache.clean_expired().await?
     };
 
-    println!("{}", formatter.header("Cache Cleanup Summary"));
     println!(
         "{}",
         formatter.field(
@@ -82,7 +81,11 @@ pub async fn handle_clean(config: Config, all: bool, dry_run: bool) -> Result<()
     ];
     println!(
         "{}",
-        formatter.table(&["Cache", "Files removed", "Disk space freed"], &rows)
+        formatter.table(
+            "Cache cleanup",
+            &["Cache", "Files removed", "Disk space freed"],
+            &rows
+        )
     );
 
     let files_removed = catalog_files + bottles.bottles_removed;
@@ -169,15 +172,15 @@ pub async fn handle_analytics(config: Config, period: String, top: usize) -> Res
 
     println!(
         "{}",
-        formatter.header(&format!(
-            "Top {} packages by installs (last {} days)",
-            rows.len(),
-            days
-        ))
-    );
-    println!(
-        "{}",
-        formatter.table(&["#", "Package", "Installs", "Percent"], &rows)
+        formatter.table(
+            &format!(
+                "Top {} packages by installs (last {} days)",
+                rows.len(),
+                days
+            ),
+            &["#", "Package", "Installs", "Percent"],
+            &rows
+        )
     );
 
     if analytics.total_count > 0 {

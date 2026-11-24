@@ -148,7 +148,8 @@ pub(crate) async fn info(
     let kind = requested_kind(package, &requested, formula, cask)?;
     let source = HttpMetadataSource::new(config)?;
     let metadata = lookup(&source, requested.name, kind).await?;
-    print_info(config, prefix, &metadata, deps, analytics);
+    let prefix = prefix_path(prefix)?;
+    print_info(config, &prefix, &metadata, deps, analytics);
     Ok(())
 }
 
@@ -291,23 +292,18 @@ impl MetadataSource for HttpMetadataSource {
         match self.http.fetch_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error) {
-                    if let Ok(Some(canonical)) =
+                if is_not_found(&error)
+                    && let Ok(Some(canonical)) =
                         catalog_cache::resolve_formula_alias(&self.config, name).await
-                    {
-                        if !canonical.contains('/')
-                            && validate_identifier(&canonical, "formula alias").is_ok()
-                        {
-                            let alias_url =
-                                format!("{API_BASE}/{}/{canonical}.json", Kind::Formula.endpoint());
-                            return match self.http.fetch_json(&alias_url).await {
-                                Ok(payload) => Ok(payload),
-                                Err(alias_error) => {
-                                    Err(classify_http_error(&alias_url, alias_error))
-                                }
-                            };
-                        }
-                    }
+                    && !canonical.contains('/')
+                    && validate_identifier(&canonical, "formula alias").is_ok()
+                {
+                    let alias_url =
+                        format!("{API_BASE}/{}/{canonical}.json", Kind::Formula.endpoint());
+                    return match self.http.fetch_json(&alias_url).await {
+                        Ok(payload) => Ok(payload),
+                        Err(alias_error) => Err(classify_http_error(&alias_url, alias_error)),
+                    };
                 }
                 Err(classify_http_error(&url, error))
             }
@@ -456,7 +452,7 @@ fn validate_period(period: &str) -> Result<&str> {
 
 fn print_info(
     config: &Config,
-    prefix: Option<&Path>,
+    prefix: &Path,
     metadata: &Metadata,
     deps: bool,
     show_analytics: bool,
@@ -483,7 +479,7 @@ fn print_info(
 
 fn print_formula(
     formatter: &DnfStyleFormatter,
-    prefix: Option<&Path>,
+    prefix: &Path,
     metadata: &Metadata,
     formula: &FormulaResponse,
     deps: bool,
@@ -557,7 +553,7 @@ fn print_formula(
         );
     }
 
-    let installed = read_installed(prefix, &metadata.name);
+    let installed = read_installed(Some(prefix), &metadata.name);
     if let Installed::Unknown(reason) = &installed {
         eprintln!(
             "{} could not read brewrs receipts: {}",
@@ -583,12 +579,12 @@ fn print_formula(
     if show_analytics {
         print_inline_analytics(formatter, metadata, formula.analytics.as_ref());
     }
-    print_caveats(formatter, formula.caveats.as_deref());
+    print_caveats(formatter, prefix, formula.caveats.as_deref());
 }
 
 fn print_cask(
     formatter: &DnfStyleFormatter,
-    prefix: Option<&Path>,
+    prefix: &Path,
     metadata: &Metadata,
     cask: &CaskResponse,
     deps: bool,
@@ -625,7 +621,7 @@ fn print_cask(
     if let Some(conflicts) = cask_conflicts_value(&cask.conflicts_with) {
         println!("{}", formatter.field("Conflicts", &conflicts));
     }
-    let installed = read_installed_cask(prefix, &metadata.name);
+    let installed = read_installed_cask(Some(prefix), &metadata.name);
     if let InstalledCask::Unknown(reason) = &installed {
         eprintln!(
             "{} could not read brewrs cask receipts: {}",
@@ -651,7 +647,7 @@ fn print_cask(
     if show_analytics {
         print_inline_analytics(formatter, metadata, cask.analytics.as_ref());
     }
-    print_caveats(formatter, cask.caveats.as_deref());
+    print_caveats(formatter, prefix, cask.caveats.as_deref());
 }
 
 fn print_dependencies(formatter: &DnfStyleFormatter, rows: &[Vec<String>]) {
@@ -660,8 +656,14 @@ fn print_dependencies(formatter: &DnfStyleFormatter, rows: &[Vec<String>]) {
         return;
     }
     println!();
-    println!("{}", formatter.section("Dependencies"));
-    println!("{}", formatter.table(&["Kind", "Dependency"], rows));
+    println!(
+        "{}",
+        formatter.table(
+            &format!("Dependencies ({})", rows.len()),
+            &["Kind", "Dependency"],
+            rows
+        )
+    );
 }
 
 fn print_inline_analytics(
@@ -682,21 +684,51 @@ fn print_inline_analytics(
     println!();
     println!(
         "{}",
-        formatter.section("Analytics (Homebrew install events)")
-    );
-    println!(
-        "{}",
-        formatter.table(&["Period", "Installs", "Variants"], &rows)
+        formatter.table(
+            "Analytics (Homebrew install events)",
+            &["Period", "Installs", "Variants"],
+            &rows
+        )
     );
 }
 
-fn print_caveats(formatter: &DnfStyleFormatter, caveats: Option<&str>) {
-    let Some(text) = caveats.map(str::trim).filter(|text| !text.is_empty()) else {
-        return;
-    };
-    println!();
-    println!("{}", formatter.section("Caveats"));
-    println!("{}", clean_block(text));
+pub(super) fn print_caveats(formatter: &DnfStyleFormatter, prefix: &Path, caveats: Option<&str>) {
+    if let Some(block) = caveat_block(formatter, prefix, "Caveats", caveats) {
+        println!("{block}");
+    }
+}
+
+/// The rendered caveat block, if the package has non-empty caveats.
+///
+/// Callers that route human-readable output to stderr (an install run in plain
+/// mode) print this through the formatter's mode-aware `note` helper.
+pub(super) fn caveat_block(
+    formatter: &DnfStyleFormatter,
+    prefix: &Path,
+    title: &str,
+    caveats: Option<&str>,
+) -> Option<String> {
+    let text = caveats.map(str::trim).filter(|text| !text.is_empty())?;
+    let text = localize_caveats(text, prefix);
+    Some(format!(
+        "\n{}\n{}",
+        formatter.section(title),
+        clean_block(&text)
+    ))
+}
+
+/// Replace Homebrew prefix placeholders in caveat text with the brewrs prefix.
+///
+/// Caveats quote shell snippets, so the prefix stays absolute: `~` does not
+/// expand inside double quotes.
+fn localize_caveats(text: &str, prefix: &Path) -> String {
+    let prefix = prefix.display().to_string();
+    let cellar = format!("{prefix}/Cellar");
+    text.replace("${HOMEBREW_PREFIX}", &prefix)
+        .replace("$HOMEBREW_PREFIX", &prefix)
+        .replace("${HOMEBREW_CELLAR}", &cellar)
+        .replace("$HOMEBREW_CELLAR", &cellar)
+        .replace("$(brew --prefix)", &prefix)
 }
 
 fn print_analytics(
@@ -771,12 +803,14 @@ fn print_analytics(
 
     if breakdown.len() > 1 {
         println!();
-        println!("{}", formatter.section("Breakdown"));
         let rows: Vec<Vec<String>> = breakdown
             .iter()
             .map(|(label, count)| vec![label.clone(), format_count(*count)])
             .collect();
-        println!("{}", formatter.table(&["Variant", "Installs"], &rows));
+        println!(
+            "{}",
+            formatter.table("Breakdown", &["Variant", "Installs"], &rows)
+        );
     }
     Ok(())
 }
@@ -1322,7 +1356,7 @@ fn format_count(value: u64) -> String {
     let digits = value.to_string();
     let mut output = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             output.push(',');
         }
         output.push(character);
@@ -2017,6 +2051,22 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("deprecated since 2024-01-01"));
         assert!(messages[0].contains("replacement: jaq"));
+    }
+
+    #[test]
+    fn caveats_localize_homebrew_prefix_placeholders() {
+        let prefix = Path::new("/Users/me/Brewrs Space");
+        let text = "export PATH=${HOMEBREW_PREFIX}/bin:$HOMEBREW_PREFIX/sbin\n\
+                    cargs=--cellar=$HOMEBREW_CELLAR\n\
+                    cfg=${HOMEBREW_CELLAR}/pkg\n\
+                    helper=$(brew --prefix)";
+        assert_eq!(
+            localize_caveats(text, prefix),
+            "export PATH=/Users/me/Brewrs Space/bin:/Users/me/Brewrs Space/sbin\n\
+             cargs=--cellar=/Users/me/Brewrs Space/Cellar\n\
+             cfg=/Users/me/Brewrs Space/Cellar/pkg\n\
+             helper=/Users/me/Brewrs Space"
+        );
     }
 
     #[tokio::test]

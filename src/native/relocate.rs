@@ -259,6 +259,7 @@ mod tests {
         let package = Prepared {
             stage,
             receipt: Receipt {
+                source: Default::default(),
                 name: "ripgrep".into(),
                 version: "16.0.0".into(),
                 version_scheme: 0,

@@ -509,7 +509,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
         }
         let command = read_u32(bytes, offset)?;
         let command_size = read_u32(bytes, offset + 4)? as usize;
-        if command_size < 8 || command_size % 8 != 0 {
+        if command_size < 8 || !command_size.is_multiple_of(8) {
             bail!(
                 "Mach-O load command {index} has invalid size {command_size}; 64-bit commands are 8-byte aligned"
             );
@@ -889,10 +889,10 @@ fn check_marker_plan(bytes: &[u8], parsed: &Parsed, expected: &[Option<String>])
     })?;
 
     for (index, target) in expected.iter().enumerate() {
-        if let Some(target) = target {
-            if target.contains(MARKER_TEXT) {
-                bail!("Homebrew placeholder in load command {index} was not resolved ({target:?})");
-            }
+        if let Some(target) = target
+            && target.contains(MARKER_TEXT)
+        {
+            bail!("Homebrew placeholder in load command {index} was not resolved ({target:?})");
         }
     }
     Ok(())

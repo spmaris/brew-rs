@@ -66,7 +66,8 @@ async fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            let mode = ui::table::Mode::detect_stderr(true);
+            eprintln!("{}", ui::table::format_error(mode, &format!("{error:#}")));
             ExitCode::FAILURE
         }
     }

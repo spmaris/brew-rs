@@ -179,29 +179,25 @@ pub(crate) fn add(
     }
 
     let ui = DnfStyleFormatter::new(config);
-    println!("{}  {}", ui.section("Tapped"), ui.info(&tap));
-    println!("{}", ui.field("Manifest", &source.display().to_string()));
-    println!("{}", ui.field("SHA-256", &digest));
-    println!(
-        "{}",
-        ui.field("Packages", &manifest.packages.len().to_string())
-    );
-    println!(
-        "\nNo artifact was downloaded or executed. Every package must be requested as a fully qualified <owner>/<repo>/<token> target."
-    );
+    ui.note(&format!("{}  {}", ui.section("Tapped"), ui.info(&tap)));
+    ui.note(&ui.field("Manifest", &source.display().to_string()));
+    ui.note(&ui.field("SHA-256", &digest));
+    ui.note(&ui.field("Packages", &manifest.packages.len().to_string()));
+    ui.note("\nNo artifact was downloaded or executed. Every package must be requested as a fully qualified <owner>/<repo>/<token> target.");
     Ok(())
 }
 
 /// List registered taps and their declared packages without touching Homebrew.
 pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let path = prefix_path(prefix)?;
+    let ui = DnfStyleFormatter::new(config);
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!(
+            ui.note(&format!(
                 "No third-party taps: '{}' is not an initialized brewrs prefix.",
                 path.display()
-            );
+            ));
             return Ok(());
         }
         Err(error) => {
@@ -211,17 +207,14 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
 
     let store = Store::open_existing(&path)
         .context("Listing taps requires an initialized brewrs prefix")?;
-    let ui = DnfStyleFormatter::new(config);
     let taps = all_tapped(store.prefix())?;
-    println!(
+    ui.note(&format!(
         "{}  {}",
         ui.section("Third-party taps"),
         ui.info(&store.prefix().display().to_string())
-    );
+    ));
     if taps.is_empty() {
-        println!(
-            "No third-party taps are registered. Use `brewrs tap add <owner>/<repo> --manifest <path>`."
-        );
+        ui.note("No third-party taps are registered. Use `brewrs tap add <owner>/<repo> --manifest <path>`.");
         return Ok(());
     }
 
@@ -269,18 +262,19 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     println!(
         "{}",
         ui.table(
+            &format!("Tap packages ({})", rows.len()),
             &["Tap", "Package", "Version", "Bin", "Arch", "Installed"],
             &rows
         )
     );
-    println!();
+    ui.note("");
     for tapped in &taps {
-        println!(
+        ui.note(&format!(
             "{}  {}  (manifest sha256 {})",
             ui.section(&tapped.record.tap),
             tapped.record.source,
             short_digest(tapped.manifest_sha256())
-        );
+        ));
     }
     Ok(())
 }
@@ -292,14 +286,14 @@ pub(crate) fn plan(config: &Config, prefix: Option<&Path>, package: &str) -> Res
     let ui = DnfStyleFormatter::new(config);
     render_plan(&ui, &plan, "Tap install plan");
     if plan.installed.is_some() {
-        println!(
+        ui.note(&format!(
             "\nAlready installed from the tap. No changes; `brewrs tap install {package}` re-verifies the artifact bytes."
-        );
+        ));
     } else {
-        println!("\nNothing was downloaded or installed.");
+        ui.note("\nNothing was downloaded or installed.");
     }
-    println!(
-        "This lane evaluates no Ruby or shell source and supports only explicit naked macOS executables."
+    ui.note(
+        "This lane evaluates no Ruby or shell source and supports only explicit naked macOS executables.",
     );
     Ok(())
 }
@@ -332,16 +326,16 @@ pub(crate) async fn install(
                 receipt.artifact_bytes
             );
         }
-        println!("\nAlready installed; artifact bytes verified. No changes.");
+        ui.note("\nAlready installed; artifact bytes verified. No changes.");
         return Ok(());
     }
 
     if dry_run {
-        println!("\n1 change planned. No packages changed.");
+        ui.note("\nDry run: 1 change planned, nothing applied.");
         return Ok(());
     }
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
+    if config.general.confirm_operations && !yes && !confirm("Install 1 package?")? {
+        eprintln!("Cancelled. No packages changed.");
         return Ok(());
     }
 
@@ -365,7 +359,7 @@ pub(crate) async fn install(
                 current.qualified
             );
         }
-        println!("\nAlready installed by a concurrent brewrs process. No changes.");
+        ui.note("\nAlready installed by a concurrent brewrs process. No changes.");
         return Ok(());
     }
     if !current.same_selection(&plan) {
@@ -404,22 +398,20 @@ pub(crate) async fn install(
         .with_context(|| format!("Failed to install '{}'", current.qualified))?;
     drop(stage);
 
-    println!("\n{} {}.", ui.success("Installed"), current.qualified);
-    println!(
-        "{}",
-        ui.field(
-            "Bin",
-            &store.prefix().join(&current.link).display().to_string()
-        )
-    );
-    println!(
-        "{}",
-        ui.field("Receipt", &current.receipt_path.display().to_string())
-    );
-    println!(
+    ui.note(&format!(
+        "\n{} {}.",
+        ui.success("Installed"),
+        current.qualified
+    ));
+    ui.note(&ui.field(
+        "Bin",
+        &store.prefix().join(&current.link).display().to_string(),
+    ));
+    ui.note(&ui.field("Receipt", &current.receipt_path.display().to_string()));
+    ui.note(&format!(
         "The artifact was SHA-256 verified and checked as a {} Mach-O executable. Only the executable was installed.",
         current.architecture
-    );
+    ));
     Ok(())
 }
 
@@ -460,7 +452,11 @@ pub(crate) fn uninstall(
     verify_removal_state(&path, &receipt)?;
 
     let ui = DnfStyleFormatter::new(config);
-    println!("{}  {}", ui.section("Tap uninstall"), ui.info(package));
+    ui.note(&format!(
+        "{}  {}",
+        ui.section("Tap uninstall"),
+        ui.info(package)
+    ));
     for (label, value) in [
         ("Version", receipt.version.clone()),
         ("Architecture", receipt.architecture.clone()),
@@ -468,15 +464,15 @@ pub(crate) fn uninstall(
         ("Keg", path.join(&receipt.keg).display().to_string()),
         ("Receipt", receipt_path.display().to_string()),
     ] {
-        println!("{}", ui.field(label, &value));
+        ui.note(&ui.field(label, &value));
     }
 
     if dry_run {
-        println!("\n1 change planned. No packages changed.");
+        ui.note("\nDry run: 1 change planned, nothing applied.");
         return Ok(());
     }
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
+    if config.general.confirm_operations && !yes && !confirm("Remove 1 package?")? {
+        eprintln!("Cancelled. No packages changed.");
         return Ok(());
     }
 
@@ -490,7 +486,7 @@ pub(crate) fn uninstall(
     }
     verify_removal_state(store.prefix(), &current)?;
     commit_uninstall(store.prefix(), &current)?;
-    println!("\n{} {package}.", ui.success("Uninstalled"));
+    ui.note(&format!("\n{} {package}.", ui.success("Uninstalled")));
     Ok(())
 }
 
@@ -530,21 +526,21 @@ pub(crate) fn untap(config: &Config, prefix: Option<&Path>, tap_name: &str) -> R
 
     let taproom_package_rel = Path::new(TAPROOM).join(&owner).join(&repo);
     let taproom_package = prefix.join(&taproom_package_rel);
-    if verify_ancestor_dirs(prefix, &taproom_package_rel, "tap payload")? {
-        if let Ok(metadata) = fs::symlink_metadata(&taproom_package) {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!(
-                    "refusing to untap '{tap}': '{}' is not a real directory",
-                    taproom_package.display()
-                );
-            }
-            let entries = read_dir_names(&taproom_package, MAX_PACKAGES + 1, "tap payload")?;
-            if !entries.is_empty() {
-                bail!(
-                    "refusing to untap '{tap}': installed payload directories remain in '{}'",
-                    taproom_package.display()
-                );
-            }
+    if verify_ancestor_dirs(prefix, &taproom_package_rel, "tap payload")?
+        && let Ok(metadata) = fs::symlink_metadata(&taproom_package)
+    {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "refusing to untap '{tap}': '{}' is not a real directory",
+                taproom_package.display()
+            );
+        }
+        let entries = read_dir_names(&taproom_package, MAX_PACKAGES + 1, "tap payload")?;
+        if !entries.is_empty() {
+            bail!(
+                "refusing to untap '{tap}': installed payload directories remain in '{}'",
+                taproom_package.display()
+            );
         }
     }
 
@@ -591,8 +587,8 @@ pub(crate) fn untap(config: &Config, prefix: Option<&Path>, tap_name: &str) -> R
     let _ = fs::remove_dir(prefix.join(TAPROOM));
 
     let ui = DnfStyleFormatter::new(config);
-    println!("{}  {}", ui.section("Untapped"), ui.info(&tap));
-    println!("No installed tap package was touched.");
+    ui.note(&format!("{}  {}", ui.section("Untapped"), ui.info(&tap)));
+    ui.note("No installed tap package was touched.");
     Ok(())
 }
 
@@ -1009,13 +1005,11 @@ fn commit_install(
 
     if let Err(error) = result {
         let mut issues = Vec::new();
-        if link_created {
-            if let Err(remove_error) = fs::remove_file(&link) {
-                issues.push(format!(
-                    "failed to remove '{}': {remove_error}",
-                    link.display()
-                ));
-            }
+        if link_created && let Err(remove_error) = fs::remove_file(&link) {
+            issues.push(format!(
+                "failed to remove '{}': {remove_error}",
+                link.display()
+            ));
         }
         if file_created {
             let executable = keg.join("bin").join(&plan.bin);
@@ -1172,10 +1166,10 @@ fn commit_uninstall(prefix: &Path, receipt: &TapReceipt) -> Result<()> {
         let _ = fs::remove_dir(keg.join("bin"));
         let _ = fs::remove_dir(&keg);
     }
-    if let Some(package_rel) = keg_rel.parent() {
-        if verify_ancestor_dirs(prefix, package_rel, "tap package").unwrap_or(false) {
-            let _ = fs::remove_dir(prefix.join(package_rel));
-        }
+    if let Some(package_rel) = keg_rel.parent()
+        && verify_ancestor_dirs(prefix, package_rel, "tap package").unwrap_or(false)
+    {
+        let _ = fs::remove_dir(prefix.join(package_rel));
     }
     drop(quarantine);
     Ok(())
@@ -1546,11 +1540,11 @@ fn tap_dir(prefix: &Path, owner: &str, repo: &str) -> PathBuf {
 }
 
 fn render_plan(formatter: &DnfStyleFormatter, plan: &TapPlan, title: &str) {
-    println!(
+    formatter.note(&format!(
         "{}  {}",
         formatter.section(title),
         formatter.info(&plan.qualified)
-    );
+    ));
     let state = match &plan.installed {
         Some(receipt) => format!("installed ({})", receipt.version),
         None => "not installed".to_string(),
@@ -1570,7 +1564,7 @@ fn render_plan(formatter: &DnfStyleFormatter, plan: &TapPlan, title: &str) {
         ("Manifest SHA", plan.manifest_sha256.clone()),
         ("State", state),
     ] {
-        println!("{}", formatter.field(label, &value));
+        formatter.note(&formatter.field(label, &value));
     }
 }
 

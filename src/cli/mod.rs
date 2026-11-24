@@ -80,7 +80,7 @@ enum Commands {
         service_dirs: Vec<PathBuf>,
     },
 
-    /// Preview or list services for brewrs-managed packages without starting them
+    /// Preview or list services for installed packages without starting them
     Services {
         #[command(subcommand)]
         action: ServiceAction,
@@ -140,6 +140,9 @@ enum Commands {
         /// Install from HEAD (unsupported; only stable bottles are supported)
         #[arg(long, conflicts_with = "cask")]
         head: bool,
+        /// Package source: `homebrew` (default) or the reviewed official `upstream` build
+        #[arg(long, value_enum, conflicts_with = "cask")]
+        source: Option<crate::native::install::SourceFlag>,
         #[command(flatten)]
         kind: PackageKind,
         #[command(flatten)]
@@ -267,7 +270,7 @@ enum Commands {
         /// Show a dependency tree (recursive dependents with --reverse)
         #[arg(long)]
         tree: bool,
-        /// Show brewrs-managed formulae that depend on this package
+        /// Show installed formulae that depend on this package
         #[arg(long)]
         reverse: bool,
     },
@@ -290,10 +293,13 @@ enum NativeAction {
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
+        /// Package source: `homebrew` (default) or the reviewed official `upstream` build
+        #[arg(long, value_enum)]
+        source: Option<crate::native::install::SourceFlag>,
         #[command(flatten)]
         transaction: Transaction,
     },
-    /// Upgrade selected brewrs-managed formulae (all if omitted)
+    /// Upgrade selected formulae (all if omitted)
     Upgrade {
         packages: Vec<String>,
         #[command(flatten)]
@@ -404,6 +410,7 @@ impl Cli {
             Commands::Native { action } => match action {
                 NativeAction::Install {
                     packages,
+                    source,
                     transaction,
                 } => {
                     native::install(
@@ -412,6 +419,7 @@ impl Cli {
                         &packages,
                         transaction.dry_run,
                         transaction.yes,
+                        source,
                     )
                     .await?;
                 }
@@ -425,6 +433,7 @@ impl Cli {
                         &packages,
                         transaction.dry_run,
                         transaction.yes,
+                        true,
                     )
                     .await?;
                 }
@@ -521,6 +530,7 @@ impl Cli {
                 force,
                 no_deps,
                 head,
+                source,
                 kind,
                 transaction,
             } => {
@@ -549,6 +559,7 @@ impl Cli {
                         &packages,
                         transaction.dry_run,
                         transaction.yes,
+                        source,
                     )
                     .await?;
                 }

@@ -6,12 +6,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{config::Config, ui::DnfStyleFormatter};
+use crate::{
+    config::Config,
+    ui::{
+        DnfStyleFormatter,
+        table::{Row, Section, display_path},
+    },
+};
 
 use super::plan::PlannedFormula;
+pub(crate) use super::plan::SourceFlag;
+use super::portable::Catalog;
 use super::store::{
-    Dependency, Prepared, Receipt, Store, validate_conflicts, validate_dependencies_with_retained,
-    validate_retained_pin_closure,
+    Dependency, PackageSource, Prepared, Receipt, Store, validate_conflicts,
+    validate_dependencies_with_retained, validate_retained_pin_closure,
 };
 use super::{archive, default_target, download, plan, relocate};
 
@@ -21,6 +29,7 @@ pub(crate) async fn install(
     packages: &[String],
     dry_run: bool,
     yes: bool,
+    source: Option<SourceFlag>,
 ) -> Result<()> {
     if std::env::consts::OS != "macos" {
         bail!("Native installation is supported on macOS only; plan and fetch are still available");
@@ -31,100 +40,185 @@ pub(crate) async fn install(
     let existing = store.installed()?;
     let retained = store.retained()?;
     let existing_casks = super::cask_store::installed(&store)?;
-    let plan = plan::resolve(config, packages, &tag).await?;
-    let pending = pending_packages(&plan, &existing, &retained)?;
+    let formatter = DnfStyleFormatter::new(config);
+    let remaining;
+    let packages = if source.is_none() {
+        let (rest, notes) =
+            partition_upstream_installed(super::portable::catalog()?, packages, &existing);
+        for note in &notes {
+            formatter.note(note);
+        }
+        if rest.is_empty() {
+            return Ok(());
+        }
+        remaining = rest;
+        &remaining[..]
+    } else {
+        packages
+    };
+    let plan = match source {
+        Some(SourceFlag::Upstream) => super::portable::catalog()?.plan_targets(packages, &tag)?,
+        Some(SourceFlag::Homebrew) | None => plan::resolve(config, packages, &tag).await?,
+    };
+    validate_sources(&plan, &existing)?;
+    let pending = pending_packages(&plan, &existing, &retained).map_err(|error| {
+        with_upstream_hint(super::portable::catalog(), error, &plan, &existing, &tag)
+    })?;
     let mut projected = existing.clone();
     for item in &pending {
         projected.push(item.receipt.clone());
     }
     super::cask_store::validate_cask_conflicts(&existing_casks, &projected)?;
-    let promotions = requested_promotions(&plan, &existing);
-    let formatter = DnfStyleFormatter::new(config);
-    let rows: Vec<_> = plan
+    let installed_requested: Vec<String> = pending
         .iter()
-        .map(|formula| {
-            let action = if pending
-                .iter()
-                .any(|entry| entry.receipt.name == formula.name)
-            {
-                if formula.cellar == ":any" {
-                    if formula.keg_only {
-                        "Relocate & install (keg-only)"
-                    } else {
-                        "Relocate & install"
-                    }
-                } else if formula.keg_only {
-                    "Install (keg-only)"
-                } else {
-                    "Install"
-                }
-            } else if promotions
-                .iter()
-                .any(|receipt| receipt.name == formula.name)
-            {
-                "Mark requested"
-            } else {
-                "Already installed"
-            };
-            let reason = if formula.requested
-                || existing
-                    .iter()
-                    .any(|receipt| receipt.name == formula.name && receipt.requested)
-            {
-                "Requested"
-            } else {
-                "Dependency"
-            };
-            vec![
-                formula.name.clone(),
-                formula.version.clone(),
-                action.into(),
-                reason.into(),
-            ]
+        .filter(|item| item.formula.requested)
+        .map(|item| format!("{} {}", item.formula.name, item.formula.version))
+        .collect();
+    let installed_dependencies = pending
+        .iter()
+        .filter(|item| !item.formula.requested)
+        .count();
+    let installed_caveats: Vec<(&str, &str)> = pending
+        .iter()
+        .filter(|item| item.formula.requested)
+        .filter_map(|item| {
+            item.formula
+                .caveats
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| (item.formula.name.as_str(), text))
         })
         .collect();
-    println!(
-        "{}  {}",
-        formatter.section("Native install"),
-        formatter.info(&tag)
-    );
-    println!(
-        "{}",
-        formatter.table(&["Package", "Version", "Action", "Reason"], &rows)
-    );
-    println!(
-        "{}",
-        formatter.field("Prefix", &store.prefix().display().to_string())
-    );
-
+    let promotions = requested_promotions(&plan, &existing);
     if pending.is_empty() && promotions.is_empty() {
-        println!("\nNothing to install.");
+        for (formula, alias) in requested_installed(packages, &plan)? {
+            let name = match alias {
+                Some(typed) => format!("{typed} → {}", formula.name),
+                None => formula.name.clone(),
+            };
+            formatter.note(&format!("{name} {} is already installed.", formula.version));
+        }
+        if dry_run {
+            formatter.note("\nDry run: nothing to do.");
+        }
         return Ok(());
     }
+    let mut installing = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut promoting = Vec::new();
+    let mut present = Vec::new();
+    for formula in &plan {
+        let requested = formula.requested
+            || existing
+                .iter()
+                .any(|receipt| receipt.name == formula.name && receipt.requested);
+        let (action, group) = if pending
+            .iter()
+            .any(|entry| entry.receipt.name == formula.name)
+        {
+            (
+                "install",
+                if requested {
+                    &mut installing
+                } else {
+                    &mut dependencies
+                },
+            )
+        } else if promotions
+            .iter()
+            .any(|receipt| receipt.name == formula.name)
+        {
+            ("mark-requested", &mut promoting)
+        } else {
+            ("already-installed", &mut present)
+        };
+        let note = formula_note(formula.keg_only);
+        let cells = vec![
+            formula.name.clone(),
+            formula.version.clone(),
+            formula.source.label().to_ascii_lowercase(),
+        ];
+        group.push(Row::plan(action, note, cells).requested(requested));
+    }
+    let (requested_count, dependency_count) = (installing.len(), dependencies.len());
+    let mut summary = Vec::new();
+    if requested_count + dependency_count != 0 {
+        summary.push(("Install", package_count(requested_count, dependency_count)));
+    }
+    if !promotions.is_empty() {
+        let count = promotions.len();
+        summary.push((
+            "Mark",
+            format!(
+                "{count} {} as requested",
+                plural(count, "package", "packages")
+            ),
+        ));
+    }
+    if prefix.is_some() {
+        summary.push(("Prefix", display_path(store.prefix())));
+    }
+    let rendered = formatter.plan_table(
+        "Install plan",
+        &["Package", "Version", "Source"],
+        vec![
+            Section::new("Installing", installing),
+            Section::new("Installing dependencies", dependencies),
+            Section::new("Promoting", promoting),
+            Section::new("Already installed", present),
+        ],
+        &summary,
+    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
+
     if dry_run {
         let count = pending.len() + promotions.len();
-        let noun = if count == 1 { "change" } else { "changes" };
-        println!("\n{count} {noun} planned. No packages changed.");
+        let noun = plural(count, "change", "changes");
+        formatter.note(&format!(
+            "\nDry run: {count} {noun} planned, nothing applied."
+        ));
         return Ok(());
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
+    let question = install_question(pending.len(), promotions.len());
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
         return Ok(());
     }
 
     if pending.iter().any(|item| item.formula.cellar == ":any") {
         relocate::preflight()?;
     }
+    if !pending.is_empty() {
+        eprintln!();
+    }
     let service_names: Vec<String> = pending
         .iter()
         .filter(|item| item.formula.has_service)
         .map(|item| item.formula.name.clone())
         .collect();
+    let steps = crate::ui::steps::Steps::new(config);
     let mut downloaded = Vec::new();
     for candidate in pending {
-        let bottle = fetch_formula(config, candidate.formula).await?;
-        downloaded.push((candidate, bottle));
+        let formula = candidate.formula;
+        let step = steps.start(&format!("Downloading {} {}", formula.name, formula.version));
+        match fetch_formula(config, formula).await {
+            Ok(bottle) => {
+                step.done(&format!(
+                    "Downloaded {} {} (checksum verified)",
+                    formula.name, formula.version
+                ));
+                downloaded.push((candidate, bottle));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
     }
     let store = if promotions.is_empty() {
         Store::open(&path, true)?
@@ -134,52 +228,95 @@ pub(crate) async fn install(
     let mut staged = Vec::new();
     for (candidate, bottle) in downloaded {
         let needs_relocation = candidate.formula.cellar == ":any";
-        staged.push((needs_relocation, stage_formula(&store, candidate, &bottle)?));
+        let name = candidate.formula.name.clone();
+        let step = steps.start(&format!("Unpacking {name}"));
+        match stage_formula(&store, candidate, &bottle) {
+            Ok(package) => {
+                step.done(&format!("Unpacked {name}"));
+                staged.push((needs_relocation, package));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
     }
-    relocate::staged(
-        store.prefix(),
+    let relocate_items = || {
         staged
             .iter()
             .map(|(needs_relocation, package)| relocate::Item {
                 package,
                 needs_relocation: *needs_relocation,
-            }),
-    )?;
+            })
+    };
+    let relocate_count = staged.iter().filter(|(needs, _)| *needs).count();
+    if relocate_count != 0 {
+        let noun = plural(relocate_count, "package", "packages");
+        let step = steps.start(&format!("Relocating {relocate_count} {noun}"));
+        match relocate::staged(store.prefix(), relocate_items()) {
+            Ok(()) => step.done(&format!("Relocated {relocate_count} {noun}")),
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
+    } else {
+        relocate::staged(store.prefix(), relocate_items())?;
+    }
     let prepared: Vec<_> = staged.into_iter().map(|(_, package)| package).collect();
     let count = prepared.len();
     let any_keg_only = prepared.iter().any(|package| package.receipt.keg_only);
-    if promotions.is_empty() {
+    if count != 0 {
+        let step = steps.start("Linking into prefix");
+        let result = if promotions.is_empty() {
+            store.commit(prepared)
+        } else {
+            store.commit_with_promotions(prepared, &promotions)
+        };
+        match result {
+            Ok(()) => step.done(&format!(
+                "Linked {count} {}",
+                plural(count, "package", "packages")
+            )),
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
+    } else if promotions.is_empty() {
         store.commit(prepared)?;
     } else {
         store.commit_with_promotions(prepared, &promotions)?;
     }
     if count != 0 {
-        println!(
-            "\n{} {count} {}.",
-            formatter.success("Installed"),
-            if count == 1 { "formula" } else { "formulae" }
-        );
-        println!(
-            "{}",
-            formatter.field("Bin", &store.prefix().join("bin").display().to_string())
-        );
+        let bin = store.prefix().join("bin");
+        formatter.note(&format!(
+            "\n{}",
+            formatter.result(&installed_summary(
+                &installed_requested,
+                installed_dependencies
+            ))
+        ));
+        let mut follow_up = vec![("Bin", display_path(&bin))];
         if any_keg_only {
-            println!(
-                "{}",
-                formatter.field("Opt", &store.prefix().join("opt").display().to_string())
-            );
+            follow_up.push(("Opt", display_path(&store.prefix().join("opt"))));
         }
         if !service_names.is_empty() {
-            println!(
-                "Note: {} {} an optional service (not started automatically).",
-                service_names.join(", "),
-                if service_names.len() == 1 {
-                    "declares"
-                } else {
-                    "declare"
-                }
-            );
+            follow_up.push((
+                "Service",
+                format!("{} (not started automatically)", service_names.join(", ")),
+            ));
         }
+        let path_value = std::env::var_os("PATH");
+        if let Some(hint) = next_path_hint(
+            path_value.as_deref().unwrap_or(std::ffi::OsStr::new("")),
+            &bin,
+            prefix.map(|_| store.prefix()),
+        ) {
+            follow_up.push(("Next", hint));
+        }
+        formatter.note(&formatter.fields(&follow_up));
+        print_installed_caveats(&formatter, store.prefix(), &installed_caveats);
     }
     if !promotions.is_empty() {
         let names = promotions
@@ -187,9 +324,239 @@ pub(crate) async fn install(
             .map(|receipt| receipt.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{}: {names}", formatter.success("Marked as requested"));
+        formatter.note(&format!(
+            "{}: {names}",
+            formatter.success("Marked as requested")
+        ));
     }
     Ok(())
+}
+
+/// The exceptional note shown for a plan row, or an empty string.
+fn formula_note(keg_only: bool) -> String {
+    if keg_only {
+        "keg-only".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The confirmation question for an install with pending packages and/or
+/// promotions; `confirm` appends the `[y/N]` suffix.
+fn install_question(pending: usize, promotions: usize) -> String {
+    match (pending, promotions) {
+        (0, count) => format!(
+            "Mark {count} {} as requested?",
+            plural(count, "package", "packages")
+        ),
+        (count, 0) => format!("Install {count} {}?", plural(count, "package", "packages")),
+        (installs, marks) => format!(
+            "Install {installs} {} and mark {marks} as requested?",
+            plural(installs, "package", "packages")
+        ),
+    }
+}
+
+/// `1 package`, or `2 packages (1 requested, 1 dependency)`; the breakdown is
+/// dropped when nothing was pulled in as a dependency.
+fn package_count(requested: usize, dependencies: usize) -> String {
+    let count = requested + dependencies;
+    let total = format!("{count} {}", plural(count, "package", "packages"));
+    if dependencies == 0 {
+        total
+    } else {
+        format!(
+            "{total} ({requested} requested, {dependencies} {})",
+            plural(dependencies, "dependency", "dependencies")
+        )
+    }
+}
+
+fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
+    if count == 1 { one } else { many }
+}
+
+/// Comma-joined items, keeping the first four and summarising the rest as
+/// `, and N more` so a wide result line stays readable.
+fn limited_list(items: &[String]) -> String {
+    const LIMIT: usize = 4;
+    if items.len() <= LIMIT {
+        return items.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        items[..LIMIT].join(", "),
+        items.len() - LIMIT
+    )
+}
+
+/// The `Installed ...` outcome text: each requested formula as `name version`,
+/// plus a dependency count when the plan also pulled in non-requested formulae.
+fn installed_summary(requested: &[String], dependencies: usize) -> String {
+    if requested.is_empty() {
+        return format!(
+            "Installed {dependencies} {}",
+            plural(dependencies, "package", "packages")
+        );
+    }
+    let mut text = format!("Installed {}", limited_list(requested));
+    if dependencies != 0 {
+        text.push_str(&format!(
+            " (+{dependencies} {})",
+            plural(dependencies, "dependency", "dependencies")
+        ));
+    }
+    text
+}
+
+/// The `Upgraded ...` outcome text, with each `name old → new` transition.
+fn upgraded_summary(upgraded: &[String]) -> String {
+    format!("Upgraded {}", limited_list(upgraded))
+}
+
+/// The `Removed ...` outcome text. Explicitly requested removals are named and
+/// any autoremoved leftovers are counted; a pure autoremove names its packages.
+fn removed_summary(requested: &[String], unused: &[String]) -> String {
+    if requested.is_empty() {
+        return format!("Removed {}", limited_list(unused));
+    }
+    let mut text = format!("Removed {}", limited_list(requested));
+    if !unused.is_empty() {
+        text.push_str(&format!(
+            " (+{} unused {})",
+            unused.len(),
+            plural(unused.len(), "dependency", "dependencies")
+        ));
+    }
+    text
+}
+
+/// Whether any `$PATH` entry names `bin`, matching by exact text or by
+/// canonical path so a symlinked prefix entry still counts.
+fn path_includes(path_value: &std::ffi::OsStr, bin: &Path) -> bool {
+    let canonical = fs::canonicalize(bin).ok();
+    std::env::split_paths(path_value).any(|entry| {
+        entry == bin
+            || canonical
+                .as_ref()
+                .is_some_and(|bin| fs::canonicalize(&entry).is_ok_and(|entry| entry == *bin))
+    })
+}
+
+/// The follow-up hint shown after an install when `$PATH` does not reach the
+/// prefix's `bin`: the shellenv command that adds it.
+fn next_path_hint(
+    path_value: &std::ffi::OsStr,
+    bin: &Path,
+    prefix: Option<&Path>,
+) -> Option<String> {
+    if path_includes(path_value, bin) {
+        return None;
+    }
+    let command = match prefix {
+        Some(prefix) => format!(
+            "eval \"$(brewrs shellenv --prefix {})\"",
+            posix_quote(&prefix.to_string_lossy())
+        ),
+        None => "eval \"$(brewrs shellenv)\"".to_string(),
+    };
+    Some(format!("{command}  (add it to ~/.zprofile to keep it)"))
+}
+
+/// Print install caveats the way `info` does; when more than one requested
+/// formula carries notes, each block is titled with its formula. Caveats are
+/// human-readable, so plain mode sends them to stderr.
+fn print_installed_caveats(formatter: &DnfStyleFormatter, prefix: &Path, caveats: &[(&str, &str)]) {
+    match caveats {
+        [] => {}
+        [(_, text)] => {
+            if let Some(block) = super::info::caveat_block(formatter, prefix, "Caveats", Some(text))
+            {
+                formatter.note(&block);
+            }
+        }
+        _ => {
+            for (name, text) in caveats {
+                let title = format!("Caveats for {name}");
+                if let Some(block) =
+                    super::info::caveat_block(formatter, prefix, &title, Some(text))
+                {
+                    formatter.note(&block);
+                }
+            }
+        }
+    }
+}
+
+/// Split install targets into those still to resolve and the notices for
+/// catalog packages already installed from upstream. Without `--source` the
+/// switch error would be useless advice, so these are reported as satisfied.
+fn partition_upstream_installed(
+    catalog: &Catalog,
+    targets: &[String],
+    installed: &[Receipt],
+) -> (Vec<String>, Vec<String>) {
+    let mut rest = Vec::new();
+    let mut notes = Vec::new();
+    for target in targets {
+        let present = catalog.find(target).and_then(|package| {
+            installed.iter().find(|receipt| {
+                receipt.name == package.name && receipt.source == PackageSource::Upstream
+            })
+        });
+        match present {
+            Some(receipt) => {
+                let name = if target == &receipt.name {
+                    receipt.name.clone()
+                } else {
+                    format!("{target} → {}", receipt.name)
+                };
+                notes.push(format!(
+                    "{name} {} is already installed (official upstream build).",
+                    receipt.version
+                ));
+            }
+            None => rest.push(target.clone()),
+        }
+    }
+    (rest, notes)
+}
+
+/// Pair each requested target with the planned formula it resolved to.
+///
+/// The plan only carries canonical names, so an alias (`nvim`) is mapped back
+/// through the bundled catalog; the typed name is returned alongside the
+/// formula when it differs from the canonical name.
+fn requested_installed<'a>(
+    targets: &[String],
+    planned: &'a [PlannedFormula],
+) -> Result<Vec<(&'a PlannedFormula, Option<String>)>> {
+    let catalog = super::portable::catalog()?;
+    let mut matched: HashSet<&str> = HashSet::new();
+    let mut paired = Vec::with_capacity(targets.len());
+    for target in targets {
+        let typed = plan::parse_target(target)?;
+        let formula = planned
+            .iter()
+            .find(|formula| formula.name == typed)
+            .or_else(|| {
+                catalog
+                    .find(typed)
+                    .and_then(|package| planned.iter().find(|formula| formula.name == package.name))
+            })
+            .or_else(|| {
+                planned
+                    .iter()
+                    .find(|formula| formula.requested && !matched.contains(formula.name.as_str()))
+            });
+        let Some(formula) = formula else {
+            continue;
+        };
+        matched.insert(formula.name.as_str());
+        let alias = (formula.name != typed).then(|| typed.to_string());
+        paired.push((formula, alias));
+    }
+    Ok(paired)
 }
 
 fn requested_promotions(plan: &[PlannedFormula], installed: &[Receipt]) -> Vec<Receipt> {
@@ -204,10 +571,12 @@ fn requested_promotions(plan: &[PlannedFormula], installed: &[Receipt]) -> Vec<R
         .collect()
 }
 
-async fn fetch_formula(config: &Config, formula: &PlannedFormula) -> Result<PathBuf> {
-    download::fetch(config, &formula.url, &formula.sha256)
-        .await
-        .with_context(|| format!("Failed to fetch {} {}", formula.name, formula.version))
+pub(super) async fn fetch_formula(config: &Config, formula: &PlannedFormula) -> Result<PathBuf> {
+    let download = match formula.source {
+        PackageSource::Upstream => super::portable::fetch(config, formula).await,
+        PackageSource::Homebrew => download::fetch(config, &formula.url, &formula.sha256).await,
+    };
+    download.with_context(|| format!("Failed to fetch {} {}", formula.name, formula.version))
 }
 
 #[derive(Debug)]
@@ -232,15 +601,24 @@ struct UpgradeChange {
 fn stage_formula(store: &Store, candidate: Candidate<'_>, bottle: &Path) -> Result<Prepared> {
     let stage = store.stage()?;
     let receipt = candidate.receipt;
-    archive::unpack(
-        bottle,
-        stage.path(),
-        &receipt.name,
-        &receipt.version,
-        &receipt.sha256,
-    )
-    .with_context(|| format!("Failed to stage {} {}", receipt.name, receipt.version))?;
-    if receipt.name == "nvm" {
+    match candidate.formula.source {
+        PackageSource::Upstream => super::portable::stage(candidate.formula, bottle, stage.path())
+            .with_context(|| {
+                format!(
+                    "Failed to stage upstream {} {}",
+                    receipt.name, receipt.version
+                )
+            })?,
+        PackageSource::Homebrew => archive::unpack(
+            bottle,
+            stage.path(),
+            &receipt.name,
+            &receipt.version,
+            &receipt.sha256,
+        )
+        .with_context(|| format!("Failed to stage {} {}", receipt.name, receipt.version))?,
+    }
+    if receipt.source == PackageSource::Homebrew && receipt.name == "nvm" {
         relocate_nvm_wrapper(store.prefix(), stage.path(), &receipt.version)
             .context("Failed to relocate the staged nvm wrapper")?;
     }
@@ -379,6 +757,7 @@ fn receipt_for(
         name: formula.name.clone(),
         version: formula.version.clone(),
         version_scheme,
+        source: formula.source,
         sha256: formula.sha256.clone(),
         requested,
         keg_only: formula.keg_only,
@@ -393,7 +772,8 @@ pub(crate) async fn upgrade(
     packages: &[String],
     dry_run: bool,
     yes: bool,
-) -> Result<()> {
+    announce_current: bool,
+) -> Result<bool> {
     if std::env::consts::OS != "macos" {
         bail!("Native upgrades are supported on macOS only");
     }
@@ -401,73 +781,137 @@ pub(crate) async fn upgrade(
     let store = Store::open(&path, false)?;
     let installed = store.installed()?;
     let retained = store.retained()?;
+    let formatter = DnfStyleFormatter::new(config);
     let selected = if packages.is_empty() {
         installed.clone()
     } else {
         removal_plan(packages, &installed)?
     };
     if selected.is_empty() {
-        println!("No brewrs-managed packages to upgrade.");
-        return Ok(());
+        formatter.note("No packages installed yet.");
+        return Ok(false);
     }
 
-    let (tag, changes) = resolve_changes(config, &installed, &selected, &retained).await?;
+    let (_, changes) = resolve_changes(config, &installed, &selected, &retained).await?;
     if changes.is_empty() {
-        println!("All selected packages are up to date.");
-        return Ok(());
+        if announce_current {
+            formatter.note("All packages are up to date.");
+        }
+        return Ok(false);
     }
 
-    let formatter = DnfStyleFormatter::new(config);
-    render_upgrade_preview(&formatter, "Native upgrade", &tag, store.prefix(), &changes);
+    render_upgrade_preview(
+        &formatter,
+        "Upgrade plan",
+        store.prefix(),
+        prefix.is_some(),
+        &changes,
+    );
     if dry_run {
-        println!("\nNo packages changed.");
-        return Ok(());
+        let count = changes.len();
+        let noun = plural(count, "change", "changes");
+        formatter.note(&format!(
+            "\nDry run: {count} {noun} planned, nothing applied."
+        ));
+        return Ok(true);
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
-        return Ok(());
+    let question = format!(
+        "Upgrade {} {}?",
+        changes.len(),
+        plural(changes.len(), "package", "packages")
+    );
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
+        return Ok(true);
     }
 
     if changes.iter().any(|item| item.formula.cellar == ":any") {
         relocate::preflight()?;
     }
     let store = Store::open_existing(&path)?;
+    eprintln!();
+    let steps = crate::ui::steps::Steps::new(config);
+    let upgraded: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{} {} → {}",
+                change.formula.name, change.old.version, change.new.version
+            )
+        })
+        .collect();
     let mut staged = Vec::new();
     for change in changes {
-        let bottle = fetch_formula(config, &change.formula).await?;
+        let name = change.formula.name.clone();
+        let version = change.formula.version.clone();
+        let step = steps.start(&format!("Downloading {name} {version}"));
+        let bottle = match fetch_formula(config, &change.formula).await {
+            Ok(bottle) => {
+                step.done(&format!("Downloaded {name} {version} (checksum verified)"));
+                bottle
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        };
         let needs_relocation = change.formula.cellar == ":any";
+        let step = steps.start(&format!("Unpacking {name}"));
         let candidate = Candidate {
             formula: &change.formula,
             receipt: change.new,
         };
-        staged.push((
-            needs_relocation,
-            change.old,
-            stage_formula(&store, candidate, &bottle)?,
-        ));
+        match stage_formula(&store, candidate, &bottle) {
+            Ok(package) => {
+                step.done(&format!("Unpacked {name}"));
+                staged.push((needs_relocation, change.old, package));
+            }
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
     }
-    relocate::staged(
-        store.prefix(),
+    let relocate_items = || {
         staged
             .iter()
             .map(|(needs_relocation, _, package)| relocate::Item {
                 package,
                 needs_relocation: *needs_relocation,
-            }),
-    )?;
+            })
+    };
+    let relocate_count = staged.iter().filter(|(needs, _, _)| *needs).count();
+    if relocate_count != 0 {
+        let noun = plural(relocate_count, "package", "packages");
+        let step = steps.start(&format!("Relocating {relocate_count} {noun}"));
+        match relocate::staged(store.prefix(), relocate_items()) {
+            Ok(()) => step.done(&format!("Relocated {relocate_count} {noun}")),
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
+    } else {
+        relocate::staged(store.prefix(), relocate_items())?;
+    }
     let replacements: Vec<_> = staged
         .into_iter()
         .map(|(_, old, package)| (old, package))
         .collect();
-    let count = replacements.len();
-    store.upgrade(replacements)?;
-    println!(
-        "\n{} {count} {}.",
-        formatter.success("Upgraded"),
-        if count == 1 { "formula" } else { "formulae" }
-    );
-    Ok(())
+    let step = steps.start("Replacing installed versions");
+    match store.upgrade(replacements) {
+        Ok(()) => step.done("Replaced old versions"),
+        Err(error) => {
+            step.fail();
+            return Err(error);
+        }
+    }
+    formatter.note(&format!(
+        "\n{}",
+        formatter.result(&upgraded_summary(&upgraded))
+    ));
+    Ok(true)
 }
 
 /// Report the native packages that have a newer bottle available.
@@ -487,20 +931,26 @@ pub(crate) async fn check_updates(config: &Config, prefix: Option<&Path>) -> Res
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
     let installed = store.installed()?;
+    let formatter = DnfStyleFormatter::new(config);
     if installed.is_empty() {
-        println!("No brewrs-managed packages to upgrade.");
+        formatter.note("No packages installed yet.");
         return Ok(false);
     }
     let retained = store.retained()?;
 
-    let (tag, changes) = resolve_changes(config, &installed, &installed, &retained).await?;
-    let formatter = DnfStyleFormatter::new(config);
+    let (_, changes) = resolve_changes(config, &installed, &installed, &retained).await?;
     if changes.is_empty() {
-        println!("All brewrs-managed packages are up to date.");
+        formatter.note("All packages are up to date.");
         return Ok(false);
     }
-    render_upgrade_preview(&formatter, "Native updates", &tag, store.prefix(), &changes);
-    println!(
+    render_upgrade_preview(
+        &formatter,
+        "Available updates",
+        store.prefix(),
+        prefix.is_some(),
+        &changes,
+    );
+    formatter.note(&format!(
         "\n{} {} available.",
         formatter.success(&changes.len().to_string()),
         if changes.len() == 1 {
@@ -508,7 +958,7 @@ pub(crate) async fn check_updates(config: &Config, prefix: Option<&Path>) -> Res
         } else {
             "updates"
         }
-    );
+    ));
     Ok(true)
 }
 
@@ -522,14 +972,132 @@ async fn resolve_changes(
     selected: &[Receipt],
     retained: &[Receipt],
 ) -> Result<(String, Vec<UpgradeChange>)> {
-    let targets: Vec<_> = selected
+    let tag = default_target()?;
+    // Upgrades follow the recorded source; a package never switches source.
+    let homebrew: Vec<String> = selected
         .iter()
+        .filter(|receipt| receipt.source == PackageSource::Homebrew)
+        .map(|receipt| format!("homebrew/core/{}", receipt.name))
+        .collect();
+    let upstream: Vec<String> = selected
+        .iter()
+        .filter(|receipt| receipt.source == PackageSource::Upstream)
         .map(|receipt| receipt.name.clone())
         .collect();
-    let tag = default_target()?;
-    let plan = plan::resolve(config, &targets, &tag).await?;
+    let mut plan = if upstream.is_empty() {
+        Vec::new()
+    } else {
+        super::portable::catalog()?
+            .plan_targets(&upstream, &tag)
+            .context("Cannot plan upgrades for upstream-installed packages")?
+    };
+    if !homebrew.is_empty() {
+        plan.extend(plan::resolve(config, &homebrew, &tag).await?);
+    }
+    validate_sources(&plan, installed)?;
     let changes = planned_changes(&plan, installed, selected, retained)?;
     Ok((tag, changes))
+}
+
+/// Reject plans that mix sources for one package or let an upstream build
+/// stand in for a Homebrew dependency.
+fn validate_sources(plan: &[PlannedFormula], installed: &[Receipt]) -> Result<()> {
+    for formula in plan {
+        if formula.source == PackageSource::Homebrew {
+            for dependency in &formula.dependencies {
+                let origin = if plan.iter().any(|other| {
+                    other.name == *dependency && other.source == PackageSource::Upstream
+                }) {
+                    "planned from upstream"
+                } else if installed.iter().any(|receipt| {
+                    receipt.name == *dependency && receipt.source == PackageSource::Upstream
+                }) {
+                    "installed from upstream"
+                } else {
+                    continue;
+                };
+                bail!(
+                    "{} depends on {dependency}, which is {origin}; an upstream build cannot satisfy a Homebrew dependency",
+                    formula.name
+                );
+            }
+        }
+        if let Some(receipt) = installed
+            .iter()
+            .find(|receipt| receipt.name == formula.name && receipt.source != formula.source)
+        {
+            bail!(
+                "{} is installed from {}; uninstall it first to switch",
+                receipt.name,
+                receipt.source.label()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A formula that cannot be installed natively.
+#[derive(Debug)]
+struct InstallBlocked(String);
+
+impl std::fmt::Display for InstallBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InstallBlocked {}
+
+/// Append a hint when the blocker belongs to a requested target (or one of its
+/// dependencies) that the reviewed upstream catalog can supply. The original
+/// error is otherwise unchanged; nothing is ever installed from upstream
+/// without `--source upstream`.
+fn with_upstream_hint(
+    catalog: Result<&Catalog>,
+    error: anyhow::Error,
+    plan: &[PlannedFormula],
+    installed: &[Receipt],
+    tag: &str,
+) -> anyhow::Error {
+    if error.downcast_ref::<InstallBlocked>().is_none() {
+        return error;
+    }
+    let Ok(catalog) = catalog else {
+        return error;
+    };
+    let blocked = |formula: &PlannedFormula| {
+        !formula.install_blockers.is_empty()
+            && !installed.iter().any(|receipt| receipt.name == formula.name)
+    };
+    let mut message = error.to_string();
+    let mut hinted = HashSet::new();
+    for target in plan.iter().filter(|formula| formula.requested) {
+        // Dependencies precede dependents, so one forward walk over the plan
+        // collects this target's closure.
+        let mut closure = HashSet::from([target.name.as_str()]);
+        for formula in plan.iter().rev() {
+            if closure.contains(formula.name.as_str()) {
+                closure.extend(formula.dependencies.iter().map(String::as_str));
+            }
+        }
+        if !plan
+            .iter()
+            .any(|formula| closure.contains(formula.name.as_str()) && blocked(formula))
+        {
+            continue;
+        }
+        if let Some(package) = catalog
+            .find(&target.name)
+            .filter(|package| package.supports(tag))
+            && hinted.insert(package.name.as_str())
+        {
+            message.push_str(&format!(
+                "\nAn official upstream build is available: brewrs install --source upstream {}",
+                package.name
+            ));
+        }
+    }
+    anyhow::anyhow!(message)
 }
 
 /// Reduce an already-resolved plan to the ordered changes it would apply.
@@ -615,33 +1183,44 @@ fn planned_changes(
 fn render_upgrade_preview(
     formatter: &DnfStyleFormatter,
     title: &str,
-    tag: &str,
     prefix: &Path,
+    show_prefix: bool,
     changes: &[UpgradeChange],
 ) {
-    println!("{}  {}", formatter.section(title), formatter.info(tag));
-    println!(
-        "{}",
-        formatter.table(
-            &["Package", "Installed", "Available"],
-            &upgrade_rows(changes)
-        )
+    let count = changes.len();
+    let mut summary = vec![(
+        "Upgrade",
+        format!("{count} {}", plural(count, "package", "packages")),
+    )];
+    if show_prefix {
+        summary.push(("Prefix", display_path(prefix)));
+    }
+    let rendered = formatter.plan_table(
+        title,
+        &["Package", "Version", "Source"],
+        vec![Section::new("Upgrading", upgrade_rows(changes))],
+        &summary,
     );
-    println!(
-        "{}",
-        formatter.field("Prefix", &prefix.display().to_string())
-    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
 }
 
-fn upgrade_rows(changes: &[UpgradeChange]) -> Vec<Vec<String>> {
+fn upgrade_rows(changes: &[UpgradeChange]) -> Vec<Row> {
     changes
         .iter()
         .map(|change| {
-            vec![
-                change.old.name.clone(),
-                change.old.version.clone(),
-                change.new.version.clone(),
-            ]
+            Row::plan(
+                "upgrade",
+                formula_note(change.formula.keg_only),
+                vec![
+                    change.old.name.clone(),
+                    format!("{} → {}", change.old.version, change.new.version),
+                    change.new.source.label().to_ascii_lowercase(),
+                ],
+            )
+            .requested(change.formula.requested)
         })
         .collect()
 }
@@ -667,6 +1246,12 @@ fn upgrade_plan<'a>(
                     old.name
                 )
             })?;
+        if old.source != new.source {
+            bail!(
+                "Refusing to change the installed source for '{}' during upgrade",
+                old.name
+            );
+        }
         // An unchanged bottle keeps its original pins. The projected graph
         // still rejects upgrading any library that this bottle depends on.
         if new.version_scheme == Some(old.version_scheme)
@@ -756,7 +1341,15 @@ pub(crate) fn remove(
     let installed = store.installed()?;
     let retained = store.retained()?;
     let pending = planned_removals(packages, &installed, autoremove, &retained)?;
-    apply_removal(config, &store, &pending, dry_run, yes, "Remove packages")
+    apply_removal(
+        config,
+        &store,
+        &pending,
+        dry_run,
+        yes,
+        "Remove packages",
+        prefix.is_some(),
+    )
 }
 
 fn planned_removals(
@@ -818,6 +1411,7 @@ pub(crate) fn autoremove(
         dry_run,
         yes,
         "Remove unused dependencies",
+        prefix.is_some(),
     )
 }
 
@@ -876,51 +1470,89 @@ fn apply_removal(
     dry_run: bool,
     yes: bool,
     title: &str,
+    show_prefix: bool,
 ) -> Result<()> {
+    let formatter = DnfStyleFormatter::new(config);
     if pending.is_empty() {
-        println!("No unused dependencies to remove.");
+        formatter.note("No unused dependencies to remove.");
         return Ok(());
     }
-    let formatter = DnfStyleFormatter::new(config);
     let rows: Vec<_> = pending
         .iter()
         .map(|receipt| {
-            vec![
-                receipt.name.clone(),
-                receipt.version.clone(),
-                "Remove".into(),
-            ]
+            Row::plan(
+                "remove",
+                formula_note(receipt.keg_only),
+                vec![
+                    receipt.name.clone(),
+                    receipt.version.clone(),
+                    receipt.source.label().to_ascii_lowercase(),
+                ],
+            )
+            .requested(receipt.requested)
         })
         .collect();
-    println!("{}", formatter.section(title));
-    println!(
-        "{}",
-        formatter.table(&["Package", "Version", "Action"], &rows)
+    let label = if title == "Remove unused dependencies" {
+        "Removing unused dependencies"
+    } else {
+        "Removing"
+    };
+    let count = pending.len();
+    let mut summary = vec![(
+        "Remove",
+        format!("{count} {}", plural(count, "package", "packages")),
+    )];
+    if show_prefix {
+        summary.push(("Prefix", display_path(store.prefix())));
+    }
+    let rendered = formatter.plan_table(
+        "Remove plan",
+        &["Package", "Version", "Source"],
+        vec![Section::new(label, rows)],
+        &summary,
     );
-    println!(
-        "{}",
-        formatter.field("Prefix", &store.prefix().display().to_string())
-    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
     if dry_run {
-        println!("\nNo packages changed.");
+        let noun = plural(count, "change", "changes");
+        formatter.note(&format!(
+            "\nDry run: {count} {noun} planned, nothing applied."
+        ));
         return Ok(());
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
+    let question = format!("Remove {count} {}?", plural(count, "package", "packages"));
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
         return Ok(());
     }
-    store.remove(pending)?;
-    println!(
-        "\n{} {} {}.",
-        formatter.success("Removed"),
-        pending.len(),
-        if pending.len() == 1 {
-            "formula"
-        } else {
-            "formulae"
+    eprintln!();
+    let steps = crate::ui::steps::Steps::new(config);
+    let noun = plural(count, "package", "packages");
+    let step = steps.start(&format!("Unlinking {count} {noun}"));
+    match store.remove(pending) {
+        Ok(()) => step.done(&format!("Unlinked {count} {noun}")),
+        Err(error) => {
+            step.fail();
+            return Err(error);
         }
-    );
+    }
+    let requested_names: Vec<String> = pending
+        .iter()
+        .filter(|receipt| receipt.requested)
+        .map(|receipt| receipt.name.clone())
+        .collect();
+    let unused_names: Vec<String> = pending
+        .iter()
+        .filter(|receipt| !receipt.requested)
+        .map(|receipt| receipt.name.clone())
+        .collect();
+    formatter.note(&format!(
+        "\n{}",
+        formatter.result(&removed_summary(&requested_names, &unused_names))
+    ));
     Ok(())
 }
 
@@ -929,6 +1561,15 @@ fn removal_plan(packages: &[String], installed: &[Receipt]) -> Result<Vec<Receip
     let mut pending = Vec::new();
     for target in packages {
         let name = plan::parse_target(target)?;
+        // A catalog alias (e.g. `nvim`) names the upstream package only when no
+        // package of that exact name is installed.
+        let name = if installed.iter().any(|entry| entry.name == name) {
+            name
+        } else {
+            super::portable::catalog()?
+                .find(target)
+                .map_or(name, |package| package.name.as_str())
+        };
         if selected.insert(name) {
             let receipt = installed
                 .iter()
@@ -943,14 +1584,11 @@ fn removal_plan(packages: &[String], installed: &[Receipt]) -> Result<Vec<Receip
 pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let receipts = store.installed()?;
+    let formatter = DnfStyleFormatter::new(config);
     if receipts.is_empty() {
-        println!(
-            "No brewrs-managed packages in {}.",
-            store.prefix().display()
-        );
+        formatter.note(&format!("No packages in {}.", store.prefix().display()));
         return Ok(());
     }
-    let formatter = DnfStyleFormatter::new(config);
     render_formula_list(&formatter, receipts);
     Ok(())
 }
@@ -970,25 +1608,76 @@ pub(crate) fn list_all(
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let formulae = store.installed()?;
     let casks = super::cask_store::installed(&store)?;
+    let formatter = DnfStyleFormatter::new(config);
     if formulae.is_empty() && casks.is_empty() {
-        println!(
-            "No brewrs-managed packages in {}.",
-            store.prefix().display()
-        );
+        formatter.note(&format!("No packages in {}.", store.prefix().display()));
         return Ok(());
     }
-    let formatter = DnfStyleFormatter::new(config);
-    let has_formulae = !formulae.is_empty();
-    if has_formulae {
-        render_formula_list(&formatter, formulae);
-    }
-    if !casks.is_empty() {
+    if formatter.boxed() {
+        let has_formulae = !formulae.is_empty();
         if has_formulae {
-            println!();
+            render_formula_list(&formatter, formulae);
         }
-        super::cask_install::render_cask_list(&formatter, &casks);
+        if !casks.is_empty() {
+            if has_formulae {
+                println!();
+            }
+            super::cask_install::render_cask_list(&formatter, &casks);
+        }
+    } else {
+        render_inventory(&formatter, &formulae, &casks);
     }
     Ok(())
+}
+
+/// Plain `list`: formula and cask rows in one `Type Name Version Source Reason`
+/// table so scripts see a single, stable schema.
+fn render_inventory(
+    formatter: &DnfStyleFormatter,
+    formulae: &[Receipt],
+    casks: &[super::cask_store::CaskReceipt],
+) {
+    let mut sorted: Vec<&Receipt> = formulae.iter().collect();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut rows: Vec<Vec<String>> = sorted
+        .iter()
+        .map(|receipt| {
+            vec![
+                "formula".to_string(),
+                receipt.name.clone(),
+                receipt.version.clone(),
+                receipt.source.label().to_ascii_lowercase(),
+                reason_token(receipt).to_string(),
+            ]
+        })
+        .collect();
+    let mut sorted_casks: Vec<&super::cask_store::CaskReceipt> = casks.iter().collect();
+    sorted_casks.sort_by(|left, right| left.token.cmp(&right.token));
+    for cask in sorted_casks {
+        rows.push(vec![
+            "cask".to_string(),
+            cask.token.clone(),
+            cask.version.clone(),
+            "homebrew".to_string(),
+            "requested".to_string(),
+        ]);
+    }
+    println!(
+        "{}",
+        formatter.table(
+            "Packages",
+            &["Type", "Name", "Version", "Source", "Reason"],
+            &rows
+        )
+    );
+}
+
+fn reason_token(receipt: &Receipt) -> &'static str {
+    if receipt.requested {
+        "requested"
+    } else {
+        "dependency"
+    }
 }
 
 pub(crate) async fn check_all_updates(
@@ -1007,8 +1696,9 @@ pub(crate) async fn check_all_updates(
     let store = Store::open(&prefix_path(prefix)?, false)?;
     let formulae = store.installed()?;
     let casks = super::cask_store::installed(&store)?;
+    let formatter = DnfStyleFormatter::new(config);
     if formulae.is_empty() && casks.is_empty() {
-        println!("No brewrs-managed packages to upgrade.");
+        formatter.note("No packages installed yet.");
         return Ok(false);
     }
     let mut has_updates = false;
@@ -1035,25 +1725,37 @@ pub(crate) async fn upgrade_all(
     yes: bool,
 ) -> Result<()> {
     if cask_only {
-        return super::cask_install::upgrade(config, prefix, packages, greedy, dry_run, yes).await;
+        return super::cask_install::upgrade(config, prefix, packages, greedy, dry_run, yes, true)
+            .await
+            .map(|_| ());
     }
     if formula_only {
-        return upgrade(config, prefix, packages, dry_run, yes).await;
+        return upgrade(config, prefix, packages, dry_run, yes, true)
+            .await
+            .map(|_| ());
     }
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
     let installed_formulae = store.installed()?;
     let installed_casks = super::cask_store::installed(&store)?;
     if packages.is_empty() {
+        let formatter = DnfStyleFormatter::new(config);
         if installed_formulae.is_empty() && installed_casks.is_empty() {
-            println!("No brewrs-managed packages to upgrade.");
+            formatter.note("No packages installed yet.");
             return Ok(());
         }
+        let both = !installed_formulae.is_empty() && !installed_casks.is_empty();
+        let mut changed = false;
         if !installed_formulae.is_empty() {
-            upgrade(config, prefix, &[], dry_run, yes).await?;
+            changed |= upgrade(config, prefix, &[], dry_run, yes, !both).await?;
         }
         if !installed_casks.is_empty() {
-            super::cask_install::upgrade(config, prefix, &[], greedy, dry_run, yes).await?;
+            changed |=
+                super::cask_install::upgrade(config, prefix, &[], greedy, dry_run, yes, !both)
+                    .await?;
+        }
+        if both && !changed {
+            formatter.note("Everything is up to date.");
         }
         return Ok(());
     }
@@ -1088,11 +1790,25 @@ pub(crate) async fn upgrade_all(
         }
     }
 
+    let both = !formula_targets.is_empty() && !cask_targets.is_empty();
+    let mut changed = false;
     if !formula_targets.is_empty() {
-        upgrade(config, prefix, &formula_targets, dry_run, yes).await?;
+        changed |= upgrade(config, prefix, &formula_targets, dry_run, yes, !both).await?;
     }
     if !cask_targets.is_empty() {
-        super::cask_install::upgrade(config, prefix, &cask_targets, greedy, dry_run, yes).await?;
+        changed |= super::cask_install::upgrade(
+            config,
+            prefix,
+            &cask_targets,
+            greedy,
+            dry_run,
+            yes,
+            !both,
+        )
+        .await?;
+    }
+    if both && !changed {
+        DnfStyleFormatter::new(config).note("Everything is up to date.");
     }
     Ok(())
 }
@@ -1102,23 +1818,36 @@ fn render_formula_list(formatter: &DnfStyleFormatter, mut receipts: Vec<Receipt>
     let rows: Vec<_> = receipts
         .into_iter()
         .map(|receipt| {
+            let reason = reason_token(&receipt).to_string();
             vec![
                 receipt.name,
                 receipt.version,
-                if receipt.requested {
-                    "Requested"
-                } else {
-                    "Dependency"
-                }
-                .into(),
+                receipt.source.label().to_ascii_lowercase(),
+                reason,
             ]
         })
         .collect();
-    println!("{}", formatter.section("Native packages"));
-    println!(
-        "{}",
-        formatter.table(&["Package", "Version", "Reason"], &rows)
-    );
+    let rendered = if formatter.boxed() {
+        formatter.table(
+            &format!("Packages ({})", rows.len()),
+            &["Package", "Version", "Source", "Reason"],
+            &rows,
+        )
+    } else {
+        let rows: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|mut cells| {
+                cells.insert(0, "formula".to_string());
+                cells
+            })
+            .collect();
+        formatter.table(
+            "Packages",
+            &["Type", "Name", "Version", "Source", "Reason"],
+            &rows,
+        )
+    };
+    println!("{rendered}");
 }
 
 fn pending_packages<'a>(
@@ -1140,11 +1869,25 @@ fn pending_packages<'a>(
             bail!("{}", replacement_conflict(existing, &receipt));
         }
         if !formula.install_blockers.is_empty() {
-            bail!(
-                "Cannot install {} natively: {}",
+            let mut message = format!(
+                "Cannot install {} natively: {}.",
                 formula.name,
                 formula.install_blockers.join("; ")
             );
+            for blocker in &formula.install_blockers {
+                if let Some(reason) = blocker_reason(blocker) {
+                    message.push_str("\n  ");
+                    message.push_str(reason);
+                }
+            }
+            if !formula.requested {
+                let needed_by = requested_dependents(plan, &formula.name);
+                if !needed_by.is_empty() {
+                    message.push_str("\n  Needed by: ");
+                    message.push_str(&needed_by.join(", "));
+                }
+            }
+            return Err(InstallBlocked(message).into());
         }
         let receipt = receipt_for(formula, plan, formula.requested)?;
         projected.push(receipt.clone());
@@ -1154,6 +1897,45 @@ fn pending_packages<'a>(
     validate_dependencies_with_retained(installed, &newcomers, retained)?;
     validate_conflicts(&projected)?;
     Ok(pending)
+}
+
+/// A plain-language reason for a blocker whose cause is not obvious.
+fn blocker_reason(blocker: &str) -> Option<&'static str> {
+    match blocker {
+        "requires a fixed Homebrew prefix" => Some(
+            "Homebrew built this bottle for /opt/homebrew only; brewrs installs into its own prefix, so this bottle can't be used.",
+        ),
+        "requires bottle relocation not yet supported for this formula or platform" => {
+            Some("brewrs can't relocate this bottle on this macOS version yet.")
+        }
+        _ => None,
+    }
+}
+
+/// Requested targets that depend on `blocked`, directly or transitively.
+fn requested_dependents<'a>(plan: &'a [PlannedFormula], blocked: &'a str) -> Vec<&'a str> {
+    let mut needed: HashSet<&str> = HashSet::from([blocked]);
+    loop {
+        let before = needed.len();
+        for formula in plan {
+            if formula
+                .dependencies
+                .iter()
+                .any(|dependency| needed.contains(dependency.as_str()))
+            {
+                needed.insert(formula.name.as_str());
+            }
+        }
+        if needed.len() == before {
+            break;
+        }
+    }
+    plan.iter()
+        .filter(|formula| {
+            formula.requested && formula.name != blocked && needed.contains(formula.name.as_str())
+        })
+        .map(|formula| formula.name.as_str())
+        .collect()
 }
 
 /// Explain why `install` refuses to replace an installed package in place,
@@ -1328,11 +2110,11 @@ fn fish_quote(value: &str) -> String {
     out
 }
 
-pub(super) fn confirm() -> Result<bool> {
+pub(super) fn confirm(question: &str) -> Result<bool> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
         bail!("Confirmation requires a visible terminal; pass --assumeyes or --dry-run");
     }
-    eprint!("Apply this plan? [y/N] ");
+    eprint!("{question} [y/N] ");
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -1346,13 +2128,144 @@ pub(super) fn confirm() -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn package_count_wording() {
+        assert_eq!(package_count(1, 0), "1 package");
+        assert_eq!(package_count(2, 0), "2 packages");
+        assert_eq!(
+            package_count(1, 1),
+            "2 packages (1 requested, 1 dependency)"
+        );
+        assert_eq!(
+            package_count(1, 3),
+            "4 packages (1 requested, 3 dependencies)"
+        );
+        assert_eq!(
+            package_count(2, 1),
+            "3 packages (2 requested, 1 dependency)"
+        );
+    }
+
+    #[test]
+    fn install_question_covers_installs_promotions_and_both() {
+        assert_eq!(install_question(1, 0), "Install 1 package?");
+        assert_eq!(install_question(2, 0), "Install 2 packages?");
+        assert_eq!(install_question(0, 1), "Mark 1 package as requested?");
+        assert_eq!(install_question(0, 2), "Mark 2 packages as requested?");
+        assert_eq!(
+            install_question(2, 1),
+            "Install 2 packages and mark 1 as requested?"
+        );
+        assert_eq!(
+            install_question(1, 3),
+            "Install 1 package and mark 3 as requested?"
+        );
+    }
+
+    #[test]
+    fn limited_list_keeps_four_and_summarises_the_rest() {
+        assert_eq!(limited_list(&[]), "");
+        assert_eq!(limited_list(&["jq 1.8.2".to_string()]), "jq 1.8.2");
+        let four = ["a 1", "b 1", "c 1", "d 1"].map(str::to_string);
+        assert_eq!(limited_list(&four), "a 1, b 1, c 1, d 1");
+        let five = ["a 1", "b 1", "c 1", "d 1", "e 1"].map(str::to_string);
+        assert_eq!(limited_list(&five), "a 1, b 1, c 1, d 1, and 1 more");
+        let seven = ["a 1", "b 1", "c 1", "d 1", "e 1", "f 1", "g 1"].map(str::to_string);
+        assert_eq!(limited_list(&seven), "a 1, b 1, c 1, d 1, and 3 more");
+    }
+
+    #[test]
+    fn installed_summary_names_requested_formulae_and_counts_dependencies() {
+        assert_eq!(
+            installed_summary(&["jq 1.8.2".to_string()], 1),
+            "Installed jq 1.8.2 (+1 dependency)"
+        );
+        assert_eq!(
+            installed_summary(&["jq 1.8.2".to_string(), "curl 8.0".to_string()], 0),
+            "Installed jq 1.8.2, curl 8.0"
+        );
+        assert_eq!(installed_summary(&[], 2), "Installed 2 packages");
+        assert_eq!(installed_summary(&[], 1), "Installed 1 package");
+        let many = ["a 1", "b 1", "c 1", "d 1", "e 1"].map(str::to_string);
+        assert_eq!(
+            installed_summary(&many, 2),
+            "Installed a 1, b 1, c 1, d 1, and 1 more (+2 dependencies)"
+        );
+    }
+
+    #[test]
+    fn upgraded_summary_names_old_and_new_versions() {
+        assert_eq!(
+            upgraded_summary(&["jq 1.8.1 → 1.8.2".to_string()]),
+            "Upgraded jq 1.8.1 → 1.8.2"
+        );
+        let many = ["a 1 → 2", "b 1 → 2", "c 1 → 2", "d 1 → 2", "e 1 → 2"].map(str::to_string);
+        assert_eq!(
+            upgraded_summary(&many),
+            "Upgraded a 1 → 2, b 1 → 2, c 1 → 2, d 1 → 2, and 1 more"
+        );
+    }
+
+    #[test]
+    fn removed_summary_counts_unused_dependencies() {
+        assert_eq!(
+            removed_summary(&["jq".to_string()], &["oniguruma".to_string()]),
+            "Removed jq (+1 unused dependency)"
+        );
+        assert_eq!(
+            removed_summary(&["jq".to_string()], &["a".to_string(), "b".to_string()]),
+            "Removed jq (+2 unused dependencies)"
+        );
+        assert_eq!(removed_summary(&["jq".to_string()], &[]), "Removed jq");
+        assert_eq!(
+            removed_summary(&[], &["a".to_string(), "b".to_string()]),
+            "Removed a, b"
+        );
+    }
+
+    #[test]
+    fn next_hint_appears_only_when_bin_is_missing_from_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let empty = std::ffi::OsStr::new("");
+        assert_eq!(
+            next_path_hint(empty, &bin, None).as_deref(),
+            Some("eval \"$(brewrs shellenv)\"  (add it to ~/.zprofile to keep it)")
+        );
+
+        let exact = bin.as_os_str();
+        assert_eq!(next_path_hint(exact, &bin, None), None);
+
+        let canonical = fs::canonicalize(&bin).unwrap();
+        assert_eq!(next_path_hint(canonical.as_os_str(), &bin, None), None);
+
+        let other = temp.path().join("other");
+        let with_other = std::ffi::OsString::from(other.as_os_str());
+        assert!(next_path_hint(&with_other, &bin, None).is_some());
+    }
+
+    #[test]
+    fn next_hint_quotes_an_explicit_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        let prefix = Path::new("/tmp/it's here");
+        let hint = next_path_hint(std::ffi::OsStr::new(""), &bin, Some(prefix)).unwrap();
+        assert_eq!(
+            hint,
+            "eval \"$(brewrs shellenv --prefix '/tmp/it'\\''s here')\"  (add it to ~/.zprofile to keep it)"
+        );
+    }
+
     fn formula() -> PlannedFormula {
         PlannedFormula {
+            source: Default::default(),
             name: "hello".into(),
             version: "1.2".into(),
             version_scheme: Some(0),
             keg_only: false,
             has_service: false,
+            caveats: None,
             conflicts_with: Vec::new(),
             requested: true,
             url: String::new(),
@@ -1378,6 +2291,7 @@ mod tests {
 
     fn installed_hello(version: &str) -> Receipt {
         Receipt {
+            source: Default::default(),
             name: "hello".into(),
             version: version.into(),
             version_scheme: 0,
@@ -1598,6 +2512,7 @@ mod tests {
     fn reinstall_is_a_noop_only_for_the_same_version_and_digest() {
         let plan = [formula()];
         let mut receipt = Receipt {
+            source: Default::default(),
             name: "hello".into(),
             version: "1.2".into(),
             version_scheme: 0,
@@ -1618,6 +2533,7 @@ mod tests {
 
     fn receipt(name: &str, version: &str, digest: char) -> Receipt {
         Receipt {
+            source: Default::default(),
             name: name.into(),
             version: version.into(),
             version_scheme: 0,
@@ -1626,6 +2542,29 @@ mod tests {
             keg_only: false,
             conflicts_with: Vec::new(),
             dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upstream_installed_catalog_targets_are_reported_not_resolved() {
+        let catalog = super::super::portable::catalog().unwrap();
+        let mut neovim = receipt("neovim", "0.12.6", 'a');
+        neovim.source = PackageSource::Upstream;
+        let targets = ["nvim".to_string(), "ripgrep".to_string()];
+
+        let (rest, notes) = partition_upstream_installed(catalog, &targets, &[neovim.clone()]);
+        assert_eq!(rest, ["ripgrep"]);
+        assert_eq!(
+            notes,
+            ["nvim → neovim 0.12.6 is already installed (official upstream build)."]
+        );
+
+        // A Homebrew-sourced receipt, or nothing installed, resolves normally.
+        neovim.source = PackageSource::Homebrew;
+        for installed in [vec![neovim], Vec::new()] {
+            let (rest, notes) = partition_upstream_installed(catalog, &targets, &installed);
+            assert_eq!(rest, targets);
+            assert!(notes.is_empty());
         }
     }
 
@@ -1652,14 +2591,19 @@ mod tests {
         assert_eq!(changes[0].old.version, "1.2");
         assert_eq!(changes[0].new.version, "1.3");
         assert_eq!(changes[0].formula.version, "1.3");
+        let rows = upgrade_rows(&changes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "upgrade");
         assert_eq!(
-            upgrade_rows(&changes),
-            [vec![
+            rows[0].cells,
+            [
                 "hello".to_string(),
-                "1.2".to_string(),
-                "1.3".to_string()
-            ]]
+                "1.2 → 1.3".to_string(),
+                "homebrew".to_string()
+            ]
         );
+        assert!(rows[0].note.is_empty());
+        assert!(rows[0].requested);
     }
 
     #[test]
@@ -1826,5 +2770,138 @@ mod tests {
 
         assert!(render_shellenv(Path::new("relative/path"), Some("sh"), None).is_err());
         assert!(render_shellenv(Path::new("/tmp/bad\npath"), Some("sh"), None).is_err());
+    }
+
+    const TAG: &str = "arm64_sequoia";
+
+    fn named(name: &str, requested: bool, dependencies: &[&str]) -> PlannedFormula {
+        PlannedFormula {
+            name: name.into(),
+            requested,
+            dependencies: dependencies.iter().map(|name| (*name).into()).collect(),
+            ..formula()
+        }
+    }
+
+    fn blocked_message(plan: &[PlannedFormula]) -> String {
+        let error = pending_packages(plan, &[], &[]).unwrap_err();
+        with_upstream_hint(super::super::portable::catalog(), error, plan, &[], TAG).to_string()
+    }
+
+    #[test]
+    fn blocked_target_with_catalog_entry_gets_an_upstream_hint() {
+        let mut neovim = named("neovim", true, &["gettext"]);
+        neovim.install_blockers.clear();
+        let mut gettext = named("gettext", false, &[]);
+        gettext
+            .install_blockers
+            .push("requires a fixed Homebrew prefix");
+        let message = blocked_message(&[gettext, neovim]);
+        assert!(message.starts_with("Cannot install gettext natively: requires a fixed"));
+        assert!(message.contains(
+            "An official upstream build is available: brewrs install --source upstream neovim"
+        ));
+    }
+
+    #[test]
+    fn blocked_dependency_gets_a_reason_and_its_requested_dependents() {
+        let mut library = named("lib", false, &[]);
+        library
+            .install_blockers
+            .push("requires a fixed Homebrew prefix");
+        let message = pending_packages(&[library, named("app", true, &["lib"])], &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            "Cannot install lib natively: requires a fixed Homebrew prefix.\n  Homebrew built this bottle for /opt/homebrew only; brewrs installs into its own prefix, so this bottle can't be used.\n  Needed by: app"
+        );
+    }
+
+    #[test]
+    fn blocked_target_without_catalog_entry_gets_no_hint() {
+        let mut tool = named("sometool", true, &[]);
+        tool.install_blockers.push("needs relocation");
+        let message = blocked_message(&[tool]);
+        assert_eq!(
+            message,
+            "Cannot install sometool natively: needs relocation."
+        );
+    }
+
+    #[test]
+    fn blocked_catalog_dependency_does_not_hint_for_an_unrelated_target() {
+        // neovim is only a (blocked) dependency of the requested target, and
+        // the target itself has no catalog entry.
+        let mut neovim = named("neovim", false, &[]);
+        neovim.install_blockers.push("needs relocation");
+        let message = blocked_message(&[neovim, named("sometool", true, &["neovim"])]);
+        assert!(!message.contains("Hint"));
+    }
+
+    #[test]
+    fn unblocked_homebrew_target_with_catalog_entry_stays_homebrew() {
+        let plan = [named("neovim", true, &[])];
+        let pending = pending_packages(&plan, &[], &[]).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].formula.source, PackageSource::Homebrew);
+        assert_eq!(pending[0].receipt.source, PackageSource::Homebrew);
+    }
+
+    #[test]
+    fn upstream_never_satisfies_a_homebrew_dependency() {
+        let mut upstream = receipt("lib", "1.0", 'c');
+        upstream.source = PackageSource::Upstream;
+        let app = named("app", true, &["lib"]);
+        let message = validate_sources(std::slice::from_ref(&app), &[upstream])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("app") && message.contains("lib"),
+            "{message}"
+        );
+
+        let mut planned = named("lib", false, &[]);
+        planned.source = PackageSource::Upstream;
+        let message = validate_sources(&[planned, app], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("planned from upstream"), "{message}");
+    }
+
+    #[test]
+    fn switching_source_requires_uninstalling_first() {
+        let installed = [receipt("hello", "1.2", 'a')];
+        let mut upstream = formula();
+        upstream.source = PackageSource::Upstream;
+        assert_eq!(
+            validate_sources(&[upstream], &installed)
+                .unwrap_err()
+                .to_string(),
+            "hello is installed from Homebrew; uninstall it first to switch"
+        );
+        assert!(validate_sources(&[formula()], &installed).is_ok());
+    }
+
+    #[test]
+    fn upgrade_refuses_to_switch_source() {
+        let mut old = receipt("hello", "1.0", 'a');
+        old.source = PackageSource::Upstream;
+        assert!(
+            upgrade_plan(&[formula()], &[old])
+                .unwrap_err()
+                .to_string()
+                .contains("Refusing to change the installed source")
+        );
+    }
+
+    #[test]
+    fn removal_resolves_a_catalog_alias_only_to_an_upstream_receipt() {
+        let installed = [receipt("neovim", "0.12.6", 'a')];
+        assert_eq!(
+            removal_plan(&["nvim".into()], &installed).unwrap()[0].name,
+            "neovim"
+        );
+        assert!(removal_plan(&["nvim".into()], &[]).is_err());
     }
 }

@@ -138,9 +138,4 @@ impl Config {
             1
         }
     }
-
-    /// Check if we should use colored output
-    pub fn use_colors(&self) -> bool {
-        self.ui.colored && console::colors_enabled()
-    }
 }

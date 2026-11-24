@@ -10,7 +10,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{config::Config, ui::DnfStyleFormatter};
+use crate::{
+    config::Config,
+    ui::{
+        DnfStyleFormatter,
+        table::{Row, Section, display_path},
+    },
+};
 
 use super::cask_extract::{self, StagedCaskPayload};
 use super::cask_plan::{CaskVersionOrder, PlannedCask, PlannedCaskArtifact, compare_cask_versions};
@@ -56,7 +62,7 @@ pub(crate) async fn install(
         }
         if !cask.install_blockers.is_empty() {
             bail!(
-                "Cannot install cask {} natively: {}",
+                "Cannot install cask {} natively: {}.",
                 cask.token,
                 cask.install_blockers.join("; ")
             );
@@ -69,53 +75,71 @@ pub(crate) async fn install(
     cask_store::validate_cask_conflicts(&projected, &existing_formulae)?;
 
     let formatter = DnfStyleFormatter::new(config);
-    let rows: Vec<_> = plan
-        .iter()
-        .map(|cask| {
-            let action = if pending.iter().any(|item| item.token == cask.token) {
-                "Install"
-            } else {
-                "Already installed"
-            };
-            vec![
-                cask.token.clone(),
-                cask.version.clone(),
-                action.into(),
-                summarize_artifacts(&cask.artifacts),
-            ]
-        })
-        .collect();
+    let mut installing = Vec::new();
+    let mut present = Vec::new();
+    for cask in &plan {
+        let pending_cask = pending.iter().any(|item| item.token == cask.token);
+        let cells = vec![
+            cask.token.clone(),
+            cask.version.clone(),
+            summarize_artifacts(&cask.artifacts),
+        ];
+        if pending_cask {
+            installing.push(Row::plan("install", String::new(), cells));
+        } else {
+            present.push(Row::plan("already-installed", String::new(), cells));
+        }
+    }
+    let count = installing.len();
+    let mut summary = Vec::new();
+    if count != 0 {
+        summary.push((
+            "Install",
+            format!("{count} {}", if count == 1 { "cask" } else { "casks" }),
+        ));
+    }
+    if prefix.is_some() {
+        summary.push(("Prefix", display_path(store.prefix())));
+    }
+    summary.push(("Appdir", resolved_appdir.display().to_string()));
+    let rendered = formatter.plan_table(
+        "Cask install plan",
+        &["Cask", "Version", "Artifacts"],
+        vec![
+            Section::new("Installing", installing),
+            Section::new("Already installed", present),
+        ],
+        &summary,
+    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
 
-    println!(
-        "{}  {}",
-        formatter.section("Native cask install"),
-        formatter.info(&tag)
-    );
-    println!(
-        "{}",
-        formatter.table(&["Cask", "Version", "Action", "Artifacts"], &rows)
-    );
-    println!(
-        "{}",
-        formatter.field("Prefix", &store.prefix().display().to_string())
-    );
-    println!(
-        "{}",
-        formatter.field("Appdir", &resolved_appdir.display().to_string())
-    );
-
-    if pending.is_empty() {
-        println!("\nNothing to install.");
+    if pending.is_empty() && !dry_run {
+        formatter.note("\nNothing to install.");
         return Ok(());
     }
     if dry_run {
-        let noun = if pending.len() == 1 { "cask" } else { "casks" };
-        println!("\n{} {noun} planned. No packages changed.", pending.len());
+        let count = pending.len();
+        if count == 0 {
+            formatter.note("\nDry run: nothing to do.");
+        } else {
+            let noun = if count == 1 { "change" } else { "changes" };
+            formatter.note(&format!(
+                "\nDry run: {count} {noun} planned, nothing applied."
+            ));
+        }
         return Ok(());
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
+    let count = pending.len();
+    let question = format!(
+        "Install {count} {}?",
+        if count == 1 { "cask" } else { "casks" }
+    );
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
         return Ok(());
     }
 
@@ -146,22 +170,22 @@ pub(crate) async fn install(
     });
     cask_store::commit(&store, prepared)?;
 
-    println!(
-        "\n{} {count} {}.",
-        formatter.success("Installed"),
-        if count == 1 { "cask" } else { "casks" }
-    );
+    formatter.note(&format!(
+        "\n{}",
+        formatter.result(&format!(
+            "Installed {count} {}",
+            if count == 1 { "cask" } else { "casks" }
+        ))
+    ));
+    let mut follow_up = Vec::new();
     if any_apps {
-        println!(
-            "{}",
-            formatter.field("Appdir", &resolved_appdir.display().to_string())
-        );
+        follow_up.push(("Appdir", display_path(&resolved_appdir)));
     }
     if any_bin {
-        println!(
-            "{}",
-            formatter.field("Bin", &store.prefix().join("bin").display().to_string())
-        );
+        follow_up.push(("Bin", display_path(&store.prefix().join("bin"))));
+    }
+    if !follow_up.is_empty() {
+        formatter.note(&formatter.fields(&follow_up));
     }
     Ok(())
 }
@@ -170,15 +194,40 @@ pub(crate) fn list(config: &Config, prefix: Option<&Path>) -> Result<()> {
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
     let casks = cask_store::installed(&store)?;
+    let formatter = DnfStyleFormatter::new(config);
     if casks.is_empty() {
-        println!("No brewrs-managed casks in {}.", store.prefix().display());
+        formatter.note(&format!("No casks in {}.", store.prefix().display()));
         return Ok(());
     }
-    let formatter = DnfStyleFormatter::new(config);
-    render_cask_list(&formatter, &casks);
+    if formatter.boxed() {
+        render_cask_list(&formatter, &casks);
+    } else {
+        let rows: Vec<Vec<String>> = casks
+            .iter()
+            .map(|cask| {
+                vec![
+                    "cask".to_string(),
+                    cask.token.clone(),
+                    cask.version.clone(),
+                    "homebrew".to_string(),
+                    "requested".to_string(),
+                ]
+            })
+            .collect();
+        println!(
+            "{}",
+            formatter.table(
+                "Packages",
+                &["Type", "Name", "Version", "Source", "Reason"],
+                &rows
+            )
+        );
+    }
     Ok(())
 }
 
+/// Boxed `list`: the `Casks (N)` panel with its targets. Plain output omits
+/// targets and uses the shared inventory table instead.
 pub(super) fn render_cask_list(formatter: &DnfStyleFormatter, casks: &[CaskReceipt]) {
     let rows: Vec<_> = casks
         .iter()
@@ -190,10 +239,13 @@ pub(super) fn render_cask_list(formatter: &DnfStyleFormatter, casks: &[CaskRecei
             ]
         })
         .collect();
-    println!("{}", formatter.section("Native casks"));
     println!(
         "{}",
-        formatter.table(&["Cask", "Version", "Targets"], &rows)
+        formatter.table(
+            &format!("Casks ({})", rows.len()),
+            &["Cask", "Version", "Targets"],
+            &rows,
+        )
     );
 }
 
@@ -225,35 +277,80 @@ pub(crate) fn remove(
     let rows: Vec<_> = pending
         .iter()
         .map(|receipt| {
-            vec![
-                receipt.token.clone(),
-                receipt.version.clone(),
-                "Remove".into(),
-            ]
+            Row::plan(
+                "remove",
+                String::new(),
+                vec![receipt.token.clone(), receipt.version.clone()],
+            )
         })
         .collect();
-    println!("{}", formatter.section("Remove casks"));
-    println!("{}", formatter.table(&["Cask", "Version", "Action"], &rows));
-    println!(
-        "{}",
-        formatter.field("Prefix", &store.prefix().display().to_string())
+    let mut summary = vec![(
+        "Remove",
+        format!(
+            "{} {}",
+            pending.len(),
+            if pending.len() == 1 { "cask" } else { "casks" }
+        ),
+    )];
+    if prefix.is_some() {
+        summary.push(("Prefix", display_path(store.prefix())));
+    }
+    let rendered = formatter.plan_table(
+        "Cask remove plan",
+        &["Cask", "Version"],
+        vec![Section::new("Removing", rows)],
+        &summary,
     );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
     if dry_run {
-        println!("\nNo packages changed.");
+        let count = pending.len();
+        if count == 0 {
+            formatter.note("\nDry run: nothing to do.");
+        } else {
+            let noun = if count == 1 { "change" } else { "changes" };
+            formatter.note(&format!(
+                "\nDry run: {count} {noun} planned, nothing applied."
+            ));
+        }
         return Ok(());
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
-        return Ok(());
-    }
-    cask_store::remove(&store, &pending)?;
-    println!(
-        "\n{} {} {}.",
-        formatter.success("Removed"),
+    let question = format!(
+        "Remove {} {}?",
         pending.len(),
         if pending.len() == 1 { "cask" } else { "casks" }
     );
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
+        return Ok(());
+    }
+    let count = pending.len();
+    if count == 0 {
+        cask_store::remove(&store, &pending)?;
+    } else {
+        eprintln!();
+        let noun = if count == 1 { "cask" } else { "casks" };
+        let steps = crate::ui::steps::Steps::new(config);
+        let step = steps.start(&format!("Unlinking {count} {noun}"));
+        match cask_store::remove(&store, &pending) {
+            Ok(()) => step.done(&format!("Unlinked {count} {noun}")),
+            Err(error) => {
+                step.fail();
+                return Err(error);
+            }
+        }
+    }
+    formatter.note(&format!(
+        "\n{}",
+        formatter.result(&format!(
+            "Removed {} {}",
+            pending.len(),
+            if pending.len() == 1 { "cask" } else { "casks" }
+        ))
+    ));
     Ok(())
 }
 
@@ -264,7 +361,8 @@ pub(crate) async fn upgrade(
     greedy: bool,
     dry_run: bool,
     yes: bool,
-) -> Result<()> {
+    announce_current: bool,
+) -> Result<bool> {
     if std::env::consts::OS != "macos" {
         bail!("Native cask upgrades are supported on macOS only");
     }
@@ -273,36 +371,47 @@ pub(crate) async fn upgrade(
     let store = Store::open(&path, false)?;
     let installed = cask_store::installed(&store)?;
     let selected = select_installed_casks(packages, &installed)?;
+    let formatter = DnfStyleFormatter::new(config);
     if selected.is_empty() {
-        println!("No brewrs-managed casks to upgrade.");
-        return Ok(());
+        formatter.note("No casks installed yet.");
+        return Ok(false);
     }
 
-    let (tag, changes, skipped_auto) =
+    let (_, changes, skipped_auto) =
         resolve_cask_changes(config, &store, &installed, &selected, greedy).await?;
     if changes.is_empty() {
-        println!("All selected casks are up to date.");
-        print_auto_update_skip_note(skipped_auto);
-        return Ok(());
+        if announce_current {
+            formatter.note("All casks are up to date.");
+        }
+        print_auto_update_skip_note(&formatter, skipped_auto);
+        return Ok(false);
     }
 
-    let formatter = DnfStyleFormatter::new(config);
     render_cask_upgrade_preview(
         &formatter,
-        "Native cask upgrade",
-        &tag,
+        "Cask upgrade plan",
         store.prefix(),
+        prefix.is_some(),
         &changes,
     );
-    print_auto_update_skip_note(skipped_auto);
+    print_auto_update_skip_note(&formatter, skipped_auto);
     if dry_run {
-        println!("\nNo packages changed.");
-        return Ok(());
+        let count = changes.len();
+        let noun = if count == 1 { "change" } else { "changes" };
+        formatter.note(&format!(
+            "\nDry run: {count} {noun} planned, nothing applied."
+        ));
+        return Ok(true);
     }
     io::stdout().flush()?;
-    if config.general.confirm_operations && !yes && !confirm()? {
-        println!("Cancelled. No packages changed.");
-        return Ok(());
+    let question = format!(
+        "Upgrade {} {}?",
+        changes.len(),
+        if changes.len() == 1 { "cask" } else { "casks" }
+    );
+    if config.general.confirm_operations && !yes && !confirm(&question)? {
+        eprintln!("Cancelled. No packages changed.");
+        return Ok(true);
     }
 
     let mut downloaded = Vec::with_capacity(changes.len());
@@ -334,12 +443,14 @@ pub(crate) async fn upgrade(
 
     let count = replacements.len();
     cask_store::upgrade(&store, replacements)?;
-    println!(
-        "\n{} {count} {}.",
-        formatter.success("Upgraded"),
-        if count == 1 { "cask" } else { "casks" }
-    );
-    Ok(())
+    formatter.note(&format!(
+        "\n{}",
+        formatter.result(&format!(
+            "Upgraded {count} {}",
+            if count == 1 { "cask" } else { "casks" }
+        ))
+    ));
+    Ok(true)
 }
 
 pub(crate) async fn check_updates(
@@ -354,32 +465,32 @@ pub(crate) async fn check_updates(
     let path = prefix_path(prefix)?;
     let store = Store::open(&path, false)?;
     let installed = cask_store::installed(&store)?;
+    let formatter = DnfStyleFormatter::new(config);
     if installed.is_empty() {
         if !quiet_if_empty {
-            println!("No brewrs-managed casks to upgrade.");
+            formatter.note("No casks installed yet.");
         }
         return Ok(false);
     }
 
-    let (tag, changes, skipped_auto) =
+    let (_, changes, skipped_auto) =
         resolve_cask_changes(config, &store, &installed, &installed, greedy).await?;
-    let formatter = DnfStyleFormatter::new(config);
     if changes.is_empty() {
         if !quiet_if_empty {
-            println!("All brewrs-managed casks are up to date.");
+            formatter.note("All casks are up to date.");
         }
-        print_auto_update_skip_note(skipped_auto);
+        print_auto_update_skip_note(&formatter, skipped_auto);
         return Ok(false);
     }
     render_cask_upgrade_preview(
         &formatter,
-        "Native cask updates",
-        &tag,
+        "Available cask updates",
         store.prefix(),
+        prefix.is_some(),
         &changes,
     );
-    print_auto_update_skip_note(skipped_auto);
-    println!(
+    print_auto_update_skip_note(&formatter, skipped_auto);
+    formatter.note(&format!(
         "\n{} cask {} available.",
         formatter.success(&changes.len().to_string()),
         if changes.len() == 1 {
@@ -387,7 +498,7 @@ pub(crate) async fn check_updates(
         } else {
             "updates"
         }
-    );
+    ));
     Ok(true)
 }
 
@@ -484,7 +595,7 @@ async fn resolve_cask_changes(
             CaskVersionOrder::Upgrade => {
                 if !new.install_blockers.is_empty() {
                     bail!(
-                        "Cannot upgrade cask {} natively: {}",
+                        "Cannot upgrade cask {} natively: {}.",
                         old.token,
                         new.install_blockers.join("; ")
                     );
@@ -633,37 +744,52 @@ fn summarize_receipt_targets(receipt: &CaskReceipt) -> String {
 fn render_cask_upgrade_preview(
     formatter: &DnfStyleFormatter,
     title: &str,
-    tag: &str,
     prefix: &Path,
+    show_prefix: bool,
     changes: &[CaskUpgradeChange],
 ) {
-    println!("{}  {}", formatter.section(title), formatter.info(tag));
     let rows: Vec<_> = changes
         .iter()
         .map(|change| {
-            vec![
-                change.old.token.clone(),
-                change.old.version.clone(),
-                change.planned.version.clone(),
-            ]
+            Row::plan(
+                "upgrade",
+                String::new(),
+                vec![
+                    change.old.token.clone(),
+                    format!("{} → {}", change.old.version, change.planned.version),
+                ],
+            )
         })
         .collect();
-    println!(
-        "{}",
-        formatter.table(&["Cask", "Installed", "Available"], &rows)
+    let mut summary = vec![(
+        "Upgrade",
+        format!(
+            "{} {}",
+            changes.len(),
+            if changes.len() == 1 { "cask" } else { "casks" }
+        ),
+    )];
+    if show_prefix {
+        summary.push(("Prefix", display_path(prefix)));
+    }
+    let rendered = formatter.plan_table(
+        title,
+        &["Cask", "Version"],
+        vec![Section::new("Upgrading", rows)],
+        &summary,
     );
-    println!(
-        "{}",
-        formatter.field("Prefix", &prefix.display().to_string())
-    );
+    println!("{}", rendered.table);
+    if let Some(summary) = rendered.summary {
+        eprintln!("{summary}");
+    }
 }
 
-fn print_auto_update_skip_note(skipped: usize) {
+fn print_auto_update_skip_note(formatter: &DnfStyleFormatter, skipped: usize) {
     if skipped > 0 {
-        println!(
+        formatter.note(&format!(
             "Skipped {skipped} auto-updating {}; pass --greedy to include them.",
             if skipped == 1 { "cask" } else { "casks" }
-        );
+        ));
     }
 }
 

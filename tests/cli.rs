@@ -366,8 +366,8 @@ fn migration_audit_reads_inventory_without_using_brew_or_writing() {
     ]);
     assert_success(&output);
     let report = stdout(&output);
-    assert_row_containing(&report, "ripgrep", &["16.0.0", "Requested", "Unchecked"]);
-    assert_row_containing(&report, "example-tool", &["1.3", "Dependency", "Blocked"]);
+    assert_row_containing(&report, "ripgrep", &["16.0.0", "requested", "Unchecked"]);
+    assert_row_containing(&report, "example-tool", &["1.3", "dependency", "Blocked"]);
     assert_row_containing(&report, "example-browser", &["2.0", "Unchecked"]);
     assert!(report.contains("example/tools"));
     assert!(report.contains("homebrew.mxcl.colima"));
@@ -401,10 +401,8 @@ fn migration_audit_rejects_overlapping_prefixes() {
 fn offline_catalog_search_does_not_launch_brew() {
     let sandbox = Sandbox::new();
     assert_success(&sandbox.run(&["config", "reset"]));
-    let mut config: toml::Value = fs::read_to_string(&sandbox.config)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&sandbox.config).unwrap()).unwrap();
     let cache = sandbox.home.join("catalog-cache");
     config["storage"]["cache_dir"] = toml::Value::String(cache.to_string_lossy().into_owned());
     fs::write(&sandbox.config, toml::to_string(&config).unwrap()).unwrap();
@@ -437,7 +435,7 @@ fn native_list_does_not_create_a_missing_prefix_or_call_brew() {
     ] {
         let output = sandbox.run(args);
         assert_success(&output);
-        assert!(stdout(&output).contains("No brewrs-managed packages"));
+        assert!(stderr(&output).contains("No packages in"));
     }
     assert!(!prefix.exists());
     assert!(!sandbox.config.exists());
@@ -460,7 +458,7 @@ fn hidden_native_alias_stays_accepted_but_unlisted() {
     let prefix = sandbox.home.join("native-prefix");
     let output = sandbox.run(&["native", "list", "--prefix", prefix.to_str().unwrap()]);
     assert_success(&output);
-    assert!(stdout(&output).contains("No brewrs-managed packages"));
+    assert!(stderr(&output).contains("No packages in"));
     assert!(!prefix.exists());
     sandbox.assert_no_brew();
 }
@@ -492,7 +490,7 @@ fn native_upgrade_without_receipts_is_offline_and_read_only() {
     let path = prefix.to_str().unwrap();
     let output = sandbox.run(&["upgrade", "--prefix", path, "--dry-run"]);
     assert_success(&output);
-    assert!(stdout(&output).contains("No brewrs-managed packages"));
+    assert!(stderr(&output).contains("No packages installed yet."));
     let missing = sandbox.run(&["upgrade", "--prefix", path, "--yes", "hello"]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(stderr(&missing).contains("'hello' is not installed"));
@@ -513,7 +511,7 @@ fn default_update_queries_never_consult_homebrew_on_an_empty_prefix() {
     ] {
         let output = sandbox.run(args);
         assert_success(&output);
-        assert!(stdout(&output).contains("No brewrs-managed packages"));
+        assert!(stderr(&output).contains("No packages installed yet."));
     }
     assert!(!prefix.exists());
     assert!(!sandbox.config.exists());
@@ -752,13 +750,13 @@ fn native_autoremove_previews_and_preserves_live_dependencies() {
     );
     let preview = sandbox.run(&["autoremove", "--prefix", path, "--dry-run"]);
     assert_success(&preview);
-    assert_row_containing(&stdout(&preview), "orphan-tool", &["1.0", "Remove"]);
+    assert_row_containing(&stdout(&preview), "orphan-tool", &["1.0", "remove"]);
     assert!(!stdout(&preview).contains("app-only"));
     assert!(receipts.join("orphan-tool.json").is_file());
 
     let remove = sandbox.run(&["remove", "--prefix", path, "app", "--autoremove", "--yes"]);
     assert_success(&remove);
-    assert_row_containing(&stdout(&remove), "app-only", &["1.0", "Remove"]);
+    assert_row_containing(&stdout(&remove), "app-only", &["1.0", "remove"]);
     for name in ["app", "app-only"] {
         assert!(!receipts.join(format!("{name}.json")).exists());
         assert!(!prefix.join("Cellar").join(name).join("1.0").exists());
@@ -805,7 +803,7 @@ fn native_remove_previews_and_removes_only_the_owned_package() {
 
     let preview = sandbox.run(&["remove", "--prefix", path, "hello", "--dry-run"]);
     assert_success(&preview);
-    assert_row_containing(&stdout(&preview), "hello", &["2.12.3", "Remove"]);
+    assert_row_containing(&stdout(&preview), "hello", &["2.12.3", "remove"]);
     assert!(receipt.exists() && executable.exists() && link.is_symlink());
 
     let missing = sandbox.run(&[
@@ -932,7 +930,11 @@ fn native_cask_list_remove_and_upgrade_work_offline_without_brew() {
 
     let list_all = sandbox.run(&["list", "--prefix", path]);
     assert_success(&list_all);
-    assert_row_containing(&stdout(&list_all), "demo-cask", &["1.2.3", "Demo.app"]);
+    assert_row_containing(
+        &stdout(&list_all),
+        "demo-cask",
+        &["cask", "1.2.3", "homebrew", "requested"],
+    );
 
     let list_casks = sandbox.run(&["list", "--prefix", path, "--cask"]);
     assert_success(&list_casks);
@@ -940,7 +942,7 @@ fn native_cask_list_remove_and_upgrade_work_offline_without_brew() {
 
     let list_formulae = sandbox.run(&["list", "--prefix", path, "--formula"]);
     assert_success(&list_formulae);
-    assert!(stdout(&list_formulae).contains("No brewrs-managed packages"));
+    assert!(stderr(&list_formulae).contains("No packages in"));
 
     let dry_rm = sandbox.run(&[
         "remove",
@@ -951,7 +953,7 @@ fn native_cask_list_remove_and_upgrade_work_offline_without_brew() {
         "demo-cask",
     ]);
     assert_success(&dry_rm);
-    assert_row_containing(&stdout(&dry_rm), "demo-cask", &["1.2.3", "Remove"]);
+    assert_row_containing(&stdout(&dry_rm), "demo-cask", &["1.2.3", "remove"]);
     assert!(receipts.join("demo-cask.json").is_file());
 
     let applied_rm = sandbox.run(&["remove", "--prefix", path, "--cask", "--yes", "demo-cask"]);

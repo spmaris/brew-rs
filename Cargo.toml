@@ -2,7 +2,7 @@
 name = "brew-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Spyros Maris <spyrosmaris@gmail.com>"]
 description = "A native macOS package manager using Homebrew repositories and verified bottles"
 license = "MIT"
@@ -14,45 +14,46 @@ exclude = ["/.github", "/.dsh-tui"]
 
 [dependencies]
 # CLI framework
-clap = { version = "4.0", features = ["derive", "color"] }
+clap = { version = "4.6.9", features = ["derive", "color"] }
 
 # Async runtime
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "stream", "gzip"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls-no-alpn", "charset", "system-proxy", "json", "stream", "gzip"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2.2"
 
 # Error handling
-anyhow = "1.0"
+anyhow = "1.0.105"
 
 # Terminal UI
-colored = "2.0"
-indicatif = "0.17"
-console = "0.15"
+colored = "3.1.1"
+indicatif = "0.18.6"
+console = "0.16.6"
+ratatui = { version = "0.30.2", default-features = false }
 
 # File operations
-tar = "0.4"
-flate2 = "1.0"
-tempfile = "3.0"
+tar = "0.4.46"
+flate2 = "1.1.11"
+tempfile = "3.27.0"
 
 # Fuzzy search
-fuzzy-matcher = "0.3"
+fuzzy-matcher = "0.3.7"
 
 # System paths
-dirs = "5.0"
+dirs = "7.0.0"
 
 # Cryptography
-sha2 = "0.10"
-hex = "0.4"
+sha2 = "0.11.1"
+hex = "0.4.3"
 
 # Logging
-log = "0.4"
-env_logger = "0.10"
+log = "0.4.35"
+env_logger = "0.11.12"
 
 [[bin]]
 name = "brewrs"
