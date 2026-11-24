@@ -269,3 +269,14 @@ fn parses_hdiutil_plist_mount_points_with_spaces_and_entities() {
     assert_eq!(path, PathBuf::from("/tmp/smoke/dmg.abc123/App & Tools"));
     assert!(parse_hdiutil_mount_point("<plist><dict></dict></plist>").is_err());
 }
+
+#[test]
+fn bare_io_errors_gain_an_action_and_path() {
+    let error = CaskExtractError::io("create directory", Path::new("/unpack/Foo.app"))(
+        std::io::Error::other("denied"),
+    );
+    assert_eq!(
+        crate::infra::error::error_chain(&error),
+        "failed to create directory '/unpack/Foo.app': denied"
+    );
+}

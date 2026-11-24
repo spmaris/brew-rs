@@ -1,8 +1,8 @@
 //! Service metadata: review of `service` declarations and installed-service verification.
 
-use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use super::error::{MetadataError, ServiceError};
 use super::macos::is_supported_macos_tag;
 use super::model::FormulaResponse;
 use super::validate::{
@@ -41,32 +41,43 @@ pub(crate) fn verify_installed_service(
     installed_version: &str,
     installed_version_scheme: u32,
     installed_sha256: &str,
-) -> Result<InstalledServiceMetadata> {
+) -> Result<InstalledServiceMetadata, ServiceError> {
     let canonical = validate_formula_name(&response.name, "formula name")?;
     if canonical != name {
-        bail!(
-            "official metadata for '{name}' returned formula '{canonical}'; refusing to preview a different formula"
-        );
+        return Err(ServiceError::WrongFormula {
+            name: name.to_owned(),
+            canonical: canonical.to_owned(),
+        });
     }
     if response.tap != CORE_TAP {
-        bail!(
-            "formula '{name}' is served by tap '{}'; only {CORE_TAP} metadata is supported",
-            response.tap
-        );
+        return Err(ServiceError::WrongTap {
+            name: name.to_owned(),
+            tap: response.tap,
+        });
     }
     if response.disabled {
-        bail!("formula '{name}' is disabled upstream");
+        return Err(ServiceError::Disabled {
+            name: name.to_owned(),
+        });
     }
     if !response.versions.bottle {
-        bail!("formula '{name}' has no bottled stable version");
+        return Err(ServiceError::NoBottledStable {
+            name: name.to_owned(),
+        });
     }
-    let stable = response
-        .versions
-        .stable
-        .as_deref()
-        .with_context(|| format!("formula '{name}' has no stable version"))?;
+    let stable =
+        response
+            .versions
+            .stable
+            .as_deref()
+            .ok_or_else(|| MetadataError::NoStableVersion {
+                name: name.to_owned(),
+            })?;
     if stable.is_empty() {
-        bail!("formula '{name}' has an empty stable version");
+        return Err(MetadataError::EmptyStableVersion {
+            name: name.to_owned(),
+        }
+        .into());
     }
     let revision = response.revision.unwrap_or(0);
     let version = if revision == 0 {
@@ -76,44 +87,53 @@ pub(crate) fn verify_installed_service(
     };
     validate_version(&version, name)?;
     if version != installed_version {
-        bail!(
-            "installed receipt pins {name} {installed_version}, but official metadata reports {version}; refusing to preview a different version"
-        );
+        return Err(ServiceError::VersionMismatch {
+            name: name.to_owned(),
+            installed: installed_version.to_owned(),
+            official: version,
+        });
     }
     if response.version_scheme != Some(installed_version_scheme) {
-        bail!(
-            "installed receipt pins {name} version scheme {installed_version_scheme}, but official metadata reports {:?}; refusing to preview a different version",
-            response.version_scheme
-        );
+        return Err(ServiceError::SchemeMismatch {
+            name: name.to_owned(),
+            installed: installed_version_scheme,
+            official: response.version_scheme,
+        });
     }
     let bottle = response
         .bottle
         .as_ref()
         .and_then(|bottle| bottle.stable.as_ref())
-        .with_context(|| format!("formula '{name}' has no stable bottle metadata"))?;
+        .ok_or_else(|| MetadataError::NoStableBottle {
+            name: name.to_owned(),
+        })?;
     let bottle_file = bottle
         .files
         .get(tag)
         .or_else(|| bottle.files.get("all"))
-        .with_context(|| {
-            format!(
-                "formula '{name}' has no bottle for host tag '{tag}' (available: {})",
-                available_tags(&bottle.files)
-            )
+        .ok_or_else(|| MetadataError::NoBottleForTag {
+            name: name.to_owned(),
+            tag: tag.to_owned(),
+            available: available_tags(&bottle.files),
         })?;
     let sha256 = validate_sha256(&bottle_file.sha256, name)?;
     if !sha256.eq_ignore_ascii_case(installed_sha256) {
-        bail!(
-            "installed receipt pins {name} bottle {installed_sha256}, but official metadata for tag '{tag}' reports {sha256}; refusing to preview a different artifact"
-        );
+        return Err(ServiceError::DigestMismatch {
+            name: name.to_owned(),
+            installed: installed_sha256.to_owned(),
+            tag: tag.to_owned(),
+            official: sha256,
+        });
     }
     if response.service.is_null() {
-        bail!("formula '{name}' does not declare a service");
+        return Err(ServiceError::NoService {
+            name: name.to_owned(),
+        });
     }
     if review_service(&response.service, tag).is_some() {
-        bail!(
-            "formula '{name}' declares a service declaration this native installer does not recognize as optional"
-        );
+        return Err(ServiceError::UnrecognizedService {
+            name: name.to_owned(),
+        });
     }
     Ok(InstalledServiceMetadata {
         name: name.to_string(),

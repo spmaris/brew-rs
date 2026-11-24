@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::commands::install::prefix_path;
 use crate::domain::cask_plan::{CaskVersionOrder, compare_cask_versions};
-use crate::infra::api::error::error_chain;
+use crate::infra::error::error_chain;
 use crate::infra::store::Store;
 
 use super::status::with_revision;

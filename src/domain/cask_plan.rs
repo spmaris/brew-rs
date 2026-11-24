@@ -21,12 +21,14 @@
 
 mod artifact_parse;
 mod artifacts;
+mod error;
 mod identifier;
 mod model;
 mod requirements;
 mod resolve;
 mod version_order;
 
+pub(crate) use error::IdentifierError;
 pub(crate) use identifier::{parse_cask_target, validate_cask_identifier};
 pub(crate) use model::{CaskSourcePath, ContainerHint, PlannedCask, PlannedCaskArtifact};
 pub(crate) use resolve::{CaskSource, resolve_with};

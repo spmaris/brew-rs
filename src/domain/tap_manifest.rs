@@ -29,6 +29,7 @@
 //! Unknown fields, unknown architectures, duplicate identifiers, duplicate
 //! artifacts, reserved names, and unsupported schemas fail closed.
 
+mod error;
 mod limits;
 mod manifest;
 mod names;

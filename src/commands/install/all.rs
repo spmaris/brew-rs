@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::config::Config;
 use crate::domain::plan;
-use crate::infra::store::Store;
+use crate::infra::store::{Store, reject_protected_prefix};
 use crate::ui::DnfStyleFormatter;
 
 use super::prefix_path;
@@ -67,6 +67,7 @@ pub(crate) async fn upgrade_all(
             .map(|_| ());
     }
     let path = prefix_path(prefix)?;
+    reject_protected_prefix(&path)?;
     let store = Store::open(&path, false)?;
     let installed_formulae = store.installed()?;
     let installed_casks = crate::infra::cask_store::installed(&store)?;

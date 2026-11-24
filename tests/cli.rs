@@ -958,6 +958,12 @@ fn native_cask_list_remove_and_upgrade_work_offline_without_brew() {
 
     let applied_rm = sandbox.run(&["remove", "--prefix", path, "--cask", "--yes", "demo-cask"]);
     assert_success(&applied_rm);
+    assert!(
+        stderr(&applied_rm).contains("Removed demo-cask\n")
+            || stderr(&applied_rm).ends_with("Removed demo-cask"),
+        "the result line should name the removed cask:\n{}",
+        stderr(&applied_rm)
+    );
     assert!(!receipts.join("demo-cask.json").exists());
     assert!(!prefix.join("Applications/Demo.app").exists());
     assert!(fs::symlink_metadata(bin_dir.join("demo-cli")).is_err());
@@ -1007,6 +1013,53 @@ fn native_cask_rejects_protected_prefix_and_appdir() {
     assert_eq!(bad_appdir.status.code(), Some(1));
     assert!(stderr(&bad_appdir).contains("inside the Homebrew prefix"));
     assert!(!safe_prefix.exists());
+
+    sandbox.assert_no_brew();
+}
+
+#[test]
+fn install_and_upgrade_refuse_a_protected_prefix_before_planning_or_network() {
+    let sandbox = Sandbox::new();
+    let homebrew = sandbox.home.join("fake-homebrew");
+    let protected = homebrew.join("brewrs-sub");
+    let environment = [("HOMEBREW_PREFIX", homebrew.to_str().unwrap())];
+    let prefix = protected.to_str().unwrap();
+
+    // Each command would otherwise resolve metadata over the network (or fail
+    // with a network error) before reaching the store; the refusal must come
+    // first, so the output names the protected prefix and nothing was fetched.
+    for args in [
+        vec!["install", "--prefix", prefix, "--assumeyes", "jq"],
+        vec![
+            "install",
+            "--prefix",
+            prefix,
+            "--assumeyes",
+            "--cask",
+            "alt-tab",
+        ],
+        vec!["upgrade", "--prefix", prefix, "--assumeyes"],
+        vec!["upgrade", "--prefix", prefix, "--assumeyes", "--cask"],
+    ] {
+        let output = sandbox.run_with_env(&args, &environment);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let message = stderr(&output);
+        assert!(
+            message.contains("inside the Homebrew prefix"),
+            "{args:?} should refuse the protected prefix first:\n{message}"
+        );
+        assert!(
+            !message.contains("Download") && !stdout(&output).contains("Download"),
+            "{args:?} must not download anything:\n{message}"
+        );
+        assert!(!protected.exists(), "{args:?} must not create the prefix");
+    }
 
     sandbox.assert_no_brew();
 }

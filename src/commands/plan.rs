@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::io::{self, Write};
 
 use super::install;
-use crate::domain::plan::{self, Memoized, PackageSource, PlannedFormula};
+use crate::domain::plan::{self, Memoized, PackageSource, PlannedFormula, ResolveError};
 use crate::infra::api::catalog_cache;
 use crate::infra::formula_source::HttpFormulaSource;
 use crate::infra::hint_probe::SystemHintProbe;
@@ -21,7 +21,8 @@ pub(crate) async fn resolve(
     let source = HttpFormulaSource::new(config)?;
     match plan::resolve_with(&source, targets, tag).await {
         Ok(plan) => Ok(plan),
-        Err(error) => Err(add_hints_online(error, config).await),
+        Err(ResolveError::Plan(error)) => Err(add_hints_online(error.into(), config).await),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -49,7 +50,7 @@ impl AuditPlanner {
     }
 
     pub(crate) async fn resolve(&self, name: &str, tag: &str) -> Result<Vec<PlannedFormula>> {
-        plan::resolve_with(&self.source, &[name.into()], tag).await
+        Ok(plan::resolve_with(&self.source, &[name.into()], tag).await?)
     }
 }
 

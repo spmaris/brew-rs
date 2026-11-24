@@ -147,16 +147,3 @@ pub(super) fn classify_parts(status: Option<u16>, transport_failure: bool) -> Op
         None => transport_failure.then_some(ApiFailure::Unreachable),
     }
 }
-
-/// `error` and its causes joined with `": "`, the same text `anyhow` prints
-/// for `{:#}`.
-pub(crate) fn error_chain(error: &(dyn StdError + 'static)) -> String {
-    let mut text = error.to_string();
-    let mut cause = error.source();
-    while let Some(next) = cause {
-        text.push_str(": ");
-        text.push_str(&next.to_string());
-        cause = next.source();
-    }
-    text
-}

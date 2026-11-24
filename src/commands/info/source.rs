@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::infra::api::catalog_cache;
-use crate::infra::api::http_client::{HttpClient, is_not_found};
+use crate::infra::api::http_client::HttpClient;
+use crate::infra::api::{ApiError, catalog_cache};
 
 use super::request::{Kind, validate_identifier};
 use super::response::{AnalyticsResponse, CaskResponse, FormulaResponse};
@@ -51,10 +51,10 @@ impl HttpMetadataSource {
 impl MetadataSource for HttpMetadataSource {
     async fn formula(&self, name: &str) -> std::result::Result<FormulaResponse, LookupError> {
         let url = format!("{API_BASE}/{}/{name}.json", Kind::Formula.endpoint());
-        match self.http.fetch_json(&url).await {
+        match self.http.get_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error)
+                if error.is_not_found()
                     && let Ok(Some(canonical)) =
                         catalog_cache::resolve_formula_alias(&self.config, name).await
                     && !canonical.contains('/')
@@ -62,7 +62,7 @@ impl MetadataSource for HttpMetadataSource {
                 {
                     let alias_url =
                         format!("{API_BASE}/{}/{canonical}.json", Kind::Formula.endpoint());
-                    return match self.http.fetch_json(&alias_url).await {
+                    return match self.http.get_json(&alias_url).await {
                         Ok(payload) => Ok(payload),
                         Err(alias_error) => Err(classify_http_error(&alias_url, alias_error)),
                     };
@@ -74,7 +74,7 @@ impl MetadataSource for HttpMetadataSource {
 
     async fn cask(&self, token: &str) -> std::result::Result<CaskResponse, LookupError> {
         let url = format!("{API_BASE}/{}/{token}.json", Kind::Cask.endpoint());
-        match self.http.fetch_json(&url).await {
+        match self.http.get_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => Err(classify_http_error(&url, error)),
         }
@@ -83,7 +83,7 @@ impl MetadataSource for HttpMetadataSource {
     async fn analytics(&self, kind: Kind, period: &str) -> Result<AnalyticsResponse> {
         let url = analytics_url(kind, period);
         self.http
-            .fetch_json(&url)
+            .get_json(&url)
             .await
             .with_context(|| format!("Could not fetch Homebrew analytics from {url}"))
     }
@@ -94,11 +94,11 @@ impl MetadataSource for HttpMetadataSource {
 /// Only a typed `404 Not Found` status is treated as "not found"; a transport
 /// error, a 5xx status, a parse failure or an untyped message keeps its error
 /// and its context.
-pub(super) fn classify_http_error(url: &str, error: anyhow::Error) -> LookupError {
-    if is_not_found(&error) {
+pub(super) fn classify_http_error(url: &str, error: ApiError) -> LookupError {
+    if error.is_not_found() {
         LookupError::NotFound
     } else {
-        LookupError::Failed(error.context(format!("GET {url} failed")))
+        LookupError::Failed(anyhow::Error::new(error).context(format!("GET {url} failed")))
     }
 }
 

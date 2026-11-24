@@ -99,3 +99,14 @@ fn validates_staged_and_installed_targets_without_following_escapes() {
         .is_err()
     );
 }
+
+#[test]
+fn io_errors_name_the_action_and_path() {
+    let error = RelocateError::io("read directory", Path::new("/stage/lib"))(
+        std::io::Error::other("denied"),
+    );
+    assert_eq!(
+        crate::infra::error::error_chain(&error),
+        "failed to read directory '/stage/lib': denied"
+    );
+}

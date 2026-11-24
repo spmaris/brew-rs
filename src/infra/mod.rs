@@ -6,6 +6,7 @@ pub(crate) mod cask_extract;
 pub(crate) mod cask_source;
 pub(crate) mod cask_store;
 pub(crate) mod download;
+pub(crate) mod error;
 pub(crate) mod formula_source;
 pub(crate) mod hint_probe;
 pub(crate) mod migration_inventory;

@@ -9,8 +9,8 @@ use crate::domain::plan::{PackageSource, PlannedFormula};
 use crate::infra::platform::default_target;
 use crate::infra::relocate;
 use crate::infra::store::{
-    Receipt, Store, validate_conflicts, validate_dependencies_with_retained,
-    validate_retained_pin_closure,
+    Receipt, Store, reject_protected_prefix, validate_conflicts,
+    validate_dependencies_with_retained, validate_retained_pin_closure,
 };
 use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
@@ -47,6 +47,7 @@ pub(crate) async fn upgrade(
         bail!("Native upgrades are supported on macOS only");
     }
     let path = prefix_path(prefix)?;
+    reject_protected_prefix(&path)?;
     let store = Store::open(&path, false)?;
     let installed = store.installed()?;
     let retained = store.retained()?;

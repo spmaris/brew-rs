@@ -57,7 +57,7 @@ pub(crate) fn stage(
         CaskExtractError::DigestVerification {
             token: planned.token.clone(),
             version: planned.version.clone(),
-            source: source.into(),
+            source,
         }
     })?;
 

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::commands::install::{confirm, prefix_path};
+use crate::commands::install::{confirm, prefix_path, removed_summary};
 use crate::config::Config;
 use crate::domain::cask_plan;
 use crate::infra::cask_store;
@@ -107,13 +107,10 @@ pub(crate) fn remove(
             }
         }
     }
+    let removed: Vec<String> = pending.iter().map(|r| r.token.clone()).collect();
     formatter.note(&format!(
         "\n{}",
-        formatter.result(&format!(
-            "Removed {} {}",
-            pending.len(),
-            if pending.len() == 1 { "cask" } else { "casks" }
-        ))
+        formatter.result(&removed_summary(&removed, &[]))
     ));
     Ok(())
 }

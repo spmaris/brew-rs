@@ -112,7 +112,7 @@ fn copy_from_dmg(
     let src_path = mount_point.join(rel_source);
     let dst_path = unpack_dir.join(rel_source);
     if let Some(parent) = dst_path.parent() {
-        fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
+        fs::create_dir_all(parent).map_err(CaskExtractError::io("create directory", parent))?;
     }
 
     let status = Command::new("/usr/bin/ditto")

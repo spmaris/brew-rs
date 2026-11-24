@@ -1,4 +1,3 @@
-use super::error::error_chain;
 use super::paths::{cellar_dir, opt_dir, receipts_dir, sbin_dir};
 use super::receipt::{
     encode_receipt, is_safe_bin_name, is_safe_package_name, read_receipt, replace_receipt,
@@ -7,6 +6,7 @@ use super::receipt::{
 use super::*;
 use crate::domain::plan::PackageSource;
 use crate::domain::validate::{is_lower_hex_digest, is_safe_version};
+use crate::infra::error::error_chain;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

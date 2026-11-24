@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::validate::{is_lower_hex_digest, validate_cask_url};
 
+use super::error::RecordError;
 use super::limits::{MAX_ARTIFACT_BYTES, MAX_SOURCE_PATH_BYTES, SCHEMA_VERSION, TAPROOM};
 use super::names::{
     is_known_arch, parse_tap_name, validate_bin_syntax, validate_token_syntax, validate_version,
@@ -22,10 +22,12 @@ pub(crate) struct TapRecord {
 
 impl TapRecord {
     /// Build a record for a validated manifest.
-    pub(crate) fn new(tap: &str, source: &Path, manifest_sha256: &str) -> Result<Self> {
-        let source = source
-            .to_str()
-            .context("the tap manifest path must be valid UTF-8")?;
+    pub(crate) fn new(
+        tap: &str,
+        source: &Path,
+        manifest_sha256: &str,
+    ) -> Result<Self, RecordError> {
+        let source = source.to_str().ok_or(RecordError::ManifestPathNotUtf8)?;
         let record = Self {
             schema: SCHEMA_VERSION,
             tap: tap.to_string(),
@@ -37,21 +39,19 @@ impl TapRecord {
     }
 
     /// Validate the record against the tap directory that contains it.
-    pub(crate) fn validate(&self, expected_tap: &str) -> Result<()> {
+    pub(crate) fn validate(&self, expected_tap: &str) -> Result<(), RecordError> {
         if self.schema != SCHEMA_VERSION {
-            bail!(
-                "unsupported tap registry schema {}; expected {SCHEMA_VERSION}",
-                self.schema
-            );
+            return Err(RecordError::UnsupportedRegistrySchema { found: self.schema });
         }
         parse_tap_name(&self.tap)?;
         if self.tap != expected_tap {
-            bail!("tap registry records '{}', not '{expected_tap}'", self.tap);
+            return Err(RecordError::RegistryTapMismatch {
+                recorded: self.tap.clone(),
+                expected: expected_tap.to_owned(),
+            });
         }
         if !is_lower_hex_digest(&self.manifest_sha256) {
-            bail!(
-                "tap registry has an invalid manifest sha256: expected 64 lowercase hexadecimal characters"
-            );
+            return Err(RecordError::InvalidRegistryManifestSha256);
         }
         validate_source_path(&self.source)?;
         Ok(())
@@ -92,11 +92,11 @@ impl TapReceipt {
         artifact_bytes: u64,
         manifest_sha256: &str,
         source_manifest: &Path,
-    ) -> Result<Self> {
+    ) -> Result<Self, RecordError> {
         let (owner, repo) = parse_tap_name(tap)?;
         let source_manifest = source_manifest
             .to_str()
-            .context("the tap source manifest path must be valid UTF-8")?;
+            .ok_or(RecordError::SourceManifestPathNotUtf8)?;
         let receipt = Self {
             schema: SCHEMA_VERSION,
             tap: tap.to_string(),
@@ -118,47 +118,37 @@ impl TapReceipt {
     }
 
     /// Validate a decoded receipt without consulting external state.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<(), RecordError> {
         if self.schema != SCHEMA_VERSION {
-            bail!(
-                "unsupported tap receipt schema {}; expected {SCHEMA_VERSION}",
-                self.schema
-            );
+            return Err(RecordError::UnsupportedReceiptSchema { found: self.schema });
         }
         let (owner, repo) = parse_tap_name(&self.tap)?;
         validate_token_syntax(&self.token)?;
         if self.qualified != format!("{}/{}", self.tap, self.token) {
-            bail!(
-                "tap receipt qualified name '{}' does not match '{}' and '{}'",
-                self.qualified,
-                self.tap,
-                self.token
-            );
+            return Err(RecordError::QualifiedMismatch {
+                qualified: self.qualified.clone(),
+                tap: self.tap.clone(),
+                token: self.token.clone(),
+            });
         }
         validate_version(&self.version)?;
         validate_bin_syntax(&self.bin)?;
         if !is_known_arch(&self.architecture) {
-            bail!(
-                "tap receipt has unsupported architecture '{}'",
-                self.architecture
-            );
+            return Err(RecordError::UnsupportedArchitecture {
+                architecture: self.architecture.clone(),
+            });
         }
-        validate_cask_url(&self.artifact_url).context("tap receipt has an unsafe artifact URL")?;
+        validate_cask_url(&self.artifact_url).map_err(RecordError::UnsafeArtifactUrl)?;
         if !is_lower_hex_digest(&self.artifact_sha256) {
-            bail!(
-                "tap receipt has an invalid artifact sha256: expected 64 lowercase hexadecimal characters"
-            );
+            return Err(RecordError::InvalidArtifactSha256);
         }
         if self.artifact_bytes == 0 || self.artifact_bytes > MAX_ARTIFACT_BYTES {
-            bail!(
-                "tap receipt artifact size {} is outside the supported range",
-                self.artifact_bytes
-            );
+            return Err(RecordError::ArtifactSize {
+                bytes: self.artifact_bytes,
+            });
         }
         if !is_lower_hex_digest(&self.manifest_sha256) {
-            bail!(
-                "tap receipt has an invalid manifest sha256: expected 64 lowercase hexadecimal characters"
-            );
+            return Err(RecordError::InvalidReceiptManifestSha256);
         }
         validate_source_path(&self.source_manifest)?;
         let expected_keg = format!(
@@ -167,33 +157,33 @@ impl TapReceipt {
             version = self.version
         );
         if self.keg != expected_keg {
-            bail!(
-                "tap receipt keg '{}' is not the expected '{}'",
-                self.keg,
-                expected_keg
-            );
+            return Err(RecordError::KegMismatch {
+                found: self.keg.clone(),
+                expected: expected_keg,
+            });
         }
         let expected_link = format!("bin/{}", self.bin);
         if self.link != expected_link {
-            bail!(
-                "tap receipt link '{}' is not the expected '{}'",
-                self.link,
-                expected_link
-            );
+            return Err(RecordError::LinkMismatch {
+                found: self.link.clone(),
+                expected: expected_link,
+            });
         }
         Ok(())
     }
 }
 
-fn validate_source_path(value: &str) -> Result<()> {
+fn validate_source_path(value: &str) -> Result<(), RecordError> {
     if value.is_empty() || value.len() > MAX_SOURCE_PATH_BYTES {
-        bail!("tap source path must be between 1 and {MAX_SOURCE_PATH_BYTES} bytes");
+        return Err(RecordError::SourcePathLength);
     }
     if value.chars().any(char::is_control) {
-        bail!("tap source path must not contain control characters");
+        return Err(RecordError::SourcePathControl);
     }
     if !Path::new(value).is_absolute() {
-        bail!("tap source path '{value}' must be absolute");
+        return Err(RecordError::SourcePathNotAbsolute {
+            value: value.to_owned(),
+        });
     }
     Ok(())
 }

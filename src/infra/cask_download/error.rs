@@ -6,9 +6,15 @@ use reqwest::StatusCode;
 use tokio::time::error::Elapsed;
 
 use super::{MAX_REDIRECT_URL_BYTES, MAX_REDIRECTS};
+use crate::domain::validate::UrlError;
+use crate::infra::download::DownloadError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CaskDownloadError {
+    #[error(transparent)]
+    Url(#[from] UrlError),
+    #[error(transparent)]
+    Download(#[from] DownloadError),
     #[error("refusing to fetch cask payload: sha256 must be 64 lowercase hexadecimal characters")]
     BadDigest,
     #[error("timed out requesting cask payload from {url}")]

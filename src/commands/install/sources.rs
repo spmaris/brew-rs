@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 
 use crate::domain::plan::{PackageSource, PlannedFormula};
-use crate::domain::portable::Catalog;
+use crate::domain::portable::{Catalog, PortableError};
 use crate::infra::store::Receipt;
 
 use super::pending::InstallBlocked;
@@ -84,7 +84,7 @@ pub(super) fn validate_sources(plan: &[PlannedFormula], installed: &[Receipt]) -
 /// error is otherwise unchanged; nothing is ever installed from upstream
 /// without `--source upstream`.
 pub(super) fn with_upstream_hint(
-    catalog: Result<&Catalog>,
+    catalog: Result<&Catalog, PortableError>,
     error: anyhow::Error,
     plan: &[PlannedFormula],
     installed: &[Receipt],

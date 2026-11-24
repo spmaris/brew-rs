@@ -2,14 +2,13 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
-
+use super::error::{MetadataError, NameError};
 use super::model::BottleFile;
 
 /// Tap supported by this planner.
 pub(super) const CORE_TAP: &str = "homebrew/core";
 /// Host that serves official Homebrew bottles.
-const BOTTLE_HOST: &str = "ghcr.io";
+pub(super) const BOTTLE_HOST: &str = "ghcr.io";
 /// Path prefix shared by official `homebrew/core` bottle blobs.
 const BOTTLE_URL_PREFIX: &str = "https://ghcr.io/v2/homebrew/core/";
 
@@ -18,7 +17,7 @@ pub(super) const MAX_NAME_LEN: usize = 64;
 /// Maximum length of a rendered version.
 const MAX_VERSION_LEN: usize = 64;
 /// Maximum length of a host tag.
-const MAX_TAG_LEN: usize = 64;
+pub(super) const MAX_TAG_LEN: usize = 64;
 /// Maximum length of a bottle URL.
 const MAX_URL_LEN: usize = 2048;
 /// Maximum length of a bottle cellar path.
@@ -27,20 +26,23 @@ const MAX_CELLAR_LEN: usize = 1024;
 const SHA256_HEX_LEN: usize = 64;
 
 /// Parse a target into a bare formula name, rejecting unsupported taps.
-pub(crate) fn parse_target(raw: &str) -> Result<&str> {
+pub(crate) fn parse_target(raw: &str) -> Result<&str, NameError> {
     if raw.is_empty() {
-        bail!("target formula names must not be empty");
+        return Err(NameError::TargetEmpty);
     }
     if raw.len() > MAX_NAME_LEN + CORE_TAP.len() + 1 {
-        bail!("target '{raw}' is longer than the supported maximum");
+        return Err(NameError::TargetTooLong {
+            raw: raw.to_owned(),
+        });
     }
 
     let name = match raw.rsplit_once('/') {
         Some((tap, name)) => {
             if tap != CORE_TAP {
-                bail!(
-                    "unsupported tap '{tap}' in target '{raw}': only {CORE_TAP} formulae are supported"
-                );
+                return Err(NameError::UnsupportedTap {
+                    tap: tap.to_owned(),
+                    raw: raw.to_owned(),
+                });
             }
             name
         }
@@ -51,96 +53,129 @@ pub(crate) fn parse_target(raw: &str) -> Result<&str> {
 }
 
 /// Validate a host tag: lowercase ASCII, digits and underscores only.
-pub(crate) fn validate_tag(tag: &str) -> Result<()> {
+pub(crate) fn validate_tag(tag: &str) -> Result<(), NameError> {
     if tag.is_empty() || tag.len() > MAX_TAG_LEN {
-        bail!("host tag must be between 1 and {MAX_TAG_LEN} characters");
+        return Err(NameError::TagLength);
     }
     let mut characters = tag.chars();
     match characters.next() {
         Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
-        _ => bail!("host tag '{tag}' must start with a lowercase letter or digit"),
+        _ => {
+            return Err(NameError::TagStart {
+                tag: tag.to_owned(),
+            });
+        }
     }
     if !tag.chars().all(|character| {
         character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
     }) {
-        bail!("host tag '{tag}' may only contain lowercase letters, digits and underscores");
+        return Err(NameError::TagCharacters {
+            tag: tag.to_owned(),
+        });
     }
     Ok(())
 }
 
 /// Validate a Homebrew formula identifier and return it unchanged.
-pub(crate) fn validate_formula_name<'a>(value: &'a str, what: &str) -> Result<&'a str> {
+pub(crate) fn validate_formula_name<'a>(
+    value: &'a str,
+    what: &'static str,
+) -> Result<&'a str, NameError> {
     if value.is_empty() || value.len() > MAX_NAME_LEN {
-        bail!("{what} '{value}' must be between 1 and {MAX_NAME_LEN} characters");
+        return Err(NameError::Length {
+            what,
+            value: value.to_owned(),
+        });
     }
 
     let mut characters = value.chars();
     match characters.next() {
         Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
-        _ => bail!("{what} '{value}' must start with a lowercase letter or digit"),
+        _ => {
+            return Err(NameError::Start {
+                what,
+                value: value.to_owned(),
+            });
+        }
     }
     if value.contains("..") {
-        bail!("{what} '{value}' must not contain '..'");
+        return Err(NameError::DotDot {
+            what,
+            value: value.to_owned(),
+        });
     }
     if !value.chars().all(|character| {
         character.is_ascii_lowercase()
             || character.is_ascii_digit()
             || matches!(character, '@' | '+' | '-' | '_' | '.')
     }) {
-        bail!("{what} '{value}' contains characters outside [a-z0-9@+._-]");
+        return Err(NameError::Characters {
+            what,
+            value: value.to_owned(),
+        });
     }
     Ok(value)
 }
 
 /// Validate a rendered version string.
-pub(super) fn validate_version(version: &str, formula: &str) -> Result<()> {
+pub(super) fn validate_version(version: &str, formula: &str) -> Result<(), MetadataError> {
     if version.is_empty() || version.len() > MAX_VERSION_LEN {
-        bail!("formula '{formula}' has an invalid version length");
+        return Err(MetadataError::VersionLength {
+            formula: formula.to_owned(),
+        });
     }
     if !version.chars().all(|character| {
         character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
     }) {
-        bail!("formula '{formula}' has an invalid version '{version}'");
+        return Err(MetadataError::InvalidVersion {
+            formula: formula.to_owned(),
+            version: version.to_owned(),
+        });
     }
     Ok(())
 }
 
 /// Validate and normalize a bottle digest to lowercase hexadecimal.
-pub(super) fn validate_sha256(value: &str, formula: &str) -> Result<String> {
+pub(super) fn validate_sha256(value: &str, formula: &str) -> Result<String, MetadataError> {
     if value.len() != SHA256_HEX_LEN
         || !value.chars().all(|character| character.is_ascii_hexdigit())
     {
-        bail!("formula '{formula}' has an invalid bottle sha256");
+        return Err(MetadataError::InvalidSha256 {
+            formula: formula.to_owned(),
+        });
     }
     Ok(value.to_ascii_lowercase())
 }
 
 /// Validate the bottle URL and require it to agree with `sha256`.
-pub(super) fn validate_bottle_url(value: &str, sha256: &str, formula: &str) -> Result<String> {
+pub(super) fn validate_bottle_url(
+    value: &str,
+    sha256: &str,
+    formula: &str,
+) -> Result<String, MetadataError> {
+    let formula = || formula.to_owned();
     if value.is_empty() || value.len() > MAX_URL_LEN {
-        bail!("formula '{formula}' has an invalid bottle URL length");
+        return Err(MetadataError::BottleUrlLength { formula: formula() });
     }
     if !value.is_ascii()
         || value
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        bail!(
-            "formula '{formula}' has a bottle URL with whitespace, control or non-ASCII characters"
-        );
+        return Err(MetadataError::BottleUrlCharacters { formula: formula() });
     }
     let Some(rest) = value.strip_prefix("https://") else {
-        bail!("formula '{formula}' bottle URL must use https");
+        return Err(MetadataError::BottleUrlNotHttps { formula: formula() });
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority != BOTTLE_HOST {
-        bail!("formula '{formula}' bottle URL must point at {BOTTLE_HOST}");
+        return Err(MetadataError::BottleUrlHost { formula: formula() });
     }
     let Some(rest) = value.strip_prefix(BOTTLE_URL_PREFIX) else {
-        bail!("formula '{formula}' bottle URL must be an official homebrew/core blob");
+        return Err(MetadataError::BottleUrlNotOfficial { formula: formula() });
     };
     let Some((repository, embedded)) = rest.rsplit_once("/blobs/sha256:") else {
-        bail!("formula '{formula}' bottle URL must end in /blobs/sha256:<digest>");
+        return Err(MetadataError::BottleUrlNoBlob { formula: formula() });
     };
     if repository.is_empty()
         || repository.split('/').any(|segment| {
@@ -154,32 +189,33 @@ pub(super) fn validate_bottle_url(value: &str, sha256: &str, formula: &str) -> R
                 })
         })
     {
-        bail!("formula '{formula}' bottle URL has an invalid repository path");
+        return Err(MetadataError::BottleUrlRepository { formula: formula() });
     }
     if embedded != sha256 {
-        bail!("formula '{formula}' bottle URL digest does not match its sha256");
+        return Err(MetadataError::BottleUrlDigest { formula: formula() });
     }
     Ok(value.to_string())
 }
 
 /// Validate the bottle cellar: the two Homebrew sentinels or an absolute,
 /// normalized path.
-pub(super) fn validate_cellar(value: &str, formula: &str) -> Result<String> {
+pub(super) fn validate_cellar(value: &str, formula: &str) -> Result<String, MetadataError> {
+    let formula = || formula.to_owned();
     if value == ":any" || value == ":any_skip_relocation" {
         return Ok(value.to_string());
     }
     if value.is_empty() || value.len() > MAX_CELLAR_LEN {
-        bail!("formula '{formula}' has an invalid bottle cellar");
+        return Err(MetadataError::CellarLength { formula: formula() });
     }
     if !value.is_ascii()
         || value
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        bail!("formula '{formula}' bottle cellar contains whitespace or control characters");
+        return Err(MetadataError::CellarCharacters { formula: formula() });
     }
     if !value.starts_with('/') || value.contains('\\') || value.contains("//") {
-        bail!("formula '{formula}' bottle cellar must be an absolute path");
+        return Err(MetadataError::CellarNotAbsolute { formula: formula() });
     }
     let components: Vec<&str> = value[1..].split('/').collect();
     if components.is_empty()
@@ -187,7 +223,7 @@ pub(super) fn validate_cellar(value: &str, formula: &str) -> Result<String> {
             .iter()
             .any(|component| component.is_empty() || *component == "." || *component == "..")
     {
-        bail!("formula '{formula}' bottle cellar is not a normalized path");
+        return Err(MetadataError::CellarNotNormalized { formula: formula() });
     }
     Ok(value.to_string())
 }

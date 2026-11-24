@@ -57,6 +57,48 @@ async fn audit_memoizes_shared_dependencies_and_failures() {
     );
 }
 
+/// Fails each lookup with the failure its name asks for.
+struct FailingSource;
+
+impl FormulaSource for FailingSource {
+    async fn fetch(&self, name: &str) -> Result<FormulaResponse> {
+        Err(match name {
+            "gone" => anyhow::Error::new(ApiFailure::NotFound).context("failed to fetch formula"),
+            "offline" => anyhow::Error::new(ApiFailure::Unreachable),
+            "broken" => anyhow::Error::new(ApiFailure::Server(503)),
+            _ => anyhow::anyhow!("bad json"),
+        })
+    }
+}
+
+#[tokio::test]
+async fn audit_keeps_the_friendly_failure_text_for_first_and_cached_lookups() {
+    let source = Memoized::new(FailingSource);
+    for (name, expected) in [
+        ("gone", "No Homebrew formula named 'gone'."),
+        (
+            "offline",
+            "Could not reach formulae.brew.sh. Check your network connection.",
+        ),
+        (
+            "broken",
+            "formulae.brew.sh returned an error (HTTP 503). Try again later.",
+        ),
+        (
+            "weird",
+            "Could not read Homebrew metadata for 'weird'.\n  Run with BREW_RS_LOG=debug for details.",
+        ),
+    ] {
+        // The second lookup is answered from the memo and must classify alike.
+        for _ in 0..2 {
+            let error = resolve_with(&source, &[name.into()], TAG)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected, "{name}");
+        }
+    }
+}
+
 /// Reports every name outside `docs` as an API 404.
 struct NotFoundSource(FixtureSource);
 

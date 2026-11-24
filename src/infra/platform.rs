@@ -4,7 +4,7 @@ use std::io;
 use std::process::ExitStatus;
 use std::str::Utf8Error;
 
-use crate::domain::plan::macos_tag;
+use crate::domain::plan::{MacosTagError, macos_tag};
 
 /// Why the host's default bottle tag could not be determined.
 #[derive(Debug, thiserror::Error)]
@@ -29,7 +29,7 @@ pub(crate) enum PlatformError {
         source: Utf8Error,
     },
     #[error(transparent)]
-    Tag(Box<dyn std::error::Error + Send + Sync>),
+    Tag(#[from] MacosTagError),
     #[error("No default Homebrew bottle tag for this platform; pass --target")]
     Unsupported,
 }
@@ -57,7 +57,7 @@ pub(crate) fn default_target() -> Result<String, PlatformError> {
             }
             let version = std::str::from_utf8(&version.stdout)
                 .map_err(|source| PlatformError::SwVersNotUtf8 { source })?;
-            macos_tag(arch, version.trim()).map_err(|error| PlatformError::Tag(error.into()))
+            Ok(macos_tag(arch, version.trim())?)
         }
         _ => Err(PlatformError::Unsupported),
     }

@@ -28,7 +28,7 @@ impl HintProbe for FakeProbe {
 }
 
 fn not_found(name: &str, tap: Option<&str>) -> anyhow::Error {
-    from_fetch_error(anyhow::Error::new(ApiFailure::NotFound), name, tap, None)
+    from_fetch_error(&anyhow::Error::new(ApiFailure::NotFound), name, tap, None).into()
 }
 
 #[tokio::test]
@@ -117,12 +117,12 @@ async fn tap_qualified_target_without_catalog_names_stays_bare() {
 #[tokio::test]
 async fn dependency_not_found_has_no_hints() {
     let error = from_fetch_error(
-        anyhow::Error::new(ApiFailure::NotFound),
+        &anyhow::Error::new(ApiFailure::NotFound),
         "dep",
         None,
         Some("parent"),
     );
-    let error = add_hints(error, &FakeProbe::casks(true), None).await;
+    let error = add_hints(error.into(), &FakeProbe::casks(true), None).await;
     assert_eq!(
         format!("{error:#}"),
         "Homebrew metadata for 'parent' lists dependency 'dep', which does not exist."

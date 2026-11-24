@@ -2,8 +2,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result, bail};
-
+use super::error::MetadataError;
 use super::macos::is_supported_macos_tag;
 use super::model::{FormulaNode, FormulaResponse};
 use super::requirements::review_requirements;
@@ -15,7 +14,7 @@ use super::validate::{
 };
 
 /// Maximum runtime dependencies read from a single formula.
-const MAX_DEPS_PER_FORMULA: usize = 256;
+pub(super) const MAX_DEPS_PER_FORMULA: usize = 256;
 
 /// Blocker for default-installed recommended dependencies.
 pub(super) const BLOCKER_RECOMMENDED_DEPENDENCY: &str =
@@ -26,48 +25,48 @@ pub(super) const BLOCKER_POUR_BOTTLE_ONLY: &str =
     "declares pour-bottle-only conditions not supported by this native installer";
 
 /// Build and validate one graph node from an API payload.
-pub(super) fn build_node(response: FormulaResponse, tag: &str) -> Result<(String, FormulaNode)> {
+pub(super) fn build_node(
+    response: FormulaResponse,
+    tag: &str,
+) -> Result<(String, FormulaNode), MetadataError> {
     let name = validate_formula_name(&response.name, "formula name")?.to_string();
 
     if response.tap != CORE_TAP {
-        bail!(
-            "unsupported tap '{}' for formula '{name}': only {CORE_TAP} is supported",
-            response.tap
-        );
+        return Err(MetadataError::UnsupportedTap {
+            tap: response.tap,
+            name,
+        });
     }
     if response.disabled {
-        bail!("formula '{name}' is disabled and cannot be installed");
+        return Err(MetadataError::Disabled { name });
     }
 
     if !response.versions.bottle {
-        bail!(
-            "formula '{name}' has no bottled stable version (source-only builds are not supported)"
-        );
+        return Err(MetadataError::NoBottledStable { name });
     }
     let stable = response
         .versions
         .stable
         .as_deref()
-        .with_context(|| format!("formula '{name}' has no stable version"))?;
+        .ok_or_else(|| MetadataError::NoStableVersion { name: name.clone() })?;
     if stable.is_empty() {
-        bail!("formula '{name}' has an empty stable version");
+        return Err(MetadataError::EmptyStableVersion { name });
     }
 
     let bottle = response
         .bottle
         .as_ref()
         .and_then(|bottle| bottle.stable.as_ref())
-        .with_context(|| format!("formula '{name}' has no stable bottle metadata"))?;
+        .ok_or_else(|| MetadataError::NoStableBottle { name: name.clone() })?;
     // `all` is Homebrew's platform-independent bottle.
     let bottle_file = bottle
         .files
         .get(tag)
         .or_else(|| bottle.files.get("all"))
-        .with_context(|| {
-            format!(
-                "formula '{name}' has no bottle for host tag '{tag}' (available: {})",
-                available_tags(&bottle.files)
-            )
+        .ok_or_else(|| MetadataError::NoBottleForTag {
+            name: name.clone(),
+            tag: tag.to_owned(),
+            available: available_tags(&bottle.files),
         })?;
 
     let revision = response.revision.unwrap_or(0);
@@ -88,10 +87,10 @@ pub(super) fn build_node(response: FormulaResponse, tag: &str) -> Result<(String
         .and_then(|variation| variation.dependencies.as_ref())
         .unwrap_or(&response.dependencies);
     if dependency_list.len() > MAX_DEPS_PER_FORMULA {
-        bail!(
-            "formula '{name}' declares {} dependencies, above the {MAX_DEPS_PER_FORMULA} limit",
-            dependency_list.len()
-        );
+        return Err(MetadataError::TooManyDependencies {
+            name,
+            count: dependency_list.len(),
+        });
     }
 
     let mut dependencies = Vec::with_capacity(dependency_list.len());

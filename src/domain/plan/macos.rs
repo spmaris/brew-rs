@@ -1,6 +1,6 @@
 //! macOS release and bottle-tag knowledge shared by the planner and cask planner.
 
-use anyhow::{Result, bail};
+use super::error::MacosTagError;
 
 /// Maximum length of a macOS minimum version string.
 pub(super) const MAX_REQUIREMENT_VERSION_LEN: usize = 16;
@@ -111,7 +111,7 @@ pub(in crate::domain) fn macos_version_for_tag(tag: &str) -> Option<MacosVersion
         })
 }
 
-pub(crate) fn macos_tag(arch: &str, version: &str) -> Result<String> {
+pub(crate) fn macos_tag(arch: &str, version: &str) -> Result<String, MacosTagError> {
     let release = match version.split('.').next() {
         Some("11") => "big_sur",
         Some("12") => "monterey",
@@ -119,11 +119,17 @@ pub(crate) fn macos_tag(arch: &str, version: &str) -> Result<String> {
         Some("14") => "sonoma",
         Some("15") => "sequoia",
         Some("26") => "tahoe",
-        _ => bail!("Unknown macOS bottle tag for {version}; pass --target"),
+        _ => {
+            return Err(MacosTagError::UnknownRelease {
+                version: version.to_owned(),
+            });
+        }
     };
     match arch {
         "aarch64" => Ok(format!("arm64_{release}")),
         "x86_64" => Ok(release.into()),
-        _ => bail!("No default Homebrew bottle tag for {arch}; pass --target"),
+        _ => Err(MacosTagError::UnknownArch {
+            arch: arch.to_owned(),
+        }),
     }
 }

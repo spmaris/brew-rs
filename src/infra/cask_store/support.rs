@@ -247,11 +247,7 @@ pub(super) fn read_cask_receipt(path: &Path) -> Result<CaskReceipt, CaskStoreErr
 }
 
 pub(super) fn validate_cask_receipt(receipt: &CaskReceipt) -> Result<(), CaskStoreError> {
-    validate_cask_identifier(&receipt.token, "cask token").map_err(|error| {
-        CaskStoreError::InvalidIdentifier {
-            message: error.to_string(),
-        }
-    })?;
+    validate_cask_identifier(&receipt.token, "cask token")?;
     if receipt.version.is_empty()
         || receipt.version.len() > MAX_VERSION_LEN
         || receipt.version == "."

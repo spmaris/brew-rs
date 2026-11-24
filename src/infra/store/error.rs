@@ -5,8 +5,6 @@
 //! the outer layer is the variant's `Display` and the inner one is its
 //! `source`, so chain printing yields the same combined text.
 
-use std::error::Error;
-use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -51,17 +49,6 @@ pub(crate) enum DirFault {
     Symlink,
     NotDirectory,
     Missing,
-}
-
-/// Render an error with its whole source chain as `outer: inner: ...`.
-pub(crate) fn error_chain(error: &dyn Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let _ = write!(text, ": {cause}");
-        source = cause.source();
-    }
-    text
 }
 
 fn package_directory_message(

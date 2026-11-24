@@ -5,26 +5,30 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::domain::plan::PlannedFormula;
-use crate::domain::portable::artifact_for;
+use crate::domain::portable::{PortableError, artifact_for};
 use crate::infra::archive::ArchiveError;
+use crate::infra::cask_download::CaskDownloadError;
 use crate::infra::tap_artifact::TapArtifactError;
 use crate::infra::{archive, cask_download, tap_artifact};
 
 /// Why a portable upstream release could not be fetched or staged.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PortableFetchError {
-    /// The portable catalog lookup failed (its error type is owned elsewhere).
     #[error(transparent)]
-    Catalog(Box<dyn std::error::Error + Send + Sync>),
-    /// The verified download failed (its error type is owned elsewhere).
+    Catalog(#[from] PortableError),
     #[error(transparent)]
-    Download(Box<dyn std::error::Error + Send + Sync>),
+    Download(#[from] CaskDownloadError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
     Artifact(#[from] TapArtifactError),
-    #[error(transparent)]
-    Fs(io::Error),
+    #[error("failed to {action} '{}'", path.display())]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("Portable archive member {relative:?} is not executable")]
     NotExecutable { relative: String },
     #[error(
@@ -33,15 +37,24 @@ pub(crate) enum PortableFetchError {
     NotRegularMember { relative: String },
 }
 
+impl PortableFetchError {
+    /// A `map_err` adapter that names the action and path of a failed I/O call.
+    fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Self {
+        let path = path.to_path_buf();
+        move |source| Self::Io {
+            action,
+            path,
+            source,
+        }
+    }
+}
+
 pub(crate) async fn fetch(
     config: &crate::config::Config,
     formula: &PlannedFormula,
 ) -> Result<PathBuf, PortableFetchError> {
-    let (_, _, artifact) =
-        artifact_for(formula).map_err(|error| PortableFetchError::Catalog(error.into()))?;
-    cask_download::fetch(config, &artifact.url, &artifact.sha256)
-        .await
-        .map_err(|error| PortableFetchError::Download(error.into()))
+    let (_, _, artifact) = artifact_for(formula)?;
+    Ok(cask_download::fetch(config, &artifact.url, &artifact.sha256).await?)
 }
 
 pub(crate) fn stage(
@@ -49,8 +62,7 @@ pub(crate) fn stage(
     tarball: &Path,
     out: &Path,
 ) -> Result<(), PortableFetchError> {
-    let (package, arch, artifact) =
-        artifact_for(formula).map_err(|error| PortableFetchError::Catalog(error.into()))?;
+    let (package, arch, artifact) = artifact_for(formula)?;
     archive::unpack_release(tarball, out, &artifact.root, &artifact.sha256)?;
     for relative in &package.required_files {
         regular_member(out, relative)?;
@@ -61,7 +73,7 @@ pub(crate) fn stage(
         {
             use std::os::unix::fs::PermissionsExt;
             if fs::symlink_metadata(&path)
-                .map_err(PortableFetchError::Fs)?
+                .map_err(PortableFetchError::io("inspect", &path))?
                 .permissions()
                 .mode()
                 & 0o111
@@ -82,12 +94,14 @@ fn regular_member(out: &Path, relative: &str) -> Result<PathBuf, PortableFetchEr
     // The private stage is canonicalized independently so callers may use a
     // prefix behind macOS's /var or /tmp aliases, but members cannot be aliases.
     if !fs::symlink_metadata(&path)
-        .map_err(PortableFetchError::Fs)?
+        .map_err(PortableFetchError::io("inspect", &path))?
         .is_file()
-        || path.canonicalize().map_err(PortableFetchError::Fs)?
+        || path
+            .canonicalize()
+            .map_err(PortableFetchError::io("resolve", &path))?
             != out
                 .canonicalize()
-                .map_err(PortableFetchError::Fs)?
+                .map_err(PortableFetchError::io("resolve", out))?
                 .join(relative)
     {
         return Err(PortableFetchError::NotRegularMember {

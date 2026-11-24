@@ -2,11 +2,13 @@
 
 use std::io;
 use std::num::{ParseIntError, TryFromIntError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::str::Utf8Error;
 
 use tar::EntryType;
+
+use crate::infra::download::DownloadError;
 
 /// Why a cask payload was rejected or could not be staged.
 #[derive(Debug, thiserror::Error)]
@@ -27,8 +29,6 @@ pub(crate) enum CaskExtractError {
     },
     /// A filesystem error that carried no extra context before the typed
     /// conversion and keeps its original text.
-    #[error(transparent)]
-    Fs(io::Error),
     #[error("failed to create staged symlink '{}' -> '{target}'", .path.display())]
     SymlinkCreate {
         path: PathBuf,
@@ -43,7 +43,7 @@ pub(crate) enum CaskExtractError {
         token: String,
         version: String,
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: DownloadError,
     },
     #[error("cask stage '{}' is not a real directory", .path.display())]
     StageNotDirectory { path: PathBuf },
@@ -308,4 +308,16 @@ pub(crate) enum CaskExtractError {
     },
     #[error("target '{inner_path}' inside '{}' is not a regular file", .bundle.display())]
     BundleTargetNotRegular { inner_path: String, bundle: PathBuf },
+}
+
+impl CaskExtractError {
+    /// A `map_err` adapter that names the action and path of a failed I/O call.
+    pub(super) fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Self {
+        let path = path.to_path_buf();
+        move |source| Self::Io {
+            action,
+            path,
+            source,
+        }
+    }
 }

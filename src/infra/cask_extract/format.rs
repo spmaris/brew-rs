@@ -183,7 +183,7 @@ pub(super) fn stage_naked_payload(
     };
     let dest = unpack_dir.join(rel);
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
+        fs::create_dir_all(parent).map_err(CaskExtractError::io("create directory", parent))?;
     }
     fs::copy(download_path, &dest).map_err(|source| CaskExtractError::Io {
         action: "stage naked cask binary to",

@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::commands::install::{confirm, prefix_path};
 use crate::config::Config;
 use crate::domain::tap_manifest::{TapReceipt, parse_qualified};
-use crate::infra::store::{InstallLock, Store, stages_dir};
+use crate::infra::store::{InstallLock, Store, reject_protected_prefix, stages_dir};
 use crate::infra::tap_artifact::stage_verified;
 use crate::ui::DnfStyleFormatter;
 
@@ -43,6 +43,7 @@ pub(crate) async fn install(
     yes: bool,
 ) -> Result<()> {
     let path = prefix_path(prefix)?;
+    reject_protected_prefix(&path)?;
     let plan = build_plan(&path, package)?;
     let ui = DnfStyleFormatter::new(config);
     render_plan(&ui, &plan, "Tap install");

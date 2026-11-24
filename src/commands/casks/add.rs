@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::commands::install::{confirm, prefix_path};
+use crate::commands::install::{confirm, installed_summary, prefix_path};
 use crate::config::Config;
 use crate::domain::cask_plan;
 use crate::domain::cask_plan::PlannedCask;
@@ -185,7 +185,10 @@ pub(crate) async fn install(
         )?);
     }
 
-    let count = prepared.len();
+    let installed: Vec<String> = prepared
+        .iter()
+        .map(|p| format!("{} {}", p.receipt.token, p.receipt.version))
+        .collect();
     let any_apps = prepared.iter().any(|p| !p.receipt.apps.is_empty());
     let any_bin = prepared.iter().any(|p| {
         p.receipt.links.iter().any(|l| l.dest.starts_with("bin/")) || !p.receipt.wrappers.is_empty()
@@ -194,10 +197,7 @@ pub(crate) async fn install(
 
     formatter.note(&format!(
         "\n{}",
-        formatter.result(&format!(
-            "Installed {count} {}",
-            if count == 1 { "cask" } else { "casks" }
-        ))
+        formatter.result(&installed_summary(&installed, 0))
     ));
     let mut follow_up = Vec::new();
     if any_apps {

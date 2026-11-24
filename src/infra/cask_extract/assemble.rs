@@ -37,7 +37,8 @@ pub(super) fn assemble_stage(
             bundle_name,
         } = artifact
         {
-            fs::create_dir_all(&apps_stage).map_err(CaskExtractError::Fs)?;
+            fs::create_dir_all(&apps_stage)
+                .map_err(CaskExtractError::io("create directory", &apps_stage))?;
             let src = resolve_unpack_dir_path(unpack_dir, source)?;
             let meta =
                 fs::symlink_metadata(&src).map_err(|error| CaskExtractError::AppNotFound {
@@ -141,7 +142,8 @@ pub(super) fn assemble_stage(
                     &mut caskroom_files,
                     &mut copied_payload_paths,
                 )?;
-                fs::create_dir_all(&wrappers_stage).map_err(CaskExtractError::Fs)?;
+                fs::create_dir_all(&wrappers_stage)
+                    .map_err(CaskExtractError::io("create directory", &wrappers_stage))?;
                 let script = build_command_wrapper_script(&exec_abs, args);
                 let wrapper_path = wrappers_stage.join(link_name);
                 fs::write(&wrapper_path, script.as_bytes()).map_err(|source| {
@@ -297,7 +299,7 @@ fn ensure_payload_file_staged(
     }
     let dst = caskroom_stage.join(rel);
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
+        fs::create_dir_all(parent).map_err(CaskExtractError::io("create directory", parent))?;
     }
     fs::rename(&src, &dst)
         .or_else(|_| fs::copy(&src, &dst).map(|_| ()))
@@ -372,7 +374,7 @@ fn verify_regular_file_in_bundle(
                     inner_path: inner_path.to_owned(),
                 });
             }
-            let target = fs::read_link(&abs).map_err(CaskExtractError::Fs)?;
+            let target = fs::read_link(&abs).map_err(CaskExtractError::io("read symlink", &abs))?;
             let target_str = target
                 .to_str()
                 .ok_or(CaskExtractError::BundleSymlinkNotUtf8)?;

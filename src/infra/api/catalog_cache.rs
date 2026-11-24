@@ -19,8 +19,9 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 
 use super::brew_client::BrewApiClient;
-use super::error::{ApiError, error_chain};
+use super::error::ApiError;
 use super::types::{Cask, Formula};
+use crate::infra::error::error_chain;
 
 /// Cached catalogs stay fresh for one day, matching the cadence at which the
 /// Homebrew API data changes in practice.

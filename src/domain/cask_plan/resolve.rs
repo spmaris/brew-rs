@@ -2,19 +2,20 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::super::plan::is_supported_macos_tag;
 use super::super::validate::{is_lower_hex_digest, validate_cask_url};
 use super::artifacts::review_artifacts;
+use super::error::CaskPlanError;
 use super::identifier::{CASK_TAP, parse_cask_target, validate_cask_identifier};
 use super::model::{ContainerHint, PlannedCask};
 use super::requirements::{review_conflicts_with, review_depends_on};
 
 /// Maximum cask targets accepted in one invocation.
-const MAX_TARGETS: usize = 64;
+pub(super) const MAX_TARGETS: usize = 64;
 
 /// Maximum length of a cask version.
 const MAX_VERSION_LEN: usize = 128;
@@ -32,13 +33,13 @@ pub(crate) async fn resolve_with<S: CaskSource>(
     tag: &str,
 ) -> Result<Vec<PlannedCask>> {
     if targets.is_empty() {
-        bail!("at least one cask target is required");
+        return Err(CaskPlanError::NoTargets.into());
     }
     if targets.len() > MAX_TARGETS {
-        bail!(
-            "cannot resolve more than {MAX_TARGETS} cask targets at once (got {})",
-            targets.len()
-        );
+        return Err(CaskPlanError::TooManyTargets {
+            count: targets.len(),
+        }
+        .into());
     }
 
     let mut seen_tokens = HashSet::new();
@@ -76,10 +77,10 @@ struct RawCask {
     variations: Value,
 }
 
-fn merge_variation(base: Value, tag: &str) -> Result<RawCask> {
+fn merge_variation(base: Value, tag: &str) -> Result<RawCask, CaskPlanError> {
     let mut base_obj = match base {
         Value::Object(map) => map,
-        _ => bail!("cask API response is not a JSON object"),
+        _ => return Err(CaskPlanError::NotAnObject),
     };
     let overlay = base_obj
         .get("variations")
@@ -92,18 +93,19 @@ fn merge_variation(base: Value, tag: &str) -> Result<RawCask> {
             base_obj.insert(key, value);
         }
     }
-    serde_json::from_value(Value::Object(base_obj))
-        .context("failed to parse Homebrew cask metadata")
+    serde_json::from_value(Value::Object(base_obj)).map_err(CaskPlanError::ParseMetadata)
 }
 
 pub(super) fn plan_from_value(
     payload: Value,
     requested_token: &str,
     tag: &str,
-) -> Result<PlannedCask> {
+) -> Result<PlannedCask, CaskPlanError> {
     let raw = merge_variation(payload, tag)?;
     if raw.token.is_empty() {
-        bail!("Homebrew API returned cask '{requested_token}' without a token");
+        return Err(CaskPlanError::MissingToken {
+            requested: requested_token.to_owned(),
+        });
     }
     let token = validate_cask_identifier(&raw.token, "cask token")?.to_string();
     let tap = if raw.tap.trim().is_empty() {
@@ -112,7 +114,10 @@ pub(super) fn plan_from_value(
         raw.tap.trim()
     };
     if tap != CASK_TAP {
-        bail!("cask '{token}' comes from unsupported tap '{tap}'; only {CASK_TAP} is supported");
+        return Err(CaskPlanError::UnsupportedTap {
+            token,
+            tap: tap.to_owned(),
+        });
     }
     if raw.disabled {
         let reason = raw
@@ -120,7 +125,10 @@ pub(super) fn plan_from_value(
             .as_deref()
             .filter(|text| !text.trim().is_empty())
             .unwrap_or("disabled upstream");
-        bail!("cask '{token}' is disabled ({reason})");
+        return Err(CaskPlanError::Disabled {
+            token,
+            reason: reason.to_owned(),
+        });
     }
 
     let version = parse_cask_version(&raw.version, &token)?;
@@ -168,13 +176,19 @@ pub(super) fn plan_from_value(
     })
 }
 
-fn parse_cask_version(value: &Value, token: &str) -> Result<String> {
+fn parse_cask_version(value: &Value, token: &str) -> Result<String, CaskPlanError> {
     let raw = match value {
         Value::String(s) => s.trim(),
-        _ => bail!("cask '{token}' does not declare a string version"),
+        _ => {
+            return Err(CaskPlanError::VersionNotString {
+                token: token.to_owned(),
+            });
+        }
     };
     if raw.is_empty() || raw.len() > MAX_VERSION_LEN {
-        bail!("cask '{token}' has an invalid version length");
+        return Err(CaskPlanError::VersionLength {
+            token: token.to_owned(),
+        });
     }
     if raw == "."
         || raw == ".."
@@ -183,7 +197,10 @@ fn parse_cask_version(value: &Value, token: &str) -> Result<String> {
         || raw.contains('\\')
         || raw.chars().any(|ch| ch.is_control() || ch.is_whitespace())
     {
-        bail!("cask '{token}' has an unsafe version string '{raw}'");
+        return Err(CaskPlanError::UnsafeVersion {
+            token: token.to_owned(),
+            raw: raw.to_owned(),
+        });
     }
     Ok(raw.to_string())
 }

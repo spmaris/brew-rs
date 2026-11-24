@@ -24,7 +24,9 @@
 
 use std::cmp::Ordering;
 
-use anyhow::{Result, bail};
+mod error;
+
+pub(crate) use error::VersionError;
 
 /// Longest version accepted, matching the planner's own version limit.
 const MAX_VERSION_LEN: usize = 64;
@@ -51,7 +53,7 @@ struct Version<'a> {
 /// when it is older (a downgrade), and [`Ordering::Equal`] when the numeric
 /// versions and revisions match. Both versions must use the supported numeric
 /// dotted shape; anything else is an error.
-pub(crate) fn compare(candidate: &str, installed: &str) -> anyhow::Result<std::cmp::Ordering> {
+pub(crate) fn compare(candidate: &str, installed: &str) -> Result<Ordering, VersionError> {
     let candidate = parse(candidate)?;
     let installed = parse(installed)?;
 
@@ -70,35 +72,32 @@ pub(crate) fn compare(candidate: &str, installed: &str) -> anyhow::Result<std::c
 }
 
 /// Parse the supported `digits(.digits)*(_digits)?` shape.
-fn parse(input: &str) -> Result<Version<'_>> {
+fn parse(input: &str) -> Result<Version<'_>, VersionError> {
     if input.is_empty() {
-        bail!("native version is empty; expected a numeric dotted version");
+        return Err(VersionError::Empty);
     }
     if input.len() > MAX_VERSION_LEN {
-        bail!(
-            "native version is {} bytes long, above the {MAX_VERSION_LEN}-byte limit",
-            input.len()
-        );
+        return Err(VersionError::TooLong { len: input.len() });
     }
     if input.chars().any(char::is_whitespace) {
-        bail!("native version contains whitespace; whitespace is not supported");
+        return Err(VersionError::Whitespace);
     }
     if !input.is_ascii() {
-        bail!(
-            "native version contains non-ASCII text; only ASCII digits, '.' and '_' are supported"
-        );
+        return Err(VersionError::NonAscii);
     }
     if input.contains(['-', '+']) {
-        bail!(
-            "native version '{input}' contains '{}'; prerelease, date and build-metadata versions are not supported",
-            if input.contains('-') { '-' } else { '+' }
-        );
+        return Err(VersionError::Prerelease {
+            input: input.to_owned(),
+            separator: if input.contains('-') { '-' } else { '+' },
+        });
     }
 
     let (base, revision) = match input.split_once('_') {
         Some((base, revision)) => {
             if revision.contains('_') {
-                bail!("native version '{input}' has more than one '_revision' separator");
+                return Err(VersionError::MultipleRevisions {
+                    input: input.to_owned(),
+                });
             }
             (base, revision)
         }
@@ -106,33 +105,44 @@ fn parse(input: &str) -> Result<Version<'_>> {
     };
 
     if base.is_empty() {
-        bail!("native version '{input}' has no numeric base before '_revision'");
+        return Err(VersionError::NoBase {
+            input: input.to_owned(),
+        });
     }
     if revision.is_empty() {
-        bail!("native version '{input}' has an empty '_revision'");
+        return Err(VersionError::EmptyRevision {
+            input: input.to_owned(),
+        });
     }
     if revision.len() > MAX_REVISION_DIGITS {
-        bail!("native version '{input}' has a revision above {MAX_REVISION_DIGITS} decimal digits");
+        return Err(VersionError::RevisionTooLong {
+            input: input.to_owned(),
+        });
     }
     if !revision.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!(
-            "native version '{input}' has a non-decimal '_revision'; only decimal digits are supported"
-        );
+        return Err(VersionError::NonDecimalRevision {
+            input: input.to_owned(),
+        });
     }
 
     let mut components = Vec::new();
     for component in base.split('.') {
         if component.is_empty() {
-            bail!("native version '{input}' has an empty numeric component");
+            return Err(VersionError::EmptyComponent {
+                input: input.to_owned(),
+            });
         }
         if !component.bytes().all(|byte| byte.is_ascii_digit()) {
-            bail!(
-                "native version '{input}' has an unsupported character in component '{component}'; only numeric dotted versions are supported"
-            );
+            return Err(VersionError::BadComponent {
+                input: input.to_owned(),
+                component: component.to_owned(),
+            });
         }
         components.push(component);
         if components.len() > MAX_COMPONENTS {
-            bail!("native version '{input}' has more than {MAX_COMPONENTS} numeric components");
+            return Err(VersionError::TooManyComponents {
+                input: input.to_owned(),
+            });
         }
     }
 

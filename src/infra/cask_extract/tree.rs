@@ -26,7 +26,7 @@ pub(super) fn validate_extracted_tree(root: &Path) -> Result<(), CaskExtractErro
             source,
         })?;
         for child in children {
-            let child = child.map_err(CaskExtractError::Fs)?;
+            let child = child.map_err(CaskExtractError::io("read extracted directory", &abs))?;
             entries += 1;
             if entries > MAX_ENTRIES {
                 return Err(CaskExtractError::TreeTooManyEntries { limit: MAX_ENTRIES });

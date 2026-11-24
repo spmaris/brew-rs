@@ -9,7 +9,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use reqwest::header::LOCATION;
 use reqwest::{Client, Response, StatusCode, Url};
 
@@ -21,7 +20,7 @@ use crate::infra::cache::NATIVE_CASK_DIR;
 
 mod error;
 
-use self::error::CaskDownloadError;
+pub(crate) use self::error::CaskDownloadError;
 use super::download::{
     build_verified_client, ensure_isolated_cache_dir, request_timeout, reuse_cached_bottle,
     stage_bottle,
@@ -40,9 +39,13 @@ const MAX_REDIRECTS: usize = 10;
 /// its SHA-256 offline. Corrupt regular files in the cache are discarded and
 /// fetched again; symlinks at either the cache directory or cache file path
 /// are refused.
-pub(crate) async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<PathBuf> {
+pub(crate) async fn fetch(
+    config: &Config,
+    url: &str,
+    sha256: &str,
+) -> Result<PathBuf, CaskDownloadError> {
     if !is_lower_hex_digest(sha256) {
-        return Err(CaskDownloadError::BadDigest.into());
+        return Err(CaskDownloadError::BadDigest);
     }
     let initial = validate_cask_url(url)?;
     let directory = ensure_isolated_cache_dir(config, NATIVE_CASK_DIR, "native cask")?;
@@ -58,7 +61,11 @@ pub(crate) async fn fetch(config: &Config, url: &str, sha256: &str) -> Result<Pa
     Ok(destination)
 }
 
-async fn request_cask_payload(client: &Client, initial: Url, config: &Config) -> Result<Response> {
+async fn request_cask_payload(
+    client: &Client,
+    initial: Url,
+    config: &Config,
+) -> Result<Response, CaskDownloadError> {
     let mut current = initial;
     let mut redirects = 0_usize;
 
@@ -84,7 +91,7 @@ async fn request_cask_payload(client: &Client, initial: Url, config: &Config) ->
             | StatusCode::PERMANENT_REDIRECT => {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
-                    return Err(CaskDownloadError::TooManyRedirects.into());
+                    return Err(CaskDownloadError::TooManyRedirects);
                 }
                 let location = response
                     .headers()
@@ -97,22 +104,21 @@ async fn request_cask_payload(client: &Client, initial: Url, config: &Config) ->
                 return Err(CaskDownloadError::HttpStatus {
                     status,
                     url: current.to_string(),
-                }
-                .into());
+                });
             }
         }
     }
 }
 
-fn resolve_cask_redirect(base: &Url, location: &str) -> Result<Url> {
+fn resolve_cask_redirect(base: &Url, location: &str) -> Result<Url, CaskDownloadError> {
     if location.is_empty() {
-        return Err(CaskDownloadError::EmptyLocation.into());
+        return Err(CaskDownloadError::EmptyLocation);
     }
     if location.len() > MAX_REDIRECT_URL_BYTES {
-        return Err(CaskDownloadError::LocationTooLong.into());
+        return Err(CaskDownloadError::LocationTooLong);
     }
     if location.chars().any(|ch| ch.is_control()) {
-        return Err(CaskDownloadError::LocationControlCharacters.into());
+        return Err(CaskDownloadError::LocationControlCharacters);
     }
     let target = base
         .join(location)
@@ -120,7 +126,11 @@ fn resolve_cask_redirect(base: &Url, location: &str) -> Result<Url> {
             location: location.to_owned(),
             source,
         })?;
-    validate_cask_url_with_limit(target.as_str(), MAX_REDIRECT_URL_BYTES, "cask redirect URL")
+    Ok(validate_cask_url_with_limit(
+        target.as_str(),
+        MAX_REDIRECT_URL_BYTES,
+        "cask redirect URL",
+    )?)
 }
 
 #[cfg(test)]

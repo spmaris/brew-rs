@@ -16,6 +16,7 @@ mod upgrade;
 
 pub(crate) use self::add::install;
 pub(crate) use self::all::{check_all_updates, upgrade_all};
+pub(in crate::commands) use self::format::{installed_summary, removed_summary, upgraded_summary};
 pub(crate) use self::list::{list, list_all};
 pub(crate) use self::remove::{autoremove, remove};
 pub(crate) use self::shellenv::shellenv;

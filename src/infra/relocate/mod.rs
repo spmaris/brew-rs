@@ -92,11 +92,13 @@ fn relocate_keg(
     while let Some(directory) = pending.pop() {
         let mut entries = fs::read_dir(&directory)
             .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-            .map_err(RelocateError::Fs)?;
+            .map_err(RelocateError::io("read directory", &directory))?;
         entries.sort_unstable_by_key(|entry| entry.file_name());
         for entry in entries {
-            let kind = entry.file_type().map_err(RelocateError::Fs)?;
             let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(RelocateError::io("inspect", &path))?;
             if kind.is_dir() {
                 pending.push(path);
             } else if kind.is_file() {
@@ -129,7 +131,7 @@ fn rewrite_file(
             file.take(MAX_RELOCATION_FILE_BYTES + 1)
                 .read_to_end(&mut bytes)
         })
-        .map_err(RelocateError::Fs)?;
+        .map_err(RelocateError::io("read", path))?;
     if bytes.len() as u64 > MAX_RELOCATION_FILE_BYTES {
         return Err(RelocateError::FileTooLarge {
             limit: MAX_RELOCATION_FILE_BYTES,
@@ -178,7 +180,7 @@ fn rewrite_file(
             }
         })?;
     } else if let Some(rewritten) = text::rewrite(relative, &bytes, paths)? {
-        fs::write(path, rewritten).map_err(RelocateError::Fs)?;
+        fs::write(path, rewritten).map_err(RelocateError::io("write", path))?;
     }
     Ok(())
 }
@@ -221,7 +223,7 @@ fn validate_target(
             installed_keg = package.join(version);
             for path in [&cellar, &package, &installed_keg] {
                 if !fs::symlink_metadata(path)
-                    .map_err(RelocateError::Fs)?
+                    .map_err(RelocateError::io("inspect", path))?
                     .is_dir()
                 {
                     return Err(RelocateError::TargetNotManagedKeg {
@@ -232,7 +234,9 @@ fn validate_target(
             &installed_keg
         }
     };
-    let root = root.canonicalize().map_err(RelocateError::Fs)?;
+    let root = root
+        .canonicalize()
+        .map_err(RelocateError::io("resolve", root))?;
     let candidate = match member {
         Some(member) if !member.is_empty() => root.join(member),
         _ => root.clone(),

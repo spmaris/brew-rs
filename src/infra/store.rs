@@ -160,8 +160,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 
 pub(crate) use self::error::StoreError;
-#[cfg(test)]
-pub(crate) use self::error::error_chain;
 pub(crate) use self::links::create_symlink;
 pub(crate) use self::lock::InstallLock;
 pub(super) use self::paths::{bin_dir, meta_dir, monotonic_nonce};

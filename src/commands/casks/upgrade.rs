@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::commands::install::{confirm, prefix_path};
+use crate::commands::install::{confirm, prefix_path, upgraded_summary};
 use crate::config::Config;
 use crate::domain::cask_plan;
 use crate::domain::cask_plan::{CaskVersionOrder, PlannedCask, compare_cask_versions};
@@ -107,14 +107,14 @@ pub(crate) async fn upgrade(
         replacements.push((change.old, prepared));
     }
 
-    let count = replacements.len();
+    let upgraded: Vec<String> = replacements
+        .iter()
+        .map(|(old, new)| format!("{} {} → {}", old.token, old.version, new.receipt.version))
+        .collect();
     cask_store::upgrade(&store, replacements)?;
     formatter.note(&format!(
         "\n{}",
-        formatter.result(&format!(
-            "Upgraded {count} {}",
-            if count == 1 { "cask" } else { "casks" }
-        ))
+        formatter.result(&upgraded_summary(&upgraded))
     ));
     Ok(true)
 }

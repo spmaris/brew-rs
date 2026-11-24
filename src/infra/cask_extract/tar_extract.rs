@@ -73,7 +73,8 @@ pub(super) fn extract_tar_gz(
                     return Err(CaskExtractError::TarballEntryTooLarge { path: rel });
                 }
                 if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
+                    fs::create_dir_all(parent)
+                        .map_err(CaskExtractError::io("create directory", parent))?;
                 }
                 let mut out_file = OpenOptions::new()
                     .write(true)
@@ -94,7 +95,7 @@ pub(super) fn extract_tar_gz(
                     use std::os::unix::fs::PermissionsExt;
                     let safe_mode = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
                     fs::set_permissions(&dest, fs::Permissions::from_mode(safe_mode))
-                        .map_err(CaskExtractError::Fs)?;
+                        .map_err(CaskExtractError::io("set permissions on", &dest))?;
                 }
             }
             EntryType::Symlink => {
@@ -129,13 +130,17 @@ pub(super) fn extract_tar_gz(
     // Drain remainder to check gzip CRC & trailer cleanly.
     let mut reader = tar.into_inner();
     let mut buf = [0_u8; IO_BUFFER_BYTES];
-    while reader.read(&mut buf).map_err(CaskExtractError::Fs)? != 0 {}
+    while reader
+        .read(&mut buf)
+        .map_err(CaskExtractError::io("finish reading tarball", archive_path))?
+        != 0
+    {}
 
     #[cfg(unix)]
     for (rel, dest, target) in symlinks {
         validate_relative_symlink_lexically(&rel, &target)?;
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(CaskExtractError::Fs)?;
+            fs::create_dir_all(parent).map_err(CaskExtractError::io("create directory", parent))?;
         }
         std::os::unix::fs::symlink(&target, &dest).map_err(|source| {
             CaskExtractError::SymlinkCreate {

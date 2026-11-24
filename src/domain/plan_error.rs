@@ -49,6 +49,11 @@ pub(crate) enum PlanError {
         dependency: String,
     },
     Api(ApiFailure),
+    /// A lookup failed in a way that is not not-found, network or 5xx; the
+    /// raw chain is only in the debug log.
+    MetadataUnreadable {
+        name: String,
+    },
 }
 
 impl fmt::Display for PlanError {
@@ -75,6 +80,10 @@ impl fmt::Display for PlanError {
                 "Homebrew metadata for '{parent}' lists dependency '{dependency}', which does not exist."
             ),
             Self::Api(failure) => failure.fmt(f),
+            Self::MetadataUnreadable { name } => write!(
+                f,
+                "Could not read Homebrew metadata for '{name}'.\n  Run with BREW_RS_LOG=debug for details."
+            ),
         }
     }
 }
@@ -93,18 +102,16 @@ pub(crate) fn api_failure(error: &anyhow::Error) -> Option<ApiFailure> {
 /// Failures that are not not-found/network/5xx become a readable metadata
 /// error; the original chain is logged at debug level.
 pub(crate) fn from_fetch_error(
-    error: anyhow::Error,
+    error: &anyhow::Error,
     name: &str,
     tap: Option<&str>,
     parent: Option<&str>,
-) -> anyhow::Error {
-    let Some(failure) = api_failure(&error) else {
+) -> PlanError {
+    let Some(failure) = api_failure(error) else {
         log::debug!("formula lookup for '{name}' failed: {error:#}");
-        return anyhow::anyhow!(
-            "Could not read Homebrew metadata for '{name}'.\n  Run with BREW_RS_LOG=debug for details."
-        );
+        return PlanError::MetadataUnreadable { name: name.into() };
     };
-    anyhow::Error::new(match (failure, parent) {
+    match (failure, parent) {
         (ApiFailure::NotFound, Some(parent)) => PlanError::MissingDependency {
             parent: parent.into(),
             dependency: name.into(),
@@ -115,7 +122,7 @@ pub(crate) fn from_fetch_error(
             hints: Vec::new(),
         },
         (failure, _) => PlanError::Api(failure),
-    })
+    }
 }
 
 /// Facts about a missing formula's name that need I/O to learn.

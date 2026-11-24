@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
+use crate::domain::cask_plan::IdentifierError;
 use crate::infra::store::StoreError;
 
 /// Failure of a cask store operation.
@@ -96,8 +97,8 @@ pub(crate) enum CaskStoreError {
         actual: String,
         expected: String,
     },
-    #[error("{message}")]
-    InvalidIdentifier { message: String },
+    #[error(transparent)]
+    InvalidIdentifier(#[from] IdentifierError),
     #[error("invalid version '{version}' in cask receipt '{token}'")]
     InvalidVersion { version: String, token: String },
     #[error("invalid sha256 in cask receipt '{token}'")]

@@ -63,7 +63,7 @@ pub(super) fn limited_list(items: &[String]) -> String {
 
 /// The `Installed ...` outcome text: each requested formula as `name version`,
 /// plus a dependency count when the plan also pulled in non-requested formulae.
-pub(super) fn installed_summary(requested: &[String], dependencies: usize) -> String {
+pub(in crate::commands) fn installed_summary(requested: &[String], dependencies: usize) -> String {
     if requested.is_empty() {
         return format!(
             "Installed {dependencies} {}",
@@ -81,13 +81,13 @@ pub(super) fn installed_summary(requested: &[String], dependencies: usize) -> St
 }
 
 /// The `Upgraded ...` outcome text, with each `name old → new` transition.
-pub(super) fn upgraded_summary(upgraded: &[String]) -> String {
+pub(in crate::commands) fn upgraded_summary(upgraded: &[String]) -> String {
     format!("Upgraded {}", limited_list(upgraded))
 }
 
 /// The `Removed ...` outcome text. Explicitly requested removals are named and
 /// any autoremoved leftovers are counted; a pure autoremove names its packages.
-pub(super) fn removed_summary(requested: &[String], unused: &[String]) -> String {
+pub(in crate::commands) fn removed_summary(requested: &[String], unused: &[String]) -> String {
     if requested.is_empty() {
         return format!("Removed {}", limited_list(unused));
     }

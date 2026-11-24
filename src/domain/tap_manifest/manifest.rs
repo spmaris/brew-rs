@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::domain::validate::{is_lower_hex_digest, validate_cask_url};
 
+use super::error::ManifestError;
 use super::limits::{MAX_MANIFEST_BYTES, MAX_PACKAGES, MAX_URL_BYTES, SCHEMA_VERSION};
 use super::names::{
     is_known_arch, parse_tap_name, validate_bin_identifier, validate_token_identifier,
@@ -40,37 +40,40 @@ pub(crate) struct Artifact {
 
 impl TapManifest {
     /// Parse and validate a manifest for exactly `expected_tap`.
-    pub(crate) fn parse(bytes: &[u8], expected_tap: &str) -> Result<Self> {
+    pub(crate) fn parse(bytes: &[u8], expected_tap: &str) -> Result<Self, ManifestError> {
         if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-            bail!("tap manifest exceeds the {MAX_MANIFEST_BYTES} byte limit");
+            return Err(ManifestError::TooLarge);
         }
-        let text = std::str::from_utf8(bytes).context("tap manifest is not valid UTF-8")?;
-        let manifest: Self =
-            toml::from_str(text).context("failed to parse the tap manifest as TOML")?;
+        let text = std::str::from_utf8(bytes).map_err(ManifestError::NotUtf8)?;
+        let manifest: Self = toml::from_str(text).map_err(ManifestError::InvalidToml)?;
         manifest.validate(expected_tap)?;
         Ok(manifest)
     }
 
     /// Validate the whole manifest, including cross-package collisions.
-    fn validate(&self, expected_tap: &str) -> Result<()> {
+    fn validate(&self, expected_tap: &str) -> Result<(), ManifestError> {
         if self.schema != SCHEMA_VERSION {
-            bail!(
-                "unsupported tap manifest schema {}; expected {SCHEMA_VERSION}",
-                self.schema
-            );
+            return Err(ManifestError::UnsupportedSchema { found: self.schema });
         }
-        let (owner, repo) = parse_tap_name(&self.tap)?;
+        // The validated name is exactly `<owner>/<repo>`, so it names the tap.
+        parse_tap_name(&self.tap)?;
+        let tap = self.tap.as_str();
         if self.tap != expected_tap {
-            bail!("manifest declares tap '{}', not '{expected_tap}'", self.tap);
+            return Err(ManifestError::TapMismatch {
+                declared: self.tap.clone(),
+                expected: expected_tap.to_owned(),
+            });
         }
         if self.packages.is_empty() {
-            bail!("tap '{owner}/{repo}' declares no packages");
+            return Err(ManifestError::NoPackages {
+                tap: tap.to_owned(),
+            });
         }
         if self.packages.len() > MAX_PACKAGES {
-            bail!(
-                "tap '{owner}/{repo}' declares {} packages, above the {MAX_PACKAGES} package limit",
-                self.packages.len()
-            );
+            return Err(ManifestError::TooManyPackages {
+                tap: tap.to_owned(),
+                count: self.packages.len(),
+            });
         }
 
         let mut tokens = HashSet::with_capacity(self.packages.len());
@@ -83,66 +86,62 @@ impl TapManifest {
             validate_version(&package.version)?;
             validate_bin_identifier(&package.bin)?;
             if !tokens.insert(package.token.as_str()) {
-                bail!(
-                    "tap '{owner}/{repo}' declares package token '{}' more than once",
-                    package.token
-                );
+                return Err(ManifestError::DuplicateToken {
+                    tap: tap.to_owned(),
+                    token: package.token.clone(),
+                });
             }
             if !bins.insert(package.bin.as_str()) {
-                bail!(
-                    "tap '{owner}/{repo}' declares executable name '{}' more than once",
-                    package.bin
-                );
+                return Err(ManifestError::DuplicateBin {
+                    tap: tap.to_owned(),
+                    bin: package.bin.clone(),
+                });
             }
             if package.artifacts.is_empty() {
-                bail!(
-                    "tap package '{}' declares no architecture artifacts",
-                    package.token
-                );
+                return Err(ManifestError::NoArtifacts {
+                    token: package.token.clone(),
+                });
             }
             if package.artifacts.len() > 2 {
-                bail!(
-                    "tap package '{}' declares {} artifacts; only arm64 and x86_64 are supported",
-                    package.token,
-                    package.artifacts.len()
-                );
+                return Err(ManifestError::TooManyArtifacts {
+                    token: package.token.clone(),
+                    count: package.artifacts.len(),
+                });
             }
             for (architecture, artifact) in &package.artifacts {
                 if !is_known_arch(architecture) {
-                    bail!(
-                        "tap package '{}' declares unsupported architecture '{architecture}'; expected arm64 or x86_64",
-                        package.token
-                    );
+                    return Err(ManifestError::UnsupportedArchitecture {
+                        token: package.token.clone(),
+                        architecture: architecture.clone(),
+                    });
                 }
                 if !is_lower_hex_digest(&artifact.sha256) {
-                    bail!(
-                        "tap package '{}' has an invalid sha256 for '{architecture}': expected 64 lowercase hexadecimal characters",
-                        package.token
-                    );
+                    return Err(ManifestError::InvalidSha256 {
+                        token: package.token.clone(),
+                        architecture: architecture.clone(),
+                    });
                 }
                 if artifact.url.len() > MAX_URL_BYTES {
-                    bail!(
-                        "tap package '{}' has a URL longer than {MAX_URL_BYTES} bytes",
-                        package.token
-                    );
+                    return Err(ManifestError::UrlTooLong {
+                        token: package.token.clone(),
+                    });
                 }
-                validate_cask_url(&artifact.url).with_context(|| {
-                    format!(
-                        "tap package '{}' has an unsafe '{architecture}' artifact URL",
-                        package.token
-                    )
+                validate_cask_url(&artifact.url).map_err(|source| ManifestError::UnsafeUrl {
+                    token: package.token.clone(),
+                    architecture: architecture.clone(),
+                    source,
                 })?;
                 if !urls.insert(artifact.url.as_str()) {
-                    bail!(
-                        "tap '{owner}/{repo}' declares artifact URL '{}' more than once; selected artifacts must be unambiguous",
-                        artifact.url
-                    );
+                    return Err(ManifestError::DuplicateUrl {
+                        tap: tap.to_owned(),
+                        url: artifact.url.clone(),
+                    });
                 }
                 if !digests.insert(artifact.sha256.as_str()) {
-                    bail!(
-                        "tap '{owner}/{repo}' declares artifact sha256 '{}' more than once; selected artifacts must be unambiguous",
-                        artifact.sha256
-                    );
+                    return Err(ManifestError::DuplicateSha256 {
+                        tap: tap.to_owned(),
+                        sha256: artifact.sha256.clone(),
+                    });
                 }
             }
         }
@@ -151,11 +150,11 @@ impl TapManifest {
         for (index, package) in self.packages.iter().enumerate() {
             for other in self.packages.iter().skip(index + 1) {
                 if package.token == other.bin || package.bin == other.token {
-                    bail!(
-                        "tap '{owner}/{repo}' has colliding identifiers: package '{}' and executable '{}' name different packages",
-                        package.token,
-                        package.bin
-                    );
+                    return Err(ManifestError::CollidingIdentifiers {
+                        tap: tap.to_owned(),
+                        token: package.token.clone(),
+                        bin: package.bin.clone(),
+                    });
                 }
             }
         }
@@ -163,38 +162,38 @@ impl TapManifest {
     }
 
     /// Find one declared package by exact token.
-    pub(crate) fn package(&self, token: &str) -> Result<&ManifestPackage> {
+    pub(crate) fn package(&self, token: &str) -> Result<&ManifestPackage, ManifestError> {
         self.packages
             .iter()
             .find(|package| package.token == token)
-            .with_context(|| {
-                format!(
-                    "tap '{}' does not declare package '{token}'; declared packages: {}",
-                    self.tap,
-                    self.packages
-                        .iter()
-                        .map(|package| package.token.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+            .ok_or_else(|| ManifestError::UndeclaredPackage {
+                tap: self.tap.clone(),
+                token: token.to_owned(),
+                declared: self
+                    .packages
+                    .iter()
+                    .map(|package| package.token.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             })
     }
 }
 
 impl ManifestPackage {
     /// Select the one artifact for `architecture`.
-    pub(crate) fn artifact_for(&self, architecture: &str) -> Result<&Artifact> {
+    pub(crate) fn artifact_for(&self, architecture: &str) -> Result<&Artifact, ManifestError> {
         if let Some(artifact) = self.artifacts.get(architecture) {
             return Ok(artifact);
         }
-        bail!(
-            "tap package '{}' has no {architecture} artifact; declared architectures: {}",
-            self.token,
-            self.artifacts
+        Err(ManifestError::NoArtifactForArchitecture {
+            token: self.token.clone(),
+            architecture: architecture.to_owned(),
+            declared: self
+                .artifacts
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>()
-                .join(", ")
-        )
+                .join(", "),
+        })
     }
 }

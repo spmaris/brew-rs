@@ -68,6 +68,7 @@
 //! * Metadata is fetched sequentially to keep ordering deterministic and the
 //!   request volume bounded.
 
+mod error;
 mod macos;
 mod model;
 mod node;
@@ -78,6 +79,7 @@ mod source;
 mod uses_from_macos;
 mod validate;
 
+pub(crate) use error::{MacosTagError, NameError, ResolveError, ServiceError};
 pub(super) use macos::{arch_for_tag, macos_version_for_tag, parse_macos_version_or_codename};
 pub(crate) use macos::{is_supported_macos_tag, macos_tag};
 pub(crate) use model::FormulaResponse;

@@ -40,13 +40,6 @@ async fn not_found_retains_http_status() {
     };
     assert_eq!(source.status(), Some(reqwest::StatusCode::NOT_FOUND));
     assert!(error.is_not_found());
-    // The compatibility wrapper keeps the typed status on the anyhow chain.
-    let url = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
-    let error = direct_client()
-        .fetch_json::<serde_json::Value>(&url)
-        .await
-        .unwrap_err();
-    assert!(is_not_found(&error));
 }
 
 #[tokio::test]
@@ -103,5 +96,5 @@ fn classification_ignores_other_failures() {
     assert_eq!(classify_parts(Some(400), true), None);
     assert_eq!(classify_parts(None, false), None);
     assert_eq!(ApiError::ResponseTooLarge.failure(), None);
-    assert!(!is_not_found(&anyhow::anyhow!("boom")));
+    assert!(!ApiError::ResponseTooLarge.is_not_found());
 }

@@ -4,7 +4,7 @@
 //! wrapped transparently, so the displayed text is the leaf message.
 
 use std::io;
-use std::path::{PathBuf, StripPrefixError};
+use std::path::{Path, PathBuf, StripPrefixError};
 
 use super::macho::MachoError;
 use super::paths::PathsError;
@@ -20,10 +20,13 @@ pub(crate) enum RelocateError {
     #[error(transparent)]
     Paths(#[from] PathsError),
 
-    /// A filesystem error that carried no extra context before the typed
-    /// conversion and keeps its original text.
-    #[error(transparent)]
-    Fs(io::Error),
+    #[error("failed to {action} '{}'", path.display())]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error(transparent)]
     StripPrefix(#[from] StripPrefixError),
 
@@ -77,4 +80,16 @@ pub(crate) enum RelocateError {
         .target.display()
     )]
     TargetWrongKind { kind: &'static str, target: PathBuf },
+}
+
+impl RelocateError {
+    /// A `map_err` adapter that names the action and path of a failed I/O call.
+    pub(super) fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Self {
+        let path = path.to_path_buf();
+        move |source| Self::Io {
+            action,
+            path,
+            source,
+        }
+    }
 }

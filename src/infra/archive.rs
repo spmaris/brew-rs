@@ -139,7 +139,11 @@ fn unpack_layout(
         .inner
         .into_inner()
         .fill_buf()
-        .map_err(ArchiveError::Read)?
+        .map_err(|source| ArchiveError::Io {
+            action: "check for trailing bytes after the gzip stream in",
+            path: archive.to_path_buf(),
+            source,
+        })?
         .is_empty()
     {
         return Err(ArchiveError::BytesAfterGzip);

@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 
 use super::StoreError;
-use super::error::error_chain;
+use crate::infra::error::error_chain;
 
 use super::links::{create_symlink, keg_link_target, link_directory, opt_link_target};
 use super::lock::InstallLock;

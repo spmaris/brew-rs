@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::domain::plan;
 use crate::infra::api::catalog_cache;
-use crate::infra::api::http_client::{HttpClient, is_not_found};
+use crate::infra::api::http_client::HttpClient;
 
 /// Official Homebrew formula API base.
 pub(super) const API_BASE: &str = "https://formulae.brew.sh/api";
@@ -25,17 +25,17 @@ impl FormulaSource for HttpFormulaSource {
     async fn fetch(&self, name: &str) -> Result<FormulaPayload> {
         // `name` comes from `plan::parse_target`, so it cannot alter the path.
         let url = format!("{API_BASE}/formula/{name}.json");
-        match self.http.fetch_json(&url).await {
+        match self.http.get_json(&url).await {
             Ok(payload) => Ok(payload),
             Err(error) => {
-                if is_not_found(&error)
+                if error.is_not_found()
                     && let Ok(Some(canonical)) =
                         catalog_cache::resolve_formula_alias(&self.config, name).await
                     && !canonical.contains('/')
                     && plan::parse_target(&canonical).is_ok()
                 {
                     let alias_url = format!("{API_BASE}/formula/{canonical}.json");
-                    return self.http.fetch_json(&alias_url).await.with_context(|| {
+                    return self.http.get_json(&alias_url).await.with_context(|| {
                         format!("failed to fetch formula metadata from {alias_url}")
                     });
                 }

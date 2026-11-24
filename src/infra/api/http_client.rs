@@ -4,7 +4,7 @@ use tokio::time::timeout;
 
 use crate::config::Config;
 
-use super::error::{ApiError, is_not_found_cause};
+use super::error::ApiError;
 
 // Includes the expanded public formula catalog. Count bytes after decoding so
 // compressed responses cannot bypass the bound.
@@ -64,20 +64,6 @@ impl HttpClient {
         }
         serde_json::from_slice(&bytes).map_err(ApiError::InvalidJson)
     }
-
-    /// [`Self::get_json`] for callers outside the API layer that still
-    /// propagate `anyhow` errors.
-    pub async fn fetch_json<T>(&self, url: &str) -> anyhow::Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        Ok(self.get_json(url).await?)
-    }
-}
-
-/// Whether an error chain contains a typed HTTP `404 Not Found` status.
-pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(is_not_found_cause)
 }
 
 #[cfg(test)]

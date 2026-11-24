@@ -1,6 +1,6 @@
 use super::*;
 use crate::infra::cask_extract::StagedCaskLink;
-use crate::infra::store::error_chain;
+use crate::infra::error::error_chain;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use tempfile::tempdir;
@@ -285,7 +285,7 @@ fn cask_conflict_is_reported_as_a_typed_variant() {
     cask.token = "Bad Token".into();
     let error = validate_cask_receipt(&cask).unwrap_err();
     assert!(
-        matches!(error, CaskStoreError::InvalidIdentifier { .. }),
+        matches!(error, CaskStoreError::InvalidIdentifier(_)),
         "{error:?}"
     );
 }

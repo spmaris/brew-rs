@@ -821,3 +821,24 @@ fn nvm_wrapper_relocation_quotes_paths_and_rejects_unknown_wrappers() {
     assert!(relocate_nvm_wrapper(&prefix, &stage, "0.41.0").is_err());
     assert_eq!(fs::read_to_string(&wrapper).unwrap(), unknown);
 }
+
+#[test]
+fn cask_result_lines_name_the_token_and_version() {
+    assert_eq!(
+        installed_summary(&["alt-tab 11.10.2".to_string()], 0),
+        "Installed alt-tab 11.10.2"
+    );
+    let many: Vec<String> = (1..=5).map(|n| format!("cask{n} 1.0")).collect();
+    assert_eq!(
+        installed_summary(&many, 0),
+        "Installed cask1 1.0, cask2 1.0, cask3 1.0, cask4 1.0, and 1 more"
+    );
+    assert_eq!(
+        removed_summary(&["alt-tab".to_string()], &[]),
+        "Removed alt-tab"
+    );
+    assert_eq!(
+        upgraded_summary(&["alt-tab 11.10.1 → 11.10.2".to_string()]),
+        "Upgraded alt-tab 11.10.1 → 11.10.2"
+    );
+}

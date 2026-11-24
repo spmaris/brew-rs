@@ -194,6 +194,25 @@ fn assert_failure(output: &Output, needle: &str) {
 }
 
 #[test]
+fn tap_install_refuses_a_protected_prefix_before_planning() {
+    let sandbox = Sandbox::new();
+    let homebrew = sandbox.home.join("fake-homebrew");
+    let protected = homebrew.join("brewrs-sub");
+
+    let output = sandbox
+        .command()
+        .env("HOMEBREW_PREFIX", &homebrew)
+        .args(["--no-color", "--prefix"])
+        .arg(&protected)
+        .args(["tap", "install", "pproenca/tap/agent-tui", "--yes"])
+        .output()
+        .expect("failed to run brewrs");
+    assert_failure(&output, "inside the Homebrew prefix");
+    assert!(!protected.exists(), "a refused prefix must not be created");
+    assert!(sandbox.brew_invocations().is_empty());
+}
+
+#[test]
 fn tap_add_list_plan_and_untap_are_offline_and_read_only() {
     let sandbox = Sandbox::new();
     let manifest = sandbox.manifest.to_str().unwrap();

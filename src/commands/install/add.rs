@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::domain::plan::{self, PlannedFormula, SourceFlag};
 use crate::infra::platform::default_target;
 use crate::infra::relocate;
-use crate::infra::store::{Receipt, Store};
+use crate::infra::store::{Receipt, Store, reject_protected_prefix};
 use crate::ui::DnfStyleFormatter;
 use crate::ui::table::{Row, Section, display_path};
 
@@ -32,6 +32,7 @@ pub(crate) async fn install(
         bail!("Native installation is supported on macOS only; plan and fetch are still available");
     }
     let path = prefix_path(prefix)?;
+    reject_protected_prefix(&path)?;
     let store = Store::open(&path, false)?;
     let tag = default_target()?;
     let existing = store.installed()?;

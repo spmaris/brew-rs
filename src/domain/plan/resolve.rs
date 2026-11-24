@@ -2,20 +2,19 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::{Context, Result, bail};
-
 use super::super::plan_error::from_fetch_error;
+use super::error::ResolveError;
 use super::model::{FormulaNode, PackageSource, PlannedFormula};
 use super::node::build_node;
 use super::source::FormulaSource;
 use super::validate::{parse_target, validate_tag};
 
 /// Maximum number of targets accepted in one plan.
-const MAX_TARGETS: usize = 128;
+pub(super) const MAX_TARGETS: usize = 128;
 /// Maximum number of distinct formulae in one plan.
-const MAX_FORMULAE: usize = 1024;
+pub(super) const MAX_FORMULAE: usize = 1024;
 /// Maximum number of distinct names (targets plus dependencies) queued.
-const MAX_REQUESTS: usize = 4096;
+pub(super) const MAX_REQUESTS: usize = 4096;
 
 /// Build a native install plan for `targets` on host tag `tag`, reading
 /// formula metadata through `source`.
@@ -35,13 +34,12 @@ pub(crate) async fn resolve_with<S: FormulaSource>(
     source: &S,
     targets: &[String],
     tag: &str,
-) -> Result<Vec<PlannedFormula>> {
+) -> Result<Vec<PlannedFormula>, ResolveError> {
     validate_tag(tag)?;
     if targets.len() > MAX_TARGETS {
-        bail!(
-            "too many targets: {} requested, at most {MAX_TARGETS} are supported",
-            targets.len()
-        );
+        return Err(ResolveError::TooManyTargets {
+            count: targets.len(),
+        });
     }
 
     // Parse and validate every target before doing any I/O.
@@ -81,20 +79,22 @@ pub(crate) async fn resolve_with<S: FormulaSource>(
             Ok(response) => response,
             Err(error) => {
                 return Err(from_fetch_error(
-                    error,
+                    &error,
                     &requested,
                     target_taps.get(&requested).map(String::as_str),
                     dependency_parents.get(&requested).map(String::as_str),
-                ));
+                )
+                .into());
             }
         };
         let (canonical, node) = build_node(response, tag)?;
         if let Some(existing) = canonical_for.get(&canonical)
             && existing != &canonical
         {
-            bail!(
-                "inconsistent formula metadata: '{canonical}' was already resolved as '{existing}'"
-            );
+            return Err(ResolveError::InconsistentMetadata {
+                canonical,
+                existing: existing.clone(),
+            });
         }
         // Map the canonical name to itself so a request for it does not fetch
         // the same payload twice, then map the requested name.
@@ -103,12 +103,12 @@ pub(crate) async fn resolve_with<S: FormulaSource>(
 
         if !nodes.contains_key(&canonical) {
             if nodes.len() >= MAX_FORMULAE {
-                bail!("install plan exceeds the {MAX_FORMULAE}-formula limit");
+                return Err(ResolveError::FormulaLimit);
             }
             for dependency in &node.dependencies {
                 if enqueued.insert(dependency.clone()) {
                     if enqueued.len() > MAX_REQUESTS {
-                        bail!("install plan exceeds the {MAX_REQUESTS}-request limit");
+                        return Err(ResolveError::RequestLimit);
                     }
                     dependency_parents.insert(dependency.clone(), canonical.clone());
                     queue.push_back(dependency.clone());
@@ -125,7 +125,7 @@ pub(crate) async fn resolve_with<S: FormulaSource>(
     for name in &requested_names {
         let canonical = canonical_for
             .get(name)
-            .with_context(|| format!("internal planning error: unresolved target '{name}'"))?;
+            .ok_or_else(|| ResolveError::UnresolvedTarget { name: name.clone() })?;
         if requested_canonical.insert(canonical.clone()) {
             target_names.push(canonical.clone());
         }
@@ -140,7 +140,7 @@ fn topological_order(
     canonical_for: &HashMap<String, String>,
     targets: &[String],
     requested: &HashSet<String>,
-) -> Result<Vec<PlannedFormula>> {
+) -> Result<Vec<PlannedFormula>, ResolveError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mark {
         Visiting,
@@ -168,29 +168,31 @@ fn topological_order(
                     match marks.get(&name) {
                         Some(Mark::Done) => continue,
                         Some(Mark::Visiting) => {
-                            bail!("dependency cycle detected involving formula '{name}'")
+                            return Err(ResolveError::DependencyCycle { name });
                         }
                         None => {}
                     }
 
-                    let node = nodes.get(&name).with_context(|| {
-                        format!("internal planning error: missing node '{name}'")
-                    })?;
+                    let node = nodes
+                        .get(&name)
+                        .ok_or_else(|| ResolveError::MissingNode { name: name.clone() })?;
                     marks.insert(name.clone(), Mark::Visiting);
                     stack.push(Step::Exit(name));
 
                     // Push in reverse so dependencies are visited in API order.
                     for dependency in node.dependencies.iter().rev() {
-                        let canonical = canonical_for.get(dependency).with_context(|| {
-                            format!(
-                                "internal planning error: unresolved dependency '{dependency}' of '{}'",
-                                node.name
-                            )
+                        let canonical = canonical_for.get(dependency).ok_or_else(|| {
+                            ResolveError::UnresolvedDependency {
+                                dependency: dependency.clone(),
+                                parent: node.name.clone(),
+                            }
                         })?;
                         match marks.get(canonical) {
                             Some(Mark::Done) => {}
                             Some(Mark::Visiting) => {
-                                bail!("dependency cycle detected involving formula '{canonical}'")
+                                return Err(ResolveError::DependencyCycle {
+                                    name: canonical.clone(),
+                                });
                             }
                             None => stack.push(Step::Enter(canonical.clone())),
                         }
@@ -198,9 +200,9 @@ fn topological_order(
                 }
                 Step::Exit(name) => {
                     marks.insert(name.clone(), Mark::Done);
-                    let node = nodes.get(&name).with_context(|| {
-                        format!("internal planning error: missing node '{name}'")
-                    })?;
+                    let node = nodes
+                        .get(&name)
+                        .ok_or_else(|| ResolveError::MissingNode { name: name.clone() })?;
                     let dependencies = canonical_dependencies(node, canonical_for)?;
                     order.push(PlannedFormula {
                         name: node.name.clone(),
@@ -235,16 +237,17 @@ fn topological_order(
 fn canonical_dependencies(
     node: &FormulaNode,
     canonical_for: &HashMap<String, String>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<String>, ResolveError> {
     let mut dependencies = Vec::with_capacity(node.dependencies.len());
     let mut seen = HashSet::new();
     for dependency in &node.dependencies {
-        let canonical = canonical_for.get(dependency).with_context(|| {
-            format!(
-                "internal planning error: unresolved dependency '{dependency}' of '{}'",
-                node.name
-            )
-        })?;
+        let canonical =
+            canonical_for
+                .get(dependency)
+                .ok_or_else(|| ResolveError::UnresolvedDependency {
+                    dependency: dependency.clone(),
+                    parent: node.name.clone(),
+                })?;
         if seen.insert(canonical.clone()) {
             dependencies.push(canonical.clone());
         }

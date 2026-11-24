@@ -7,9 +7,13 @@ use crate::domain::plan::{
     FormulaResponse, FormulaSource, InstalledServiceMetadata, validate_formula_name, validate_tag,
     verify_installed_service,
 };
-use crate::infra::api::error::error_chain;
 use crate::infra::api::http_client::HttpClient;
 use crate::infra::api::{API_BASE, ApiError, catalog_cache};
+use crate::infra::error::error_chain;
+
+mod error;
+
+pub(crate) use self::error::InstalledServiceError;
 
 /// [`FormulaSource`] backed by the official API over [`HttpClient`].
 pub(crate) struct HttpFormulaSource {
@@ -100,7 +104,7 @@ pub(crate) async fn fetch_installed_service(
     installed_version: &str,
     installed_version_scheme: u32,
     installed_sha256: &str,
-) -> Result<InstalledServiceMetadata> {
+) -> Result<InstalledServiceMetadata, InstalledServiceError> {
     validate_tag(tag)?;
     let name = validate_formula_name(name, "service formula name")?;
     let http = HttpClient::new(config)?;
@@ -113,14 +117,14 @@ pub(crate) async fn fetch_installed_service(
                 url,
                 source: Box::new(source),
             })?;
-    verify_installed_service(
+    Ok(verify_installed_service(
         response,
         name,
         tag,
         installed_version,
         installed_version_scheme,
         installed_sha256,
-    )
+    )?)
 }
 
 #[cfg(test)]

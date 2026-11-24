@@ -3,11 +3,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::plan::{self, PackageSource, PlannedFormula};
 use super::validate::{is_lower_hex_digest, is_safe_version, validate_cask_url};
+
+mod error;
+
+pub(crate) use error::{CatalogError, PortableError};
 
 const BUNDLED_TOML: &str = include_str!("portable.toml");
 
@@ -38,32 +41,33 @@ pub(crate) struct Artifact {
     pub sha256: String,
 }
 
-pub(crate) fn catalog() -> Result<&'static Catalog> {
-    static CATALOG: OnceLock<Result<Catalog, String>> = OnceLock::new();
+pub(crate) fn catalog() -> Result<&'static Catalog, PortableError> {
+    static CATALOG: OnceLock<Result<Catalog, CatalogError>> = OnceLock::new();
     CATALOG
-        .get_or_init(|| Catalog::parse(BUNDLED_TOML).map_err(|error| format!("{error:#}")))
+        .get_or_init(|| Catalog::parse(BUNDLED_TOML))
         .as_ref()
-        .map_err(|error| anyhow::anyhow!("Invalid bundled portable catalog: {error}"))
+        .map_err(PortableError::InvalidCatalog)
 }
 
 impl Catalog {
-    fn parse(text: &str) -> Result<Self> {
+    fn parse(text: &str) -> Result<Self, CatalogError> {
         let catalog: Self = toml::from_str(text)?;
         let mut names = HashSet::new();
         for package in &catalog.packages {
             for name in std::iter::once(&package.name).chain(&package.aliases) {
                 if name.contains('/') || plan::parse_target(name).is_err() || !names.insert(name) {
-                    bail!("Invalid or duplicate portable package name or alias: {name:?}");
+                    return Err(CatalogError::InvalidName { name: name.clone() });
                 }
             }
             if !is_safe_version(&package.version) {
-                bail!("Invalid version for portable package {}", package.name);
+                return Err(CatalogError::InvalidVersion {
+                    package: package.name.clone(),
+                });
             }
             if package.artifacts.is_empty() || package.executables.is_empty() {
-                bail!(
-                    "Portable package {} requires artifacts and executables",
-                    package.name
-                );
+                return Err(CatalogError::MissingArtifacts {
+                    package: package.name.clone(),
+                });
             }
             let mut paths = HashSet::new();
             for (path, executable) in package
@@ -76,7 +80,10 @@ impl Catalog {
                     matches!(dir, "bin" | "sbin") && !file.contains('/')
                 });
                 if !safe_relative(path) || (executable && !single_bin) || !paths.insert(path) {
-                    bail!("Invalid or duplicate path {path:?} for {}", package.name);
+                    return Err(CatalogError::InvalidPath {
+                        path: path.clone(),
+                        package: package.name.clone(),
+                    });
                 }
             }
             let mut digests = HashSet::new();
@@ -87,7 +94,10 @@ impl Catalog {
                     || !is_lower_hex_digest(&asset.sha256)
                     || !digests.insert(&asset.sha256)
                 {
-                    bail!("Invalid {arch} portable artifact for {}", package.name);
+                    return Err(CatalogError::InvalidArtifact {
+                        arch: arch.clone(),
+                        package: package.name.clone(),
+                    });
                 }
                 validate_cask_url(&asset.url)?;
             }
@@ -120,15 +130,19 @@ impl Catalog {
     ///
     /// Homebrew is never consulted. Each target must name a catalog entry (by
     /// name or alias) that ships an artifact for the host architecture.
-    pub fn plan_targets(&self, targets: &[String], tag: &str) -> Result<Vec<PlannedFormula>> {
+    pub fn plan_targets(
+        &self,
+        targets: &[String],
+        tag: &str,
+    ) -> Result<Vec<PlannedFormula>, PortableError> {
         let mut plan: Vec<PlannedFormula> = Vec::new();
         for target in targets {
-            let package = self.find(target).with_context(|| {
-                format!(
-                    "No reviewed upstream build for '{target}'.\n  Available upstream builds: {}",
-                    self.available_builds()
-                )
-            })?;
+            let package = self
+                .find(target)
+                .ok_or_else(|| PortableError::NoUpstreamBuild {
+                    target: target.clone(),
+                    available: self.available_builds(),
+                })?;
             if !plan.iter().any(|formula| formula.name == package.name) {
                 plan.push(package.plan(tag)?);
             }
@@ -144,15 +158,18 @@ impl Package {
             && plan::arch_for_tag(tag).is_some_and(|arch| self.artifacts.contains_key(arch))
     }
 
-    pub fn plan(&self, tag: &str) -> Result<PlannedFormula> {
+    pub fn plan(&self, tag: &str) -> Result<PlannedFormula, PortableError> {
         if !plan::is_supported_macos_tag(tag) {
-            bail!("Upstream releases require a supported macOS target");
+            return Err(PortableError::UnsupportedTarget);
         }
-        let arch = plan::arch_for_tag(tag).context("Portable releases require a macOS target")?;
+        let arch = plan::arch_for_tag(tag).ok_or(PortableError::NotMacos)?;
         let artifact = self
             .artifacts
             .get(arch)
-            .with_context(|| format!("No reviewed upstream archive for {} on {arch}", self.name))?;
+            .ok_or_else(|| PortableError::NoArchive {
+                package: self.name.clone(),
+                arch: arch.to_owned(),
+            })?;
         Ok(PlannedFormula {
             name: self.name.clone(),
             version: self.version.clone(),
@@ -185,11 +202,11 @@ fn safe_relative(path: &str) -> bool {
 /// The catalog entry, host architecture and artifact a plan was built from.
 pub(crate) fn artifact_for(
     formula: &PlannedFormula,
-) -> Result<(&'static Package, &'static str, &'static Artifact)> {
+) -> Result<(&'static Package, &'static str, &'static Artifact), PortableError> {
     let package = catalog()?
         .find(&formula.name)
         .filter(|package| package.name == formula.name && package.version == formula.version)
-        .context("No matching package and version in the portable catalog")?;
+        .ok_or(PortableError::NoMatchingPackage)?;
     package
         .artifacts
         .iter()
@@ -199,7 +216,7 @@ pub(crate) fn artifact_for(
                 && formula.sha256 == artifact.sha256)
                 .then_some((package, arch.as_str(), artifact))
         })
-        .context("No reviewed upstream artifact matches this plan")
+        .ok_or(PortableError::NoMatchingArtifact)
 }
 
 #[cfg(test)]

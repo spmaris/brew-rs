@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::infra::api::error::error_chain;
+use crate::infra::error::error_chain;
 
 use super::consts::{BOTTLE_DIR_NAME, IO_BUFFER_BYTES, MAX_BOTTLE_BYTES};
 use super::error::DownloadError;

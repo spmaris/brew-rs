@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::infra::api::http_client::is_not_found;
+use crate::infra::api::ApiError;
 
 use super::analytics::*;
 use super::fields::*;
@@ -233,15 +233,9 @@ fn kind_flags_are_explicit_and_unambiguous() {
 fn only_a_typed_http_404_counts_as_not_found() {
     // Error text alone never qualifies; the status must be typed. The
     // positive path is exercised end-to-end in the `HttpClient` tests.
-    assert!(!is_not_found(&anyhow::anyhow!(
-        "API request failed: HTTP 404 Not Found"
-    )));
-    assert!(!is_not_found(&anyhow::anyhow!(
-        "API request failed: HTTP 503 Service Unavailable"
-    )));
-    assert!(!is_not_found(&anyhow::anyhow!(
-        "Failed to send request: connection refused"
-    )));
+    assert!(!ApiError::UnexpectedStatus(reqwest::StatusCode::NOT_FOUND).is_not_found());
+    assert!(!ApiError::UnexpectedStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE).is_not_found());
+    assert!(!ApiError::ResponseTooLarge.is_not_found());
 }
 
 #[tokio::test]

@@ -28,8 +28,6 @@ pub(crate) enum ArchiveError {
         #[source]
         source: io::Error,
     },
-    #[error(transparent)]
-    Read(io::Error),
 
     // --- arguments ---
     #[error("bottle sha256 must be exactly {len} lowercase hexadecimal characters")]
