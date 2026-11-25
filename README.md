@@ -8,7 +8,25 @@ This is an experimental package manager, not a drop-in Homebrew replacement.
 
 ### Prebuilt binary (Apple Silicon)
 
-Download the `aarch64-apple-darwin.tar.gz` archive and its `.sha256` file from [GitHub Releases](https://github.com/spmaris/brew-rs/releases). In the download directory, verify and install the archive (replace `v0.1.0` with the version you downloaded):
+Download, verify and install the latest release into `~/.local/bin` in one step:
+
+```sh
+(
+  set -e
+  url=https://github.com/spmaris/brew-rs/releases
+  tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$url/latest"); tag=${tag##*/}
+  archive="brewrs-$tag-aarch64-apple-darwin.tar.gz"
+  cd "$(mktemp -d)"
+  curl -fsSLO "$url/download/$tag/$archive" -O "$url/download/$tag/$archive.sha256"
+  shasum -a 256 -c "$archive.sha256"
+  tar -xzf "$archive" brewrs
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 brewrs "$HOME/.local/bin/brewrs"
+  "$HOME/.local/bin/brewrs" --version
+)
+```
+
+Or download the `aarch64-apple-darwin.tar.gz` archive and its `.sha256` file from [GitHub Releases](https://github.com/spmaris/brew-rs/releases) yourself. In the download directory, verify and install the archive (replace `v0.1.0` with the version you downloaded):
 
 ```sh
 archive=brewrs-v0.1.0-aarch64-apple-darwin.tar.gz
